@@ -6,7 +6,7 @@ Updated: 2026-11-13 (UTC)
 
 | Phase | Scope | State | Commit | Tests | Notes |
 |---|---|---|---|---|---|
-| 0 | Repository hygiene, package-manager/lockfile consistency, and build bootstrap | In progress — first CI run failed in the Windows lint/test/build step and Linux native Cargo build; diagnostics and rerun required | `35cdc9b` (bootstrap), `6f07f0f` (metadata claims) | Local npm install, audit, lint, engine tests, Vite build, and Python tests: Pass. Linux CI frontend and Python steps: Pass. Windows combined frontend check: Failed; failing subcommand unknown. Linux native Cargo build: Failed (run `43413725141`). | Checks are being split and native compiler diagnostics exposed for diagnosis. Do not start Phase 1 until both Windows and Linux CI pass on checked-in lockfiles. |
+| 0 | Repository hygiene, package-manager/lockfile consistency, and build bootstrap | In progress — CI run `43414712733` failed at Windows TypeScript lint and Linux native Cargo build; diagnostic annotations added for the next run | `35cdc9b` (bootstrap), `6f07f0f` (metadata claims), `238eb2d` (CI diagnostics) | Local install/audit/lint/engine/build/Python checks: Pass. Linux CI install, lint, engine, frontend build, and Python tests: Pass; native Cargo build: Failed. Windows CI install: Pass; TypeScript lint: Failed. | Root causes not yet established. Do not start Phase 1 until both Windows and Linux CI pass on checked-in lockfiles. |
 | 1 | Tauri and sidecar runtime | Blocked by Phase 0 gate | — | — | — |
 | 2 | Analytical validity | Not started | — | — | — |
 | 3 | Truthful statistics | Not started | — | — | — |

@@ -70,7 +70,15 @@ jobs:
         run: npm ci
 
       - name: TypeScript lint
-        run: npm run lint
+        shell: pwsh
+        run: |
+          $log = Join-Path $env:RUNNER_TEMP "typescript-lint.log"
+          npm run lint *> $log
+          $lintExitCode = $LASTEXITCODE
+          if ($lintExitCode -ne 0) {
+            Get-Content $log -Tail 30 | ForEach-Object { Write-Output "::error title=TypeScript lint detail::$_" }
+          }
+          exit $lintExitCode
 
       - name: TypeScript engine tests
         run: npm run test:engine
@@ -89,7 +97,14 @@ jobs:
           cargo build --release --locked *> $log
           $buildExitCode = $LASTEXITCODE
           if ($buildExitCode -ne 0) {
-            Get-Content $log -Tail 35 | ForEach-Object { Write-Output "::error title=Cargo build detail::$_" }
+            $diagnostics = Select-String -Path $log -Pattern '(?i)(error|could not compile|failed|signal|killed|not found|no such file|undefined reference)' | Select-Object -Last 12
+            if ($diagnostics.Count -eq 0) {
+              $diagnostics = Get-Content $log -Tail 12
+            }
+            $diagnostics | ForEach-Object {
+              $line = if ($_ -is [Microsoft.PowerShell.Commands.MatchInfo]) { $_.Line } else { [string]$_ }
+              Write-Output "::error title=Cargo build detail::$line"
+            }
           }
           exit $buildExitCode
 
