@@ -25,7 +25,7 @@ jobs:
           set -euo pipefail
           encoded="$(xz -9e -c src-tauri/Cargo.lock | base64 -w0)"
           part=1
-          while IFS= read -r chunk; do
+          while IFS= read -r chunk || [[ -n "$chunk" ]]; do
             printf '::notice title=CARGOLOCK_PART_%03d::%s\n' "$part" "$chunk"
             part=$((part + 1))
           done < <(printf '%s' "$encoded" | fold -w 3000)
@@ -102,6 +102,9 @@ jobs:
 
       - name: Production frontend build
         run: npm run build
+
+      - name: Verify Rust/Python RPC allowlist parity
+        run: python scripts/check_rpc_allowlist.py
 
       - name: Run Python sidecar tests
         shell: pwsh

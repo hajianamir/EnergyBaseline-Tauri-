@@ -49,7 +49,7 @@ Use the `EnergyBaseline-Windows-NSIS-M1` artifact from [CI run 43428431657](http
    $targets | Select-Object Name, ProcessId, ParentProcessId, ExecutablePath | Format-Table -AutoSize
    ```
 
-   Verify the displayed app and sidecar PIDs correspond to this test instance. If the executable name differs, stop and verify the app identity manually; do not force-terminate an unverified process.
+   The recursive walk records every descendant under the sidecar, including any child process spawned by the frozen PyInstaller onedir executable, not only the immediate sidecar PID. Verify the displayed app and sidecar PIDs correspond to this test instance. If the executable name differs, stop and verify the app identity manually; do not force-terminate an unverified process.
 3. Force-terminate only the verified desktop app PID. The following continues polling the captured app/sidecar descendants and fails if any remain after five seconds:
 
    ```powershell

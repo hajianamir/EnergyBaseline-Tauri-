@@ -3,7 +3,6 @@ build/
 dist/
 coverage/
 src-tauri/target/
-src-tauri/Cargo.lock
 sidecar/build/
 sidecar/dist/
 __pycache__/

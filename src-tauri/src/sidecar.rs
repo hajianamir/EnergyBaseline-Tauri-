@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Emitter, Manager, Runtime};
 use tauri_plugin_shell::process::{CommandChild, CommandEvent};
 use tauri_plugin_shell::ShellExt;
 use tokio::sync::{oneshot, watch};
@@ -74,9 +74,11 @@ impl Default for RuntimeState {
     }
 }
 
-pub(crate) struct SidecarHandle {
-    app: AppHandle,
+pub(crate) struct SidecarHandle<R: Runtime = tauri::Wry> {
+    app: AppHandle<R>,
     app_home: PathBuf,
+    #[cfg(test)]
+    test_command: Option<(PathBuf, Vec<OsString>, PathBuf)>,
     log_path: PathBuf,
     runtime: Mutex<RuntimeState>,
     status_tx: watch::Sender<SidecarUiStatus>,
@@ -85,8 +87,8 @@ pub(crate) struct SidecarHandle {
     shutdown_lock: tokio::sync::Mutex<()>,
 }
 
-impl SidecarHandle {
-    pub(crate) fn new(app: AppHandle, app_home: PathBuf, log_path: PathBuf) -> Arc<Self> {
+impl<R: Runtime> SidecarHandle<R> {
+    pub(crate) fn new(app: AppHandle<R>, app_home: PathBuf, log_path: PathBuf) -> Arc<Self> {
         let initial = SidecarUiStatus {
             state: RuntimePhase::Stopped.as_str().to_string(),
             message: None,
@@ -98,6 +100,8 @@ impl SidecarHandle {
         Arc::new(Self {
             app,
             app_home,
+            #[cfg(test)]
+            test_command: None,
             log_path,
             runtime: Mutex::new(RuntimeState::default()),
             status_tx,
@@ -276,6 +280,11 @@ impl SidecarHandle {
     }
 
     fn command_details(&self) -> Result<(PathBuf, Vec<OsString>, PathBuf), String> {
+        #[cfg(test)]
+        if let Some((program, args, working_dir)) = &self.test_command {
+            return Ok((program.clone(), args.clone(), working_dir.clone()));
+        }
+
         if cfg!(debug_assertions) {
             let repository_root = Path::new(env!("CARGO_MANIFEST_DIR"))
                 .parent()
@@ -498,7 +507,12 @@ impl SidecarHandle {
                 .get("log_ref")
                 .and_then(Value::as_str)
                 .unwrap_or_else(|| self.log_path.to_str().unwrap_or("sidecar log"));
-            Err(format!("{app_code}: {description} (log: {log_ref})"))
+            let jsonrpc_code = error
+                .get("code")
+                .and_then(Value::as_i64)
+                .map(|code| format!("JSON-RPC {code}: "))
+                .unwrap_or_default();
+            Err(format!("{jsonrpc_code}{app_code}: {description} (log: {log_ref})"))
         } else {
             self.fail_generation(
                 generation,
@@ -921,8 +935,137 @@ fn terminate_process_tree(process_tree: Option<ProcessTreeGuard>, pid: Option<u3
 
 #[cfg(test)]
 mod tests {
-    use super::{id_key, is_valid_id, MAX_FRAME_BYTES};
+    use super::{id_key, is_valid_id, SidecarHandle, MAX_FRAME_BYTES};
     use serde_json::json;
+    use std::ffi::OsString;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+    use tauri::test::{mock_builder, mock_context, noop_assets, MockRuntime};
+    use tauri::Manager;
+
+    fn mock_app() -> tauri::App<MockRuntime> {
+        mock_builder()
+            .plugin(tauri_plugin_shell::init())
+            .build(mock_context(noop_assets()))
+            .expect("mock Tauri app should build")
+    }
+
+    fn test_app_home(test_name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "EnergyBaseline-M1-{test_name}-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&path).expect("test APP_HOME should be created");
+        path
+    }
+
+    fn test_sidecar(
+        app: &tauri::App<MockRuntime>,
+        app_home: PathBuf,
+        args: Vec<OsString>,
+        working_dir: PathBuf,
+    ) -> Arc<SidecarHandle<MockRuntime>> {
+        let log_path = app_home.join("logs").join("sidecar.log");
+        let program = if cfg!(windows) { "python" } else { "python3" };
+        let mut sidecar = SidecarHandle::new(app.handle().clone(), app_home, log_path);
+        Arc::get_mut(&mut sidecar)
+            .expect("test handle should be uniquely owned before startup")
+            .test_command = Some((PathBuf::from(program), args, working_dir));
+        sidecar
+    }
+
+    #[test]
+    fn rust_bridge_round_trips_real_python_sidecar_and_preserves_rpc_error_code() {
+        let app = mock_app();
+        let app_home = test_app_home("rpc-roundtrip");
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("src-tauri should be inside the repository")
+            .to_path_buf();
+        let entry = repo_root.join("sidecar").join("energybaseline").join("main.py");
+        let sidecar = test_sidecar(
+            &app,
+            app_home.clone(),
+            vec![entry.into_os_string(), OsString::from("--stdio")],
+            repo_root,
+        );
+
+        let (status, unknown_method) = tauri::async_runtime::block_on(async {
+            let status = sidecar
+                .call("system.status".to_string(), json!({}), json!("status-1"))
+                .await;
+            let unknown_method = sidecar
+                .call("not.allowlisted".to_string(), json!({}), json!("unknown-1"))
+                .await;
+            sidecar.shutdown_gracefully().await;
+            (status, unknown_method)
+        });
+        drop(app);
+        let _ = std::fs::remove_dir_all(&app_home);
+
+        let status = status.expect("system.status should return a JSON-RPC result");
+        assert_eq!(status.get("protocol_version").and_then(|value| value.as_str()), Some("1.0"));
+        assert!(status.get("pid").and_then(|value| value.as_u64()).is_some());
+        let error = unknown_method.expect_err("unallowlisted method must return a JSON-RPC error");
+        assert!(error.contains("JSON-RPC -32601"), "unexpected error: {error}");
+        assert!(error.contains("not.allowlisted"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn rpc_cancel_resolves_a_pending_rust_call_as_cancelled() {
+        let app = mock_app();
+        let app_home = test_app_home("rpc-cancel");
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("src-tauri should be inside the repository")
+            .to_path_buf();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("rpc_cancellation_sidecar.py");
+        let sidecar = test_sidecar(&app, app_home.clone(), vec![fixture.into_os_string()], repo_root);
+        let request_id = json!("pending-test-request");
+        let key = id_key(&request_id).expect("request id should be valid");
+        let call_sidecar = Arc::clone(&sidecar);
+        let call_id = request_id.clone();
+        let pending_call = tauri::async_runtime::spawn(async move {
+            call_sidecar
+                .call("test.wait".to_string(), json!({}), call_id)
+                .await
+        });
+
+        let (cancel_result, call_result) = tauri::async_runtime::block_on(async {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let is_pending = sidecar
+                    .runtime
+                    .lock()
+                    .expect("runtime lock should be available")
+                    .pending
+                    .contains_key(&key);
+                if is_pending {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "test RPC never became pending");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+
+            let cancel_result = sidecar.cancel(request_id.clone()).await;
+            let call_result = pending_call.await.expect("pending RPC task should complete");
+            sidecar.shutdown_gracefully().await;
+            (cancel_result, call_result)
+        });
+        drop(app);
+        let _ = std::fs::remove_dir_all(&app_home);
+
+        assert_eq!(
+            cancel_result.expect("sidecar should acknowledge rpc_cancel"),
+            json!({"cancelled": request_id})
+        );
+        let error = call_result.expect_err("cancelled request must not resolve successfully");
+        assert!(error.starts_with("CANCELLED:"), "unexpected error: {error}");
+    }
 
     #[test]
     fn rpc_ids_are_limited_to_json_rpc_primitives() {
