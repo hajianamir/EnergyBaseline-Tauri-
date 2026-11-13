@@ -1,7 +1,9 @@
+import hashlib
 import io
 import json
 import logging
 import os
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -21,6 +23,12 @@ from energybaseline.config.settings import (  # noqa: E402
 )
 from energybaseline.sql.guard import _MAX_SQL_BYTES, validate_readonly_sql  # noqa: E402
 from energybaseline.main import _configure_logging  # noqa: E402
+from energybaseline.persistence import (  # noqa: E402
+    CURRENT_SCHEMA_VERSION,
+    MAX_SESSION_BYTES,
+    SessionStore,
+    SessionStoreError,
+)
 from energybaseline.ipc.protocol import (  # noqa: E402
     ALLOWLISTED_METHODS,
     CONTROL_ALLOWLISTED_METHODS,
@@ -114,6 +122,184 @@ class TestDbResolver(unittest.TestCase):
         self.assertEqual(hits, [], f"DB-1 violation: {hits}")
 
 
+class TestSessionStore(unittest.TestCase):
+    def test_atomic_session_round_trip_revision_conflict_and_hash_chain(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            database = Path(tmp) / "data" / "app.db"
+            store = SessionStore(database)
+            self.assertEqual(store.initialize(), CURRENT_SCHEMA_VERSION)
+            payload = {"workspace": {"dataset": "meter.csv", "selected_targets": ["electricity"]}}
+
+            saved = store.save("session-01", payload, expected_revision=0)
+            self.assertEqual(saved["revision"], 1)
+            loaded = store.load("session-01")
+            self.assertEqual(loaded["payload"], payload)
+            self.assertEqual(loaded["revision"], 1)
+            self.assertEqual(loaded["sha256"], saved["sha256"])
+
+            with self.assertRaises(SessionStoreError) as conflict:
+                store.save("session-01", {"stale": True}, expected_revision=0)
+            self.assertEqual(conflict.exception.app_code, "CONFLICT")
+            self.assertEqual(store.load("session-01")["payload"], payload)
+
+            audit = store.verify_audit_log()
+            self.assertEqual(audit["events"], 5)  # Two schema migrations, save, and two loads.
+            with sqlite3.connect(str(database)) as conn:
+                chain_rows = conn.execute(
+                    "SELECT previous_hash, event_hash FROM audit_log ORDER BY sequence"
+                ).fetchall()
+            self.assertEqual(chain_rows[-1][1], audit["head_hash"])
+            self.assertEqual(chain_rows[0][0], "0" * 64)
+            for previous, current in zip(chain_rows, chain_rows[1:]):
+                self.assertEqual(current[0], previous[1])
+            store.close()
+
+    def test_in_memory_fallback_keeps_sessions_only_for_the_store_lifetime(self) -> None:
+        store = SessionStore(in_memory=True)
+        self.assertEqual(store.initialize(), CURRENT_SCHEMA_VERSION)
+        store.save("temporary-session", {"volatile": True})
+        self.assertTrue(store.load("temporary-session")["payload"]["volatile"])
+        store.close()
+
+        restarted_store = SessionStore(in_memory=True)
+        restarted_store.initialize()
+        with self.assertRaises(SessionStoreError) as missing:
+            restarted_store.load("temporary-session")
+        self.assertEqual(missing.exception.app_code, "NOT_FOUND")
+        restarted_store.close()
+
+    def test_version_one_database_migrates_with_online_backup_and_preserves_session(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            database = Path(tmp) / "data" / "app.db"
+            database.parent.mkdir(parents=True)
+            payload_json = json.dumps({"workspace": "legacy", "selected": ["kwh"]}, separators=(",", ":"))
+            with sqlite3.connect(str(database)) as conn:
+                conn.execute(
+                    "CREATE TABLE sessions (session_id TEXT PRIMARY KEY, revision INTEGER NOT NULL, "
+                    "payload_json TEXT NOT NULL, updated_at TEXT NOT NULL)"
+                )
+                conn.execute(
+                    "CREATE TABLE audit_log (sequence INTEGER PRIMARY KEY AUTOINCREMENT, "
+                    "created_at TEXT NOT NULL, event_json TEXT NOT NULL, previous_hash TEXT NOT NULL, "
+                    "event_hash TEXT NOT NULL UNIQUE)"
+                )
+                conn.execute(
+                    "INSERT INTO sessions(session_id, revision, payload_json, updated_at) VALUES (?, ?, ?, ?)",
+                    ("legacy-session", 3, payload_json, "2026-01-01T00:00:00Z"),
+                )
+                conn.execute("PRAGMA user_version=1")
+
+            store = SessionStore(database)
+            self.assertEqual(store.initialize(), 2)
+            restored = store.load("legacy-session")
+            self.assertEqual(restored["payload"], {"workspace": "legacy", "selected": ["kwh"]})
+            self.assertEqual(restored["revision"], 3)
+            backups = list((database.parent / "backups").glob("pre-migration-v1-to-v2-*.db"))
+            self.assertEqual(len(backups), 1)
+            with sqlite3.connect(str(backups[0])) as backup:
+                self.assertEqual(backup.execute("PRAGMA user_version").fetchone()[0], 1)
+                self.assertEqual(
+                    backup.execute("SELECT revision FROM sessions WHERE session_id='legacy-session'").fetchone()[0],
+                    3,
+                )
+            self.assertEqual(store.verify_audit_log()["events"], 3)  # Schema migration, session migration, and load.
+            store.close()
+
+    def test_failed_legacy_migration_restores_backup_without_dropping_data(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            database = Path(tmp) / "app.db"
+            with sqlite3.connect(str(database)) as conn:
+                conn.execute(
+                    "CREATE TABLE sessions (session_id TEXT PRIMARY KEY, revision INTEGER NOT NULL, "
+                    "payload_json TEXT NOT NULL, updated_at TEXT NOT NULL)"
+                )
+                conn.execute(
+                    "CREATE TABLE audit_log (sequence INTEGER PRIMARY KEY AUTOINCREMENT, "
+                    "created_at TEXT NOT NULL, event_json TEXT NOT NULL, previous_hash TEXT NOT NULL, "
+                    "event_hash TEXT NOT NULL UNIQUE)"
+                )
+                conn.execute(
+                    "INSERT INTO sessions(session_id, revision, payload_json, updated_at) VALUES (?, ?, ?, ?)",
+                    ("legacy-session", 1, '{"api_key":"must-not-be-migrated"}', "2026-01-01T00:00:00Z"),
+                )
+                conn.execute("PRAGMA user_version=1")
+
+            store = SessionStore(database)
+            with self.assertRaises(SessionStoreError) as failure:
+                store.initialize()
+            self.assertEqual(failure.exception.app_code, "INTEGRITY")
+            with sqlite3.connect(str(database)) as conn:
+                self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 1)
+                self.assertNotIn(
+                    "payload_sha256",
+                    {row[1] for row in conn.execute("PRAGMA table_info(sessions)")},
+                )
+                self.assertEqual(
+                    conn.execute("SELECT payload_json FROM sessions WHERE session_id='legacy-session'").fetchone()[0],
+                    '{"api_key":"must-not-be-migrated"}',
+                )
+            store.close()
+
+    def test_audit_updates_are_blocked_and_hash_tampering_is_detected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            database = Path(tmp) / "app.db"
+            store = SessionStore(database)
+            store.initialize()
+            store.save("session-01", {"ok": True})
+            with sqlite3.connect(str(database)) as conn:
+                with self.assertRaises(sqlite3.IntegrityError):
+                    conn.execute("UPDATE audit_log SET event_json='{}' WHERE sequence=1")
+                with self.assertRaises(sqlite3.IntegrityError):
+                    conn.execute("DELETE FROM audit_log WHERE sequence=1")
+                conn.execute("DROP TRIGGER audit_log_no_update")
+                conn.execute("UPDATE audit_log SET event_json='{}' WHERE sequence=1")
+                conn.execute(
+                    "CREATE TRIGGER audit_log_no_update BEFORE UPDATE ON audit_log "
+                    "BEGIN SELECT RAISE(ABORT, 'audit log is append-only'); END"
+                )
+            tampered_store = SessionStore(database)
+            with self.assertRaises(SessionStoreError) as failure:
+                tampered_store.initialize()
+            self.assertEqual(failure.exception.app_code, "INTEGRITY")
+            store.close()
+            tampered_store.close()
+
+    def test_session_data_and_digest_cannot_be_rewritten_away_from_the_audit_chain(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            database = Path(tmp) / "app.db"
+            store = SessionStore(database)
+            store.initialize()
+            store.save("session-01", {"original": True})
+            altered_payload = '{"tampered":true}'
+            altered_digest = hashlib.sha256(altered_payload.encode("utf-8")).hexdigest()
+            with sqlite3.connect(str(database)) as conn:
+                conn.execute(
+                    "UPDATE sessions SET payload_json=?, payload_sha256=? WHERE session_id=?",
+                    (altered_payload, altered_digest, "session-01"),
+                )
+            with self.assertRaises(SessionStoreError) as failure:
+                store.load("session-01")
+            self.assertEqual(failure.exception.app_code, "INTEGRITY")
+            store.close()
+
+    def test_payload_validation_rejects_credentials_non_json_and_oversize(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp) / "app.db")
+            store.initialize()
+            for session_id, payload in (
+                ("../outside", {"ok": True}),
+                ("session-01", {"api_key": "secret"}),
+                ("session-01", {"value": float("nan")}),
+                ("session-01", {"value": "x" * MAX_SESSION_BYTES}),
+            ):
+                with self.subTest(session_id=session_id, size=len(str(payload))):
+                    with self.assertRaises(SessionStoreError) as failure:
+                        store.save(session_id, payload)
+                    self.assertEqual(failure.exception.app_code, "VALIDATION")
+            self.assertEqual(store.verify_audit_log()["events"], 2)
+            store.close()
+
+
 class TestSidecarIpc(unittest.TestCase):
     def test_rpc_cancel_is_control_allowlisted_and_dispatched_by_production_server(self) -> None:
         self.assertIn("rpc_cancel", CONTROL_ALLOWLISTED_METHODS)
@@ -140,6 +326,83 @@ class TestSidecarIpc(unittest.TestCase):
                 "result": {"cancelled": "pending-request"},
             },
         )
+
+    def test_session_save_load_rpc_round_trip_and_stale_revision_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            database = (Path(tmp) / "data" / "app.db").as_posix()
+            output = io.StringIO()
+            server = SidecarIpcServer(proto_out=output, app_home=tmp)
+            try:
+                with patch.dict(os.environ, {"EB_DATABASE_URL": f"sqlite:///{database}"}):
+                    ready = server.handle_hello({"protocol_version": "1.0", "app_home": tmp})
+                self.assertTrue(ready)
+                self.assertIsNotNone(server.session_store)
+                output.seek(0)
+                output.truncate(0)
+
+                server.dispatch_rpc({
+                    "jsonrpc": "2.0",
+                    "id": "save-1",
+                    "method": "session.save",
+                    "params": {
+                        "session_id": "workspace-1",
+                        "expected_revision": 0,
+                        "payload": {"selected_target": "electricity", "baseline_year": 2025},
+                    },
+                })
+                saved = json.loads(output.getvalue())
+                self.assertEqual(saved["id"], "save-1")
+                self.assertEqual(saved["result"]["revision"], 1)
+                output.seek(0)
+                output.truncate(0)
+
+                server.dispatch_rpc({
+                    "jsonrpc": "2.0",
+                    "id": "load-1",
+                    "method": "session.load",
+                    "params": {"session_id": "workspace-1"},
+                })
+                loaded = json.loads(output.getvalue())
+                self.assertEqual(loaded["result"]["payload"]["selected_target"], "electricity")
+                self.assertEqual(loaded["result"]["revision"], 1)
+                output.seek(0)
+                output.truncate(0)
+
+                server.dispatch_rpc({
+                    "jsonrpc": "2.0",
+                    "id": "stale-save",
+                    "method": "session.save",
+                    "params": {
+                        "session_id": "workspace-1",
+                        "expected_revision": 0,
+                        "payload": {"selected_target": "gas"},
+                    },
+                })
+                conflict = json.loads(output.getvalue())
+                self.assertEqual(conflict["error"]["app_code"], "CONFLICT")
+            finally:
+                server.close()
+
+            restarted_output = io.StringIO()
+            restarted_server = SidecarIpcServer(proto_out=restarted_output, app_home=tmp)
+            try:
+                with patch.dict(os.environ, {"EB_DATABASE_URL": f"sqlite:///{database}"}):
+                    self.assertTrue(
+                        restarted_server.handle_hello({"protocol_version": "1.0", "app_home": tmp})
+                    )
+                restarted_output.seek(0)
+                restarted_output.truncate(0)
+                restarted_server.dispatch_rpc({
+                    "jsonrpc": "2.0",
+                    "id": "load-after-restart",
+                    "method": "session.load",
+                    "params": {"session_id": "workspace-1"},
+                })
+                resumed = json.loads(restarted_output.getvalue())
+                self.assertEqual(resumed["result"]["payload"]["selected_target"], "electricity")
+                self.assertEqual(resumed["result"]["revision"], 1)
+            finally:
+                restarted_server.close()
 
     def test_logging_stderr_fallback_is_debug_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

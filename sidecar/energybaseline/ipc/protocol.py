@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional, TextIO
 
 from energybaseline.config.settings import resolve_database
+from energybaseline.persistence import SessionStore, SessionStoreError
 from energybaseline.sql.guard import validate_readonly_sql
 
 PROTOCOL_VERSION = "1.0"
@@ -104,6 +105,8 @@ class SidecarIpcServer:
         # APP_HOME in its hello frame.
         self.db_resolution = None
         self.db_error: Optional[str] = None
+        self.session_store: Optional[SessionStore] = None
+        self.session_store_error: Optional[str] = None
         self.handshaken = False
 
     def send_frame(self, payload: Dict[str, Any]) -> None:
@@ -180,6 +183,7 @@ class SidecarIpcServer:
             self.db_resolution = None
             self.db_error = str(exc)
 
+        self._initialize_session_store()
         db = self._db_status()
         self.handshaken = True
         self.send_frame(
@@ -213,6 +217,37 @@ class SidecarIpcServer:
             "writable": True,
             "warning": resolution.warning,
         }
+
+    def _initialize_session_store(self) -> None:
+        self.close()
+        self.session_store_error = None
+        resolution = self.db_resolution
+        if resolution is None:
+            self.session_store_error = "The database resolver did not provide a usable backend."
+            return
+
+        if resolution.sqlite_path is not None:
+            store = SessionStore(resolution.sqlite_path)
+        elif resolution.fallback_tier == "memory_sqlite":
+            store = SessionStore(in_memory=True)
+        else:
+            self.session_store_error = "Session persistence is unavailable for the active database backend."
+            return
+
+        try:
+            store.initialize()
+        except Exception:
+            store.close()
+            self.session_store_error = "Session persistence initialization failed."
+            LOGGER.exception("Session persistence migration failed during handshake")
+            return
+        self.session_store = store
+
+    def close(self) -> None:
+        store = self.session_store
+        self.session_store = None
+        if store is not None:
+            store.close()
 
     def _send_progress(self, req_id: Any, *, stage: str, percent: int) -> None:
         # The system.status slice is intentionally a single completion notification;
@@ -273,6 +308,39 @@ class SidecarIpcServer:
 
         if method not in ALLOWLISTED_METHODS:
             self._error(req_id, -32601, "VALIDATION", f"Method '{method}' is not on the sidecar allowlist.")
+            return
+
+        if method in {"session.save", "session.load"}:
+            allowed_params = (
+                {"session_id", "payload", "expected_revision"}
+                if method == "session.save"
+                else {"session_id"}
+            )
+            unexpected_params = sorted(set(params) - allowed_params)
+            if unexpected_params:
+                self._error(req_id, -32602, "VALIDATION", "Session request contains unsupported parameters.")
+                return
+            if self.session_store is None:
+                LOGGER.error("Session RPC unavailable: %s", self.session_store_error or "no session store")
+                self._error(req_id, -32003, "INTERNAL", "Session persistence is unavailable; see the sidecar log.")
+                return
+            try:
+                if method == "session.save":
+                    result = self.session_store.save(
+                        params.get("session_id"),
+                        params.get("payload"),
+                        params.get("expected_revision", 0),
+                    )
+                else:
+                    result = self.session_store.load(params.get("session_id"))
+            except SessionStoreError as exc:
+                self._error(req_id, exc.code, exc.app_code, exc.message)
+                return
+            except Exception:
+                LOGGER.exception("Session %s RPC failed", method)
+                self._error(req_id, -32003, "INTERNAL", "Session persistence failed; see the sidecar log.")
+                return
+            self.send_frame({"jsonrpc": "2.0", "id": req_id, "result": result})
             return
 
         if method == "system.status":
@@ -370,11 +438,13 @@ class SidecarIpcServer:
 
             if "protocol_version" in msg and "method" not in msg:
                 if not self.handle_hello(msg):
+                    self.close()
                     return 2
             else:
                 self.dispatch_rpc(msg)
 
         # Stdin EOF is the authoritative graceful-shutdown signal (LIF-1).
+        self.close()
         return 0
 
 

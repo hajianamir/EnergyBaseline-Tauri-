@@ -13,7 +13,12 @@ a = Analysis(
     pathex=['.'],
     binaries=[],
     datas=[(str(sbom_path), 'energybaseline/data')],
-    hiddenimports=['energybaseline.config.settings', 'energybaseline.sql.guard', 'energybaseline.ipc.protocol'],
+    hiddenimports=[
+        'energybaseline.config.settings',
+        'energybaseline.persistence',
+        'energybaseline.sql.guard',
+        'energybaseline.ipc.protocol',
+    ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
