@@ -51,6 +51,11 @@ ALLOWLISTED_METHODS = {
     "system.sbom",
 }
 
+# Protocol control RPCs are allowlisted separately from application methods.
+# rpc_cancel is a dedicated bridge operation, not a business method in the
+# Rust/Python application-method parity list above.
+CONTROL_ALLOWLISTED_METHODS = frozenset({"rpc_cancel"})
+
 
 def _is_valid_id(value: Any) -> bool:
     # JSON-RPC IDs may be strings, numbers, or null, but not arrays or objects.
@@ -222,7 +227,9 @@ class SidecarIpcServer:
             self._error(req_id, -32602, "VALIDATION", "Request params must be a JSON object.")
             return
 
-        if method == "rpc_cancel":
+        # This control-plane method is handled before the handshake/business RPC
+        # checks; the Rust bridge only sends it after wait_until_ready().
+        if method == "rpc_cancel" and method in CONTROL_ALLOWLISTED_METHODS:
             target_id = params.get("id")
             if not _is_valid_id(target_id):
                 self._error(req_id, -32602, "VALIDATION", "Cancellation id must be a string, number, or null.")

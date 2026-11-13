@@ -4,6 +4,12 @@ on:
   push:
   pull_request:
   workflow_dispatch:
+    inputs:
+      diagnose_tauri_test_loader:
+        description: "Opt in to a non-blocking Windows tauri/test loader diagnostic"
+        required: false
+        default: false
+        type: boolean
 
 jobs:
   validate:
@@ -83,7 +89,85 @@ jobs:
           }
           exit $testExitCode
 
-      - name: Run locked Rust integration tests (Linux)
+      - name: Collect opt-in Windows tauri/test loader diagnostics
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.diagnose_tauri_test_loader == 'true' && runner.os == 'Windows' }}
+        continue-on-error: true
+        working-directory: src-tauri
+        shell: pwsh
+        run: |
+          $diagDir = Join-Path $env:RUNNER_TEMP "tauri-test-loader"
+          New-Item -ItemType Directory -Force -Path $diagDir | Out-Null
+          $buildLog = Join-Path $diagDir "cargo-test-no-run.log"
+          $diagLog = Join-Path $diagDir "binary-loader-diagnostics.log"
+
+          cargo test --lib --locked --features integration --no-run *> $buildLog
+          $buildExitCode = $LASTEXITCODE
+          Get-Content $buildLog
+          if ($buildExitCode -ne 0) {
+            throw "Could not build the tauri/test diagnostic binary (exit $buildExitCode)."
+          }
+
+          $testBin = Get-ChildItem -Path "target/debug" -Filter "energybaseline_lib-*.exe" -Recurse -File -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -First 1
+          if ($null -eq $testBin) {
+            throw "Could not locate the tauri/test binary under target/debug."
+          }
+          "Test binary: $($testBin.FullName)" | Tee-Object -FilePath $diagLog
+
+          $dumpbinPath = (Get-Command dumpbin.exe -ErrorAction SilentlyContinue).Source
+          if (-not $dumpbinPath) {
+            $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio/Installer/vswhere.exe"
+            if (Test-Path $vswhere) {
+              $vsInstall = (& $vswhere -latest -products "*" -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath | Select-Object -First 1)
+              if ($vsInstall) {
+                $msvcRoot = Join-Path $vsInstall "VC/Tools/MSVC"
+                $toolsets = Get-ChildItem -Path $msvcRoot -Directory -ErrorAction SilentlyContinue | Sort-Object Name -Descending
+                foreach ($toolset in $toolsets) {
+                  foreach ($hostTarget in @("Hostx64/x64", "Hostx86/x64")) {
+                    $candidate = Join-Path $toolset.FullName "bin/$hostTarget/dumpbin.exe"
+                    if (Test-Path $candidate) {
+                      $dumpbinPath = $candidate
+                      break
+                    }
+                  }
+                  if ($dumpbinPath) { break }
+                }
+              }
+            }
+          }
+
+          if ($dumpbinPath) {
+            foreach ($mode in @("/dependents", "/imports")) {
+              "=== dumpbin $mode ===" | Tee-Object -FilePath $diagLog -Append
+              & $dumpbinPath $mode $testBin.FullName 2>&1 | Tee-Object -FilePath $diagLog -Append
+            }
+          } else {
+            "dumpbin.exe was not found on this Windows runner." | Tee-Object -FilePath $diagLog -Append
+          }
+
+          "=== test binary --list ===" | Tee-Object -FilePath $diagLog -Append
+          $testProcess = Start-Process -FilePath $testBin.FullName -ArgumentList "--list" -Wait -PassThru
+          "Test binary exit code: $($testProcess.ExitCode)" | Tee-Object -FilePath $diagLog -Append
+
+          try {
+            $events = Get-WinEvent -FilterHashtable @{ LogName = "Application"; StartTime = (Get-Date).AddMinutes(-10) } -MaxEvents 50 -ErrorAction Stop |
+              Where-Object { $_.ProviderName -in @("Application Error", "Windows Error Reporting") } |
+              Select-Object TimeCreated, Id, ProviderName, Message
+            $events | Format-List | Out-File -FilePath (Join-Path $diagDir "application-errors.txt") -Encoding utf8
+          } catch {
+            $_.Exception.Message | Out-File -FilePath (Join-Path $diagDir "application-errors.txt") -Encoding utf8
+          }
+
+      - name: Upload Windows tauri/test loader diagnostics
+        if: ${{ always() && github.event_name == 'workflow_dispatch' && github.event.inputs.diagnose_tauri_test_loader == 'true' && runner.os == 'Windows' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-tauri-test-loader-diagnostics
+          path: ${{ runner.temp }}/tauri-test-loader/
+          if-no-files-found: warn
+
+      - name: Run locked MockRuntime RPC integration tests (Linux only)
         if: runner.os == 'Linux'
         working-directory: src-tauri
         shell: pwsh
@@ -100,7 +184,7 @@ jobs:
           }
           exit $testExitCode
 
-      - name: Run locked Rust unit tests (Windows)
+      - name: Run locked non-integration Rust unit tests (Windows)
         if: runner.os == 'Windows'
         working-directory: src-tauri
         shell: pwsh

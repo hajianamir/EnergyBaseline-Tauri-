@@ -189,6 +189,9 @@ impl<R: Runtime> SidecarHandle<R> {
             }
         };
 
+        // This is the Rust Shell API, not the shell plugin's webview `spawn`
+        // command; `shell:allow-spawn` does not scope this call. Keep executable
+        // selection and resource-path resolution in `command_details()`.
         let mut command = self
             .app
             .shell()

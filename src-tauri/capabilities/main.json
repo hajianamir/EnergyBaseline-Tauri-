@@ -1,22 +1,11 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "main-capability",
-  "description": "Explicit non-wildcard ACL for EnergyBaseline main window (ARC-1..ARC-6).",
+  "description": "Explicit non-wildcard ACL for EnergyBaseline main window (ARC-1..ARC-6); sidecar spawning is Rust-owned and is not granted through shell:allow-spawn.",
   "windows": ["main"],
   "permissions": [
     "core:default",
     "core:window:allow-set-progress-bar",
-    {
-      "identifier": "shell:allow-spawn",
-      "allow": [
-        {
-          "name": "energybaseline-sidecar",
-          "cmd": "$RESOURCE/energybaseline_sidecar/energybaseline_sidecar.exe",
-          "args": ["--stdio"],
-          "sidecar": false
-        }
-      ]
-    },
     "dialog:allow-open",
     "dialog:allow-save",
     "notification:default",

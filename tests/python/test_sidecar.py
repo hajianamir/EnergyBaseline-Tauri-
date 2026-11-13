@@ -1,3 +1,4 @@
+import io
 import json
 import logging
 import os
@@ -20,6 +21,11 @@ from energybaseline.config.settings import (  # noqa: E402
 )
 from energybaseline.sql.guard import validate_readonly_sql  # noqa: E402
 from energybaseline.main import _configure_logging  # noqa: E402
+from energybaseline.ipc.protocol import (  # noqa: E402
+    ALLOWLISTED_METHODS,
+    CONTROL_ALLOWLISTED_METHODS,
+    SidecarIpcServer,
+)
 
 
 class TestDbResolver(unittest.TestCase):
@@ -109,6 +115,32 @@ class TestDbResolver(unittest.TestCase):
 
 
 class TestSidecarIpc(unittest.TestCase):
+    def test_rpc_cancel_is_control_allowlisted_and_dispatched_by_production_server(self) -> None:
+        self.assertIn("rpc_cancel", CONTROL_ALLOWLISTED_METHODS)
+        self.assertNotIn("rpc_cancel", ALLOWLISTED_METHODS)
+
+        proto_out = io.StringIO()
+        server = SidecarIpcServer(proto_out=proto_out)
+        server.handshaken = True
+        server.dispatch_rpc(
+            {
+                "jsonrpc": "2.0",
+                "id": "cancel-call",
+                "method": "rpc_cancel",
+                "params": {"id": "pending-request"},
+            }
+        )
+
+        self.assertIn("pending-request", server.cancelled_ids)
+        self.assertEqual(
+            json.loads(proto_out.getvalue()),
+            {
+                "jsonrpc": "2.0",
+                "id": "cancel-call",
+                "result": {"cancelled": "pending-request"},
+            },
+        )
+
     def test_logging_stderr_fallback_is_debug_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             not_a_directory = Path(tmp) / "not-a-directory"

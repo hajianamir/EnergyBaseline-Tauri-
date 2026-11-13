@@ -4,7 +4,7 @@
 
 ## Build under test
 
-Use the `EnergyBaseline-Windows-NSIS-M1` artifact (artifact ID `14044724915`) from [CI run 43441331640](https://github.com/hajianamir/EnergyBaseline-Tauri-/actions/runs/43441331640). That run passed locked Windows/Ubuntu validation and the automated Windows freeze, NSIS install, resource-staging, and sidecar IPC/EOF smoke checks. Those checks do **not** launch and forcibly terminate the actual Tauri desktop process.
+Use the `EnergyBaseline-Windows-NSIS-M1` artifact (artifact ID `14047791741`) from [CI run 43443829616](https://github.com/hajianamir/EnergyBaseline-Tauri-/actions/runs/43443829616). That run passed locked Windows/Ubuntu validation and the automated Windows freeze, NSIS install, resource-staging, and sidecar IPC/EOF smoke checks. Those checks do **not** launch and forcibly terminate the actual Tauri desktop process.
 
 ## Preconditions
 
@@ -15,7 +15,7 @@ Use the `EnergyBaseline-Windows-NSIS-M1` artifact (artifact ID `14044724915`) fr
 
 ## Procedure
 
-1. Wait for the app to report the sidecar **Ready** (for example, in System Status); database health is a separate signal. Record the startup time; the handshake must complete within 10 seconds. Reaching Ready from this installed build also verifies the real shell-spawn path against the configured capability/resource path. A package file-staging or direct sidecar smoke is not a substitute. If Ready is not reached, retain the error and resolved path, mark the runtime check failed, and do not force-terminate an unverified process.
+1. Wait for the app to report the sidecar **Ready** (for example, in System Status); database health is a separate signal. Record the startup time; the handshake must complete within 10 seconds. Reaching Ready from this installed build verifies that the Rust-owned launcher resolves and starts the packaged resource path. The Rust `ShellExt::shell().command(...).spawn()` call does not use the shell plugin's webview `shell:allow-spawn` capability; that unused permission was removed, and the former `$RESOURCE` entry was not an active security boundary. A package file-staging or direct sidecar smoke is not a substitute. If Ready is not reached, retain the error and resolved path, mark the runtime check failed, and do not force-terminate an unverified process.
 2. Open a normal, non-elevated PowerShell session as the same user. Run both snippets in that same session. Capture and inspect the app/sidecar process tree:
 
    ```powershell
