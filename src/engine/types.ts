@@ -525,6 +525,8 @@ export interface TargetModelingBundle {
   t11WinnerVsRunnerUp: {
     dmStat: number;
     dmPValue: number;
+    dmHacLag?: number;
+    hlnFactor?: number;
     correctedTStat: number;
     correctedTPValue: number;
     interpretation: string;

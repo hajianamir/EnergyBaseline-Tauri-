@@ -404,7 +404,9 @@ export const ModelingView: React.FC<ModelingViewProps> = ({
           <div className="text-slate-500">Top-1 Rank Stability (±20%)</div>
           <div className="font-mono font-bold text-base mt-0.5">{bundle.top5[0]?.rankStabilityPct ?? 0}%</div>
           <div className="text-[11px] text-slate-500">
-            {bundle.t11WinnerVsRunnerUp ? `DM p=${bundle.t11WinnerVsRunnerUp.dmPValue}` : 'T11 check'}
+            {bundle.t11WinnerVsRunnerUp
+              ? `HAC-HLN DM p=${bundle.t11WinnerVsRunnerUp.dmPValue} · lag=${bundle.t11WinnerVsRunnerUp.dmHacLag ?? '—'} · HLN=${bundle.t11WinnerVsRunnerUp.hlnFactor ?? '—'}`
+              : 'T11 check'}
           </div>
         </div>
         <div>

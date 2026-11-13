@@ -9,13 +9,26 @@ import { executeGuardedLocalSql, validateReadOnlySql } from './sqlGuard';
 import {
   buildDefaultVsgForTarget,
   computeEdaAndMining,
+  dieboldMarianoHlnTest,
+  getBaselineRows,
   createDefaultTcpConfig,
   reevaluateTestResults,
   runDiagnosticsSuite,
   validateVsgConflict,
 } from './stats';
-import { createLockedBaseline, getScoringWeights, runTargetModelingPipeline } from './modeling';
-import { predictFromLockedBaseline } from './monitoring';
+import {
+  buildForwardChainingFolds,
+  buildTemporalForecastFeatures,
+  createLockedBaseline,
+  derivePurgeGapSteps,
+  fitNestedBlendWeights,
+  getScoringWeights,
+  prepareTrainingFold,
+  runTargetModelingPipeline,
+  shouldFitStackedEnsemble,
+} from './modeling';
+import { buildTemporalWarmupContext, predictFromLockedBaseline } from './monitoring';
+import type { DatasetRow } from './types';
 import { buildDeterministicReportModel, verifyReportNarrativeConsistency } from './report';
 import { resolveStandardForDomain } from './domains';
 
@@ -26,6 +39,128 @@ test('Synthetic ground-truth generator is deterministic for a fixed seed', () =>
   assert.equal(ds1.rows.length, 365);
   assert.deepEqual(ds1.rows[0], ds2.rows[0]);
 });
+
+test('Phase 2 / F-03: fold imputation and feature selection use training rows only', () => {
+  const trainRows: DatasetRow[] = Array.from({ length: 20 }, (_, i) => ({
+    timestamp: new Date(Date.UTC(2025, 0, i + 1)).toISOString(),
+    target: i,
+    driver: i === 0 ? null : i * 10,
+  }));
+  trainRows.push({ timestamp: '2030-01-01T00:00:00.000Z', target: null, driver: 1_000_000 });
+  const prepared = prepareTrainingFold(trainRows, 'target', ['driver']);
+  assert.equal(prepared.trainingRows.length, 20, 'rows without an observed target are excluded before fold preprocessing');
+  assert.equal(prepared.medians.driver, 100, 'validation/future values and target-missing rows must not affect the training median');
+  assert.deepEqual(prepared.features, ['driver']);
+});
+
+test('Phase 2 / F-03: CV folds are expanding forward-chaining with no future training rows', () => {
+  const folds = buildForwardChainingFolds(100, 4, 7);
+  assert.equal(folds.length, 4);
+  let previousValidationStart = -1;
+  for (const fold of folds) {
+    assert.equal(fold.trainStart, 0);
+    assert.ok(fold.trainEndExclusive <= fold.validationStart - 7, 'purge gap must separate training and validation');
+    assert.ok(fold.validationStart > previousValidationStart);
+    assert.ok(fold.trainEndExclusive < fold.validationEndExclusive);
+    previousValidationStart = fold.validationStart;
+  }
+});
+
+test('Phase 2 / F-03: modeling refuses baseline windows that cannot support two forward folds', () => {
+  const ds = generateSyntheticDataset('energy_mv', 42);
+  const rows = ds.rows.slice(0, 20);
+  const small = {
+    ...ds,
+    rows,
+    rawRowCount: rows.length,
+    temporal: { ...ds.temporal, baselineEnd: rows[rows.length - 1].timestamp },
+  };
+  const vsg = buildDefaultVsgForTarget(small, 'kwh_total', '2026-01-01T00:00:00Z');
+  assert.throws(
+    () => runTargetModelingPipeline(small, 'kwh_total', vsg.entries, createDefaultTcpConfig(small), 42),
+    /at least two usable forward-chaining folds/
+  );
+});
+
+test('Phase 2 / F-03: purge gap derives from the largest lag/window requirement', () => {
+  assert.equal(derivePurgeGapSteps(), 7, 'Informer t-7 is the longest current temporal lag');
+  assert.equal(derivePurgeGapSteps([1, 4, 7], [12]), 12, 'a longer configured rolling window expands the purge');
+});
+
+test('Phase 2 / F-03: temporal validation features use the latest causal history, including purged context', () => {
+  const allRows: DatasetRow[] = Array.from({ length: 30 }, (_, i) => ({
+    timestamp: new Date(Date.UTC(2025, 0, i + 1)).toISOString(),
+    x: i,
+    z: i + 100,
+  }));
+  const fold = buildForwardChainingFolds(allRows.length, 1, 7)[0];
+  const modelTrainingRows = allRows.slice(fold.trainStart, fold.trainEndExclusive);
+  const historyRows = allRows.slice(0, fold.validationStart);
+  const validationRows = allRows.slice(fold.validationStart, fold.validationEndExclusive);
+  assert.ok(historyRows.length > modelTrainingRows.length, 'purged covariate rows remain available as causal forecast context');
+  assert.ok(historyRows.every((row) => row.timestamp < validationRows[0].timestamp), 'history contains no future rows');
+  const features = buildTemporalForecastFeatures(historyRows, validationRows, ['x', 'z'], {}, 'informer');
+  assert.deepEqual(features[0], [15, 115, 14, 12, 8, 114, 112, 108]);
+});
+
+test('Phase 2 / F-03: baseline row selection never falls back to the complete dataset', () => {
+  const ds = generateSyntheticDataset('energy_mv', 42);
+  const outside = { ...ds, temporal: { ...ds.temporal, baselineStart: '2035-01-01T00:00:00.000Z', baselineEnd: '2035-12-31T23:59:59.999Z' } };
+  assert.equal(getBaselineRows(outside).length, 0);
+  assert.notEqual(getBaselineRows(outside).length, outside.rows.length);
+  const reversed = { ...ds, rows: [...ds.rows].reverse() };
+  const chronological = getBaselineRows(reversed);
+  assert.equal(chronological[0].timestamp, ds.temporal.baselineStart);
+  assert.ok(chronological[0].timestamp < chronological[chronological.length - 1].timestamp);
+});
+
+test('Phase 2 / F-03: temporal monitoring context warms from the immediately preceding rows', () => {
+  const ds = generateSyntheticDataset('energy_mv', 42);
+  const requested = ds.rows.slice(30, 33).reverse();
+  const context = buildTemporalWarmupContext(requested, ds);
+  assert.equal(context.scoreOffset, 7);
+  assert.equal(context.rows.length, 10);
+  assert.deepEqual(context.rows.slice(0, 7), ds.rows.slice(23, 30));
+  assert.deepEqual(context.rows.slice(context.scoreOffset), [...requested].reverse());
+  assert.deepEqual(context.requestedOrder, [2, 1, 0], 'predictions can be restored to the caller’s requested row order');
+});
+
+test('Phase 2 / F-03: ensemble weights use an earlier nested OOF block and fast mode disables selection', () => {
+  const actual = Array.from({ length: 20 }, (_, i) => i < 12 ? 0 : 10);
+  const first = Array.from({ length: 20 }, () => 0);
+  const second = Array.from({ length: 20 }, () => 10);
+  const fit = fitNestedBlendWeights(actual, first, second)!;
+  assert.equal(fit.trainEnd, 12);
+  assert.equal(fit.weight1, 1, 'weights are selected using only the first 60% training block');
+  assert.ok(fit.blendRmse >= fit.baselineRmse, 'later validation outcomes are not used to retune the weights');
+  assert.equal(shouldFitStackedEnsemble('fast'), false);
+  assert.equal(shouldFitStackedEnsemble('standard'), true);
+});
+
+test('Phase 2 / F-03: Diebold-Mariano uses HAC variance and HLN finite-sample correction', () => {
+  const differential: number[] = [];
+  let state = 0;
+  for (let i = 0; i < 120; i++) {
+    state = 0.75 * state + Math.sin(i * 0.73) + 0.2 * Math.cos(i * 0.19);
+    differential.push(state);
+  }
+  const result = dieboldMarianoHlnTest(differential, 1)!;
+  assert.ok(result.hacLag > 0);
+  assert.ok(result.longRunVariance > 0);
+  assert.ok(result.hlnFactor > 0 && result.hlnFactor < 1);
+  const dMean = differential.reduce((sum, value) => sum + value, 0) / differential.length;
+  const centered = differential.map((value) => value - dMean);
+  let expectedLongRunVariance = centered.reduce((sum, value) => sum + value * value, 0) / centered.length;
+  for (let lag = 1; lag <= result.hacLag; lag++) {
+    const covariance = centered.slice(lag).reduce((sum, value, i) => sum + value * centered[i], 0) / centered.length;
+    expectedLongRunVariance += 2 * (1 - lag / (result.hacLag + 1)) * covariance;
+  }
+  const expectedHln = Math.sqrt((centered.length - 1) / centered.length);
+  assert.ok(Math.abs(result.longRunVariance - expectedLongRunVariance) < 1e-10);
+  assert.ok(Math.abs(result.hlnFactor - expectedHln) < 1e-12);
+  assert.ok(Number.isFinite(result.statistic) && result.pValue >= 0 && result.pValue <= 1);
+});
+
 
 test('DAT-3 refuses coarser-to-finer disaggregation with DATA_REFUSED', () => {
   const check = validateGranularityTransition('daily', 'hourly');

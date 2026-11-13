@@ -15,8 +15,10 @@ import {
 import {
   chiSquarePValue,
   circularBlockBootstrapCi,
+  dieboldMarianoHlnTest,
   getBaselineRows,
   mean,
+  median,
   normalPValueTwoSided,
   pearsonCorr,
   stdDev,
@@ -636,6 +638,11 @@ function predictMlpDeterministic(X: number[][], m: MlpParams): number[] {
   });
 }
 
+// Temporal feature families use a maximum seven-row historical context (Informer t-7).
+export const TEMPORAL_FEATURE_LOOKBACK = 7;
+const TEMPORAL_FEATURE_LAGS = [1, 2, 3, 4, TEMPORAL_FEATURE_LOOKBACK];
+const TEMPORAL_FEATURE_WINDOWS = [4];
+
 // Deterministic temporal feature builders for NN sequence & transformer families (no target leakage)
 function buildTemporalContextFeatures(
   rows: DatasetRow[],
@@ -692,9 +699,21 @@ function buildTemporalContextFeatures(
       return [...base, ...patchFeatures];
     }
     // informer (ProbSparse salient lag tokens: max-deviation lags t-1, t-3, t-7)
-    const sparse = features.slice(0, 2).flatMap((f) => [getVal(i - 1, f), getVal(i - 3, f), getVal(i - 7, f)]);
+    const sparse = features.slice(0, 2).flatMap((f) => [getVal(i - 1, f), getVal(i - 3, f), getVal(i - TEMPORAL_FEATURE_LOOKBACK, f)]);
     return [...base, ...sparse];
   });
+}
+
+export function buildTemporalForecastFeatures(
+  historyRows: DatasetRow[],
+  forecastRows: DatasetRow[],
+  features: string[],
+  colMedians: Record<string, number>,
+  mode: 'gru_lag' | 'causal_tcn' | 'nbeats' | 'tft' | 'patchtst' | 'informer'
+): number[][] {
+  if (historyRows === forecastRows) return buildTemporalContextFeatures(forecastRows, features, colMedians, mode);
+  const prefix = historyRows.slice(-TEMPORAL_FEATURE_LOOKBACK);
+  return buildTemporalContextFeatures([...prefix, ...forecastRows], features, colMedians, mode).slice(prefix.length);
 }
 
 export type SerializedModelPayload =
@@ -984,6 +1003,135 @@ export function getThresholdLimits(
   return resolveThresholdLimits(profile, granularity, customThresholds);
 }
 
+export interface TrainingFoldPreprocessing {
+  trainingRows: DatasetRow[];
+  features: string[];
+  medians: Record<string, number>;
+  prunedCollinear: { feature: string; reason: string }[];
+}
+
+/**
+ * Fit imputation and target-dependent feature selection on one training partition only.
+ * Call this independently for each CV fold; never pass validation/holdout rows here.
+ */
+export function prepareTrainingFold(
+  rows: DatasetRow[],
+  targetName: string,
+  candidatePool: string[],
+  forcedFeatures: string[] = []
+): TrainingFoldPreprocessing {
+  const trainingRows = rows.filter((row) => typeof row[targetName] === 'number' && Number.isFinite(row[targetName] as number));
+  const medians: Record<string, number> = {};
+  for (const feature of candidatePool) {
+    const values = trainingRows
+      .map((row) => row[feature])
+      .filter((value): value is number => typeof value === 'number' && Number.isFinite(value));
+    medians[feature] = values.length ? median(values) : 0;
+  }
+
+  const forced = new Set(forcedFeatures);
+  const target = trainingRows.map((row) => row[targetName] as number);
+  const ranked = candidatePool
+    .filter((feature) => trainingRows.some((row) => typeof row[feature] === 'number' && Number.isFinite(row[feature] as number)))
+    .slice()
+    .sort((a, b) => {
+      if (forced.has(a) !== forced.has(b)) return forced.has(a) ? -1 : 1;
+      const xa = trainingRows.map((row) => typeof row[a] === 'number' && Number.isFinite(row[a] as number) ? row[a] as number : medians[a]);
+      const xb = trainingRows.map((row) => typeof row[b] === 'number' && Number.isFinite(row[b] as number) ? row[b] as number : medians[b]);
+      return Math.abs(pearsonCorr(xb, target)) - Math.abs(pearsonCorr(xa, target));
+    });
+
+  const features: string[] = [];
+  const prunedCollinear: TrainingFoldPreprocessing['prunedCollinear'] = [];
+  const maxFeatures = Math.max(1, Math.min(ranked.length, Math.floor(trainingRows.length / 18)));
+  for (const feature of ranked) {
+    const values = trainingRows.map((row) => typeof row[feature] === 'number' && Number.isFinite(row[feature] as number) ? row[feature] as number : medians[feature]);
+    const collinearWith = features.find((selected) => {
+      const selectedValues = trainingRows.map((row) => typeof row[selected] === 'number' && Number.isFinite(row[selected] as number) ? row[selected] as number : medians[selected]);
+      return Math.abs(pearsonCorr(values, selectedValues)) >= 0.95;
+    });
+    if (collinearWith && !forced.has(feature)) {
+      prunedCollinear.push({ feature, reason: `Pruned by fold-local VAL-6 (|r| ≥ 0.95 with '${collinearWith}').` });
+      continue;
+    }
+    if (features.length >= maxFeatures && !forced.has(feature)) {
+      prunedCollinear.push({ feature, reason: `Pruned by fold-local feature-capacity bound (${maxFeatures}).` });
+      continue;
+    }
+    features.push(feature);
+  }
+  return { trainingRows, features, medians, prunedCollinear };
+}
+
+export interface ForwardChainingFold {
+  trainStart: number;
+  trainEndExclusive: number;
+  validationStart: number;
+  validationEndExclusive: number;
+}
+
+/** Derive the temporal purge gap from the longest lag/window used by current models. */
+export function derivePurgeGapSteps(
+  lagSteps: number[] = TEMPORAL_FEATURE_LAGS,
+  rollingWindowSteps: number[] = TEMPORAL_FEATURE_WINDOWS
+): number {
+  return Math.max(0, ...lagSteps, ...rollingWindowSteps);
+}
+
+/** Expanding-window CV: each fold trains strictly before its validation block. */
+export function buildForwardChainingFolds(nRows: number, nFolds: number, purgeGapSteps: number): ForwardChainingFold[] {
+  if (nRows <= 0 || nFolds <= 0) return [];
+  const folds: ForwardChainingFold[] = [];
+  for (let fold = 0; fold < nFolds; fold++) {
+    const validationStart = Math.floor((fold + 1) * nRows / (nFolds + 1));
+    const validationEndExclusive = fold === nFolds - 1
+      ? nRows
+      : Math.floor((fold + 2) * nRows / (nFolds + 1));
+    const trainEndExclusive = validationStart - Math.max(0, Math.floor(purgeGapSteps));
+    if (trainEndExclusive > 0 && validationEndExclusive > validationStart) {
+      folds.push({ trainStart: 0, trainEndExclusive, validationStart, validationEndExclusive });
+    }
+  }
+  return folds;
+}
+
+export function shouldFitStackedEnsemble(effort: TcpConfig['effortProfile']): boolean {
+  return effort !== 'fast';
+}
+
+export function fitNestedBlendWeights(
+  actual: number[],
+  firstPrediction: number[],
+  secondPrediction: number[]
+): { weight1: number; weight2: number; trainEnd: number; validationStart: number; baselineRmse: number; blendRmse: number } | null {
+  const n = Math.min(actual.length, firstPrediction.length, secondPrediction.length);
+  if (n < 10) return null;
+  const trainEnd = Math.floor(n * 0.6);
+  if (trainEnd < 4 || n - trainEnd < 4) return null;
+  let bestWeight1 = 1;
+  let bestLoss = Infinity;
+  for (let step = 0; step <= 20; step++) {
+    const weight1 = step / 20;
+    const loss = actual.slice(0, trainEnd).reduce((sum, value, i) => {
+      const prediction = weight1 * firstPrediction[i] + (1 - weight1) * secondPrediction[i];
+      return sum + (value - prediction) ** 2;
+    }, 0) / trainEnd;
+    if (loss < bestLoss) {
+      bestLoss = loss;
+      bestWeight1 = weight1;
+    }
+  }
+  const validationStart = trainEnd;
+  const validationActual = actual.slice(validationStart, n);
+  const baselineRmse = Math.sqrt(validationActual.reduce((sum, value, i) => sum + (value - firstPrediction[validationStart + i]) ** 2, 0) / validationActual.length);
+  const blendRmse = Math.sqrt(validationActual.reduce((sum, value, i) => {
+    const idx = validationStart + i;
+    const prediction = bestWeight1 * firstPrediction[idx] + (1 - bestWeight1) * secondPrediction[idx];
+    return sum + (value - prediction) ** 2;
+  }, 0) / validationActual.length);
+  return { weight1: bestWeight1, weight2: 1 - bestWeight1, trainEnd, validationStart, baselineRmse, blendRmse };
+}
+
 // ---------- Multi-Target Pipeline Runner ----------
 
 export function runTargetModelingPipeline(
@@ -1006,61 +1154,32 @@ export function runTargetModelingPipeline(
     dataset.columns.filter((c) => vsg[c.name]?.state === 'force_include').map((c) => c.name)
   );
 
-  // Build cleaned baseline matrix (impute missing predictors via median + never impute target DAT-5)
+  // Keep the final holdout out of every preprocessing decision. Target rows are
+  // filtered before splitting, but predictor imputation/selection are fit separately
+  // inside each CV training partition below.
   const cleanRows = rows.filter((r) => typeof r[targetName] === 'number' && Number.isFinite(r[targetName] as number));
-  const colMedians: Record<string, number> = {};
-  for (const fname of candidatePool) {
-    const nums = cleanRows.map((r) => r[fname]).filter((v): v is number => typeof v === 'number' && Number.isFinite(v));
-    const sorted = [...nums].sort((a, b) => a - b);
-    colMedians[fname] = sorted[Math.floor(sorted.length / 2)] ?? 0;
-  }
-
-  // VAL-6 Collinearity pruning (|r| >= 0.95)
-  const selectedFeatures: string[] = [];
-  const prunedCollinear: { feature: string; reason: string }[] = [];
-  const yAll = cleanRows.map((r) => r[targetName] as number);
-  const rankedPool = [...candidatePool].sort((a, b) => {
-    const fa = forcedSet.has(a) ? 2 : 0;
-    const fb = forcedSet.has(b) ? 2 : 0;
-    if (fa !== fb) return fb - fa;
-    const xa = cleanRows.map((r) => (typeof r[a] === 'number' ? (r[a] as number) : colMedians[a]));
-    const xb = cleanRows.map((r) => (typeof r[b] === 'number' ? (r[b] as number) : colMedians[b]));
-    return Math.abs(pearsonCorr(xb, yAll)) - Math.abs(pearsonCorr(xa, yAll));
-  });
-
-  const kMax = Math.max(1, Math.min(rankedPool.length, Math.floor(cleanRows.length / 18)));
-  for (const fname of rankedPool) {
-    const xF = cleanRows.map((r) => (typeof r[fname] === 'number' ? (r[fname] as number) : colMedians[fname]));
-    const collinearWith = selectedFeatures.find((sf) => {
-      const xS = cleanRows.map((r) => (typeof r[sf] === 'number' ? (r[sf] as number) : colMedians[sf]));
-      return Math.abs(pearsonCorr(xF, xS)) >= 0.95;
-    });
-    if (collinearWith && !forcedSet.has(fname)) {
-      prunedCollinear.push({ feature: fname, reason: `Pruned by VAL-6 (|r| ≥ 0.95 with '${collinearWith}').` });
-      continue;
-    }
-    if (selectedFeatures.length >= kMax && !forcedSet.has(fname)) {
-      prunedCollinear.push({ feature: fname, reason: `Pruned by VAL-6 k_max=${kMax} capacity bound.` });
-      continue;
-    }
-    selectedFeatures.push(fname);
-  }
-  if (selectedFeatures.length === 0 && candidatePool.length > 0) {
-    selectedFeatures.push(candidatePool[0]);
-  }
-
-  // VAL-1 / VAL-2 / VAL-5: Holdout split (last 12% if n >= 120) + Blocked K-Fold with Purge Gap
+  if (cleanRows.length < 10) throw new Error(`Baseline window has ${cleanRows.length} complete target rows; at least 10 are required for modeling.`);
   const hasHoldout = cleanRows.length >= 120;
   const trainLen = hasHoldout ? Math.floor(cleanRows.length * 0.88) : cleanRows.length;
   const trainRows = cleanRows.slice(0, trainLen);
   const holdoutRows = hasHoldout ? cleanRows.slice(trainLen) : [];
-  const purgeGapSteps = Math.max(2, Math.round(trainLen * 0.02));
-  const kFolds = tcp.effortProfile === 'fast' ? 3 : 4;
-  const cvScheme: 'blocked_kfold' | 'forward_chaining' = cleanRows.length > 730 ? 'forward_chaining' : 'blocked_kfold';
-  const foldSize = Math.max(10, Math.floor(trainLen / kFolds));
+  const fullPreprocessing = prepareTrainingFold(trainRows, targetName, candidatePool, [...forcedSet]);
+  let selectedFeatures = fullPreprocessing.features;
+  let colMedians = fullPreprocessing.medians;
+  const prunedCollinear = fullPreprocessing.prunedCollinear;
 
-  const tempFeat = selectedFeatures.find((f) => /temp/i.test(f)) ?? selectedFeatures[0];
-  const weekFeat = selectedFeatures.find((f) => /weekend/i.test(f));
+  const purgeGapSteps = derivePurgeGapSteps();
+  const kFolds = tcp.effortProfile === 'fast' ? 3 : 4;
+  const cvScheme: 'blocked_kfold' | 'forward_chaining' = 'forward_chaining';
+  const folds = buildForwardChainingFolds(trainLen, kFolds, purgeGapSteps).filter((fold) =>
+    fold.trainEndExclusive - fold.trainStart >= 10 && fold.validationEndExclusive - fold.validationStart >= 4
+  );
+  if (folds.length < 2) {
+    throw new Error(`Baseline window cannot support at least two usable forward-chaining folds with a ${purgeGapSteps}-step purge gap.`);
+  }
+
+  let tempFeat = selectedFeatures.find((f) => /temp/i.test(f)) ?? selectedFeatures[0];
+  let weekFeat = selectedFeatures.find((f) => /weekend/i.test(f));
   const effort = tcp.effortProfile;
   const nominalCov = tcp.confidenceLevel;
   const limits = getThresholdLimits(thresholdProfile, dataset.temporal.targetGranularity, customThresholds);
@@ -1074,7 +1193,7 @@ export function runTargetModelingPipeline(
       return includeIntercept ? [1, ...vals] : vals;
     });
 
-  // Helper to evaluate a model spec via Blocked K-Fold with Purge Gap
+  // Helper to evaluate each model with expanding forward-chaining folds and a derived purge gap.
   interface ModelSpec {
     id: string;
     name: string;
@@ -1085,7 +1204,8 @@ export function runTargetModelingPipeline(
     features: string[];
     fitAndPredict: (
       trRows: DatasetRow[],
-      vaRows: DatasetRow[]
+      vaRows: DatasetRow[],
+      historyRows?: DatasetRow[]
     ) => {
       preds: number[];
       coeffs?: { term: string; value: number; se: number | null; unit: string }[];
@@ -1096,25 +1216,31 @@ export function runTargetModelingPipeline(
     };
   }
 
-  // Find best degree-day base temps for parametric models
-  const tValsTrain = tempFeat ? trainRows.map((r) => (typeof r[tempFeat] === 'number' ? (r[tempFeat] as number) : colMedians[tempFeat])) : [];
+  // Degree-day threshold search is also training-only and is recomputed per fold.
   const yTrainAll = trainRows.map((r) => r[targetName] as number);
   let bestTh = 12;
   let bestTc = 18;
-  if (tempFeat && tValsTrain.length > 10) {
+  const fitDegreeDayBases = (fitRows: DatasetRow[]): { bestTh: number; bestTc: number } => {
+    if (!tempFeat || fitRows.length <= 10) return { bestTh: 12, bestTc: 18 };
+    const tVals = fitRows.map((r) => typeof r[tempFeat!] === 'number' ? r[tempFeat!] as number : colMedians[tempFeat!] ?? 0);
+    const yVals = fitRows.map((r) => r[targetName] as number);
+    let localBestTh = 12;
+    let localBestTc = 18;
     let bestR2 = -1;
     for (let th = 10; th <= 15; th += 2) {
       for (let tc = 16; tc <= 22; tc += 2) {
-        const dd = tValsTrain.map((t) => Math.max(0, t - tc) + Math.max(0, th - t));
-        const r = pearsonCorr(dd, yTrainAll);
-        if (r * r > bestR2) {
-          bestR2 = r * r;
-          bestTh = th;
-          bestTc = tc;
+        const degreeDays = tVals.map((t) => Math.max(0, t - tc) + Math.max(0, th - t));
+        const correlation = pearsonCorr(degreeDays, yVals);
+        if (correlation * correlation > bestR2) {
+          bestR2 = correlation * correlation;
+          localBestTh = th;
+          localBestTc = tc;
         }
       }
     }
-  }
+    return { bestTh: localBestTh, bestTc: localBestTc };
+  };
+  ({ bestTh, bestTc } = fitDegreeDayBases(trainRows));
 
   const specs: ModelSpec[] = [
     {
@@ -1226,13 +1352,12 @@ export function runTargetModelingPipeline(
   ];
 
   if (tempFeat) {
-    const otherFeats = selectedFeatures.filter((f) => f !== tempFeat);
-    const build5P = (subset: DatasetRow[]) =>
+    const build5P = (subset: DatasetRow[], otherFeats: string[]) =>
       subset.map((r) => {
-        const t = typeof r[tempFeat] === 'number' ? (r[tempFeat] as number) : colMedians[tempFeat];
+        const t = typeof r[tempFeat!] === 'number' ? (r[tempFeat!] as number) : colMedians[tempFeat!] ?? 0;
         const cdd = Math.max(0, t - bestTc);
         const hdd = Math.max(0, bestTh - t);
-        return [1, cdd, hdd, ...otherFeats.map((f) => (typeof r[f] === 'number' ? (r[f] as number) : colMedians[f]))];
+        return [1, cdd, hdd, ...otherFeats.map((f) => (typeof r[f] === 'number' ? (r[f] as number) : colMedians[f] ?? 0))];
       });
 
     specs.push({
@@ -1241,12 +1366,13 @@ export function runTargetModelingPipeline(
       family: 'changepoint',
       isParametric: true,
       isNeuralNet: false,
-      paramCount: otherFeats.length + 5,
-      features: [tempFeat, ...otherFeats],
+      paramCount: selectedFeatures.length + 4,
+      features: [tempFeat, ...selectedFeatures.filter((f) => f !== tempFeat)],
       fitAndPredict: (tr, va) => {
-        const Xtr = build5P(tr);
+        const otherFeats = selectedFeatures.filter((f) => f !== tempFeat);
+        const Xtr = build5P(tr, otherFeats);
         const ytr = tr.map((r) => r[targetName] as number);
-        const Xva = build5P(va);
+        const Xva = build5P(va, otherFeats);
         const fit = fitRidgeOls(Xtr, ytr, 0.1);
         const terms = ['Base (β₀)', `CDD(>${bestTc}°C)`, `HDD(<${bestTh}°C)`, ...otherFeats];
         const eqParts = [
@@ -1311,9 +1437,10 @@ export function runTargetModelingPipeline(
       family: 'towt',
       isParametric: true,
       isNeuralNet: false,
-      paramCount: otherFeats.length + 6,
-      features: [tempFeat, ...(weekFeat ? [weekFeat] : []), ...otherFeats.slice(0, 2)],
+      paramCount: selectedFeatures.length + 6,
+      features: [tempFeat, ...(weekFeat ? [weekFeat] : []), ...selectedFeatures.filter((f) => f !== tempFeat).slice(0, 2)],
       fitAndPredict: (tr, va) => {
+        const otherFeats = selectedFeatures.filter((f) => f !== tempFeat);
         const mk = (sub: DatasetRow[]) =>
           sub.map((r) => {
             const t = typeof r[tempFeat] === 'number' ? (r[tempFeat] as number) : colMedians[tempFeat];
@@ -1531,10 +1658,10 @@ export function runTargetModelingPipeline(
       isNeuralNet: true,
       paramCount: (selectedFeatures.length + 4) * 8 + 9,
       features: selectedFeatures,
-      fitAndPredict: (tr, va) => {
+      fitAndPredict: (tr, va, historyRows = tr) => {
         const Xtr = buildTemporalContextFeatures(tr, selectedFeatures, colMedians, 'gru_lag');
         const ytr = tr.map((r) => r[targetName] as number);
-        const Xva = buildTemporalContextFeatures(va, selectedFeatures, colMedians, 'gru_lag');
+        const Xva = buildTemporalForecastFeatures(historyRows, va, selectedFeatures, colMedians, 'gru_lag');
         const m = fitMlpDeterministic(Xtr, ytr, 8, effort === 'fast' ? 10 : 20, seed + 53, true);
         return {
           preds: predictMlpDeterministic(Xva, m),
@@ -1551,10 +1678,10 @@ export function runTargetModelingPipeline(
       isNeuralNet: true,
       paramCount: (selectedFeatures.length + 7) * 8 + 9,
       features: selectedFeatures,
-      fitAndPredict: (tr, va) => {
+      fitAndPredict: (tr, va, historyRows = tr) => {
         const Xtr = buildTemporalContextFeatures(tr, selectedFeatures, colMedians, 'causal_tcn');
         const ytr = tr.map((r) => r[targetName] as number);
-        const Xva = buildTemporalContextFeatures(va, selectedFeatures, colMedians, 'causal_tcn');
+        const Xva = buildTemporalForecastFeatures(historyRows, va, selectedFeatures, colMedians, 'causal_tcn');
         const m = fitMlpDeterministic(Xtr, ytr, 8, effort === 'fast' ? 10 : 18, seed + 67, true);
         return {
           preds: predictMlpDeterministic(Xva, m),
@@ -1571,10 +1698,10 @@ export function runTargetModelingPipeline(
       isNeuralNet: true,
       paramCount: (selectedFeatures.length + 5) * 8 + 9,
       features: selectedFeatures,
-      fitAndPredict: (tr, va) => {
+      fitAndPredict: (tr, va, historyRows = tr) => {
         const Xtr = buildTemporalContextFeatures(tr, selectedFeatures, colMedians, 'nbeats');
         const ytr = tr.map((r) => r[targetName] as number);
-        const Xva = buildTemporalContextFeatures(va, selectedFeatures, colMedians, 'nbeats');
+        const Xva = buildTemporalForecastFeatures(historyRows, va, selectedFeatures, colMedians, 'nbeats');
         const m = fitMlpDeterministic(Xtr, ytr, 8, effort === 'fast' ? 10 : 20, seed + 79, true);
         return {
           preds: predictMlpDeterministic(Xva, m),
@@ -1591,10 +1718,10 @@ export function runTargetModelingPipeline(
       isNeuralNet: true,
       paramCount: (selectedFeatures.length + 5) * 9 + 10,
       features: selectedFeatures,
-      fitAndPredict: (tr, va) => {
+      fitAndPredict: (tr, va, historyRows = tr) => {
         const Xtr = buildTemporalContextFeatures(tr, selectedFeatures, colMedians, 'tft');
         const ytr = tr.map((r) => r[targetName] as number);
-        const Xva = buildTemporalContextFeatures(va, selectedFeatures, colMedians, 'tft');
+        const Xva = buildTemporalForecastFeatures(historyRows, va, selectedFeatures, colMedians, 'tft');
         const m = fitMlpDeterministic(Xtr, ytr, 9, effort === 'fast' ? 10 : 18, seed + 89, true);
         return {
           preds: predictMlpDeterministic(Xva, m),
@@ -1611,10 +1738,10 @@ export function runTargetModelingPipeline(
       isNeuralNet: true,
       paramCount: (selectedFeatures.length + 7) * 8 + 9,
       features: selectedFeatures,
-      fitAndPredict: (tr, va) => {
+      fitAndPredict: (tr, va, historyRows = tr) => {
         const Xtr = buildTemporalContextFeatures(tr, selectedFeatures, colMedians, 'patchtst');
         const ytr = tr.map((r) => r[targetName] as number);
-        const Xva = buildTemporalContextFeatures(va, selectedFeatures, colMedians, 'patchtst');
+        const Xva = buildTemporalForecastFeatures(historyRows, va, selectedFeatures, colMedians, 'patchtst');
         const m = fitMlpDeterministic(Xtr, ytr, 8, effort === 'fast' ? 10 : 18, seed + 97, true);
         return {
           preds: predictMlpDeterministic(Xva, m),
@@ -1631,10 +1758,10 @@ export function runTargetModelingPipeline(
       isNeuralNet: true,
       paramCount: (selectedFeatures.length + 7) * 8 + 9,
       features: selectedFeatures,
-      fitAndPredict: (tr, va) => {
+      fitAndPredict: (tr, va, historyRows = tr) => {
         const Xtr = buildTemporalContextFeatures(tr, selectedFeatures, colMedians, 'informer');
         const ytr = tr.map((r) => r[targetName] as number);
-        const Xva = buildTemporalContextFeatures(va, selectedFeatures, colMedians, 'informer');
+        const Xva = buildTemporalForecastFeatures(historyRows, va, selectedFeatures, colMedians, 'informer');
         const m = fitMlpDeterministic(Xtr, ytr, 8, effort === 'fast' ? 10 : 18, seed + 107, true);
         return {
           preds: predictMlpDeterministic(Xva, m),
@@ -1674,14 +1801,20 @@ export function runTargetModelingPipeline(
     const oofTs: string[] = [];
     const foldCvRmses: number[] = [];
 
-    for (let fold = 0; fold < kFolds; fold++) {
-      const valStart = fold * foldSize;
-      const valEnd = fold === kFolds - 1 ? trainLen : (fold + 1) * foldSize;
-      const trSubset = trainRows.filter((_, idx) => idx < valStart - purgeGapSteps || idx >= valEnd + purgeGapSteps);
-      const vaSubset = trainRows.slice(valStart, valEnd);
+    for (const fold of folds) {
+      const trSubset = trainRows.slice(fold.trainStart, fold.trainEndExclusive);
+      const vaSubset = trainRows.slice(fold.validationStart, fold.validationEndExclusive);
       if (trSubset.length < 10 || vaSubset.length < 4) continue;
 
-      const { preds } = spec.fitAndPredict(trSubset, vaSubset);
+      // Each fold learns medians, feature ranking/pruning, and degree-day cutoffs
+      // using only its expanding training prefix. The validation block is never read.
+      const foldPreprocessing = prepareTrainingFold(trSubset, targetName, candidatePool, [...forcedSet]);
+      selectedFeatures = foldPreprocessing.features;
+      colMedians = foldPreprocessing.medians;
+      tempFeat = selectedFeatures.find((f) => /temp/i.test(f)) ?? selectedFeatures[0];
+      weekFeat = selectedFeatures.find((f) => /weekend/i.test(f));
+      ({ bestTh, bestTc } = fitDegreeDayBases(trSubset));
+      const { preds } = spec.fitAndPredict(trSubset, vaSubset, trainRows.slice(0, fold.validationStart));
       const vaY = vaSubset.map((r) => r[targetName] as number);
       const m = computeRegressionMetrics(vaY, preds);
       foldCvRmses.push(m.cvRmse);
@@ -1691,6 +1824,14 @@ export function runTargetModelingPipeline(
         oofTs.push(vaSubset[i].timestamp);
       }
     }
+
+    // Restore training-only preprocessing fit on the complete development partition
+    // before fitting the deployable model or touching the final holdout.
+    selectedFeatures = fullPreprocessing.features;
+    colMedians = fullPreprocessing.medians;
+    tempFeat = selectedFeatures.find((f) => /temp/i.test(f)) ?? selectedFeatures[0];
+    weekFeat = selectedFeatures.find((f) => /weekend/i.test(f));
+    ({ bestTh, bestTc } = fitDegreeDayBases(trainRows));
 
     // Full train fit for coefficients, surrogate, holdout & future monitoring predictFnParams
     const fullFit = spec.fitAndPredict(trainRows, trainRows);
@@ -1885,26 +2026,60 @@ export function runTargetModelingPipeline(
     }
   }
 
-  // Ensemble Gate: blend top-2 classical models only if > 3% improvement
-  const qualifiedClassical = rawModels
-    .filter((m) => m.qualified && !m.isNeuralNet)
-    .sort((a, b) => a.oofCvRmse - b.oofCvRmse);
-  if (qualifiedClassical.length >= 2) {
-    const m1 = qualifiedClassical[0];
-    const m2 = qualifiedClassical[1];
-    const nOof = Math.min(m1.oofPredictions.length, m2.oofPredictions.length);
-    if (nOof > 10) {
-      const actuals = m1.oofPredictions.slice(0, nOof).map((p) => p.actual);
-      const blendPreds = m1.oofPredictions.slice(0, nOof).map((p, i) => 0.65 * p.predicted + 0.35 * m2.oofPredictions[i].predicted);
+  // Stacked blend weights are learned on earlier OOF predictions and assessed
+  // only on a later chronological meta-validation block. Fast mode disables this
+  // extra selection step rather than choosing weights on the evaluation predictions.
+  const ensembleCandidates = rawModels.filter((model) => !model.isNeuralNet && model.family !== 'ensemble');
+  const predictionMaps = ensembleCandidates.map((model) => ({
+    model,
+    byTimestamp: new Map(model.oofPredictions.map((row) => [row.timestamp, row])),
+  }));
+  const commonTimestamps = predictionMaps.length > 0
+    ? [...predictionMaps[0].byTimestamp.keys()].filter((timestamp) => predictionMaps.every((candidate) => candidate.byTimestamp.has(timestamp))).sort()
+    : [];
+  const innerTrainEnd = Math.floor(commonTimestamps.length * 0.6);
+  const innerRanked = predictionMaps
+    .filter((candidate) => innerTrainEnd >= 4)
+    .map((candidate) => {
+      const innerActual = commonTimestamps.slice(0, innerTrainEnd).map((timestamp) => candidate.byTimestamp.get(timestamp)!.actual);
+      const innerPredictions = commonTimestamps.slice(0, innerTrainEnd).map((timestamp) => candidate.byTimestamp.get(timestamp)!.predicted);
+      return { ...candidate, innerCvRmse: computeRegressionMetrics(innerActual, innerPredictions).cvRmse };
+    })
+    .sort((a, b) => a.innerCvRmse - b.innerCvRmse);
+
+  if (shouldFitStackedEnsemble(effort) && commonTimestamps.length >= 10 && innerRanked.length >= 2) {
+    const m1 = innerRanked[0].model;
+    const m2 = innerRanked[1].model;
+    const aligned = commonTimestamps.map((timestamp) => ({
+      first: innerRanked[0].byTimestamp.get(timestamp)!,
+      second: innerRanked[1].byTimestamp.get(timestamp)!,
+    }));
+    const nested = fitNestedBlendWeights(
+      aligned.map(({ first }) => first.actual),
+      aligned.map(({ first }) => first.predicted),
+      aligned.map(({ second }) => second.predicted)
+    );
+    if (nested && aligned.length - nested.validationStart >= 4) {
+      const validationPairs = aligned.slice(nested.validationStart);
+      const actuals = validationPairs.map(({ first }) => first.actual);
+      const firstPreds = validationPairs.map(({ first }) => first.predicted);
+      const blendPreds = validationPairs.map(({ first, second }) => nested.weight1 * first.predicted + nested.weight2 * second.predicted);
+      const baselineMetrics = computeRegressionMetrics(actuals, firstPreds);
       const bMet = computeRegressionMetrics(actuals, blendPreds);
-      if (bMet.cvRmse < m1.oofCvRmse * 0.97) {
-        const bLower = blendPreds.map((p, i) => Number((p - (m1.oofPredictions[i].upper - m1.oofPredictions[i].predicted)).toFixed(2)));
-        const bUpper = blendPreds.map((p, i) => Number((p + (m1.oofPredictions[i].upper - m1.oofPredictions[i].predicted)).toFixed(2)));
+      if (bMet.cvRmse < baselineMetrics.cvRmse * 0.97) {
+        const bLower = validationPairs.map(({ first }, i) => {
+          const radius = Math.max(0, first.upper - first.predicted);
+          return Number((blendPreds[i] - radius).toFixed(2));
+        });
+        const bUpper = validationPairs.map(({ first }, i) => {
+          const radius = Math.max(0, first.upper - first.predicted);
+          return Number((blendPreds[i] + radius).toFixed(2));
+        });
         const { t10, conformal } = computeT10AndT12(actuals, blendPreds, bLower, bUpper, false, nominalCov);
         rawModels.push({
           ...m1,
-          id: `${targetName}-ensemble-nnls`,
-          name: `Constrained NNLS Blend (0.65×${m1.family} + 0.35×${m2.family})`,
+          id: `${targetName}-ensemble-nested`,
+          name: `Nested OOF Blend (${nested.weight1.toFixed(2)}×${m1.family} + ${nested.weight2.toFixed(2)}×${m2.family})`,
           family: 'ensemble',
           isParametric: false,
           paramCount: m1.paramCount + m2.paramCount,
@@ -1915,7 +2090,7 @@ export function runTargetModelingPipeline(
           oofSmape: bMet.smape,
           t10Summary: t10,
           conformalSummary: conformal,
-          architectureSummary: `Inner-fold constrained NNLS blend of ${m1.name} (0.65) + ${m2.name} (0.35); improved OOF CV(RMSE) by >3%.`,
+          architectureSummary: `Nonnegative sum-to-one blend weights fitted on the first ${nested.trainEnd} aligned OOF predictions and evaluated on the later ${validationPairs.length} predictions; weights ${nested.weight1.toFixed(2)} / ${nested.weight2.toFixed(2)}.`,
           latexEquation: null,
           excelFormula: null,
           predictFnParams: {
@@ -1923,25 +2098,26 @@ export function runTargetModelingPipeline(
             family: 'ensemble',
             modelPayload: {
               kind: 'ensemble_blend',
-              w1: 0.65,
-              w2: 0.35,
+              w1: nested.weight1,
+              w2: nested.weight2,
               p1: m1.predictFnParams,
               p2: m2.predictFnParams,
             },
           },
-          oofPredictions: m1.oofPredictions.slice(0, nOof).map((p, i) => ({
-            timestamp: p.timestamp,
-            actual: p.actual,
+          oofPredictions: validationPairs.map(({ first }, i) => ({
+            timestamp: first.timestamp,
+            actual: first.actual,
             predicted: Number(blendPreds[i].toFixed(2)),
             lower: bLower[i],
             upper: bUpper[i],
           })),
+          artifactId: `ART-MOD-${targetName}-ensemble-nested`,
         });
       }
     }
   }
 
-  // Score qualified models using 13-criteria min-max normalization (SC-2 / SC-3)
+    // Score qualified models using 13-criteria min-max normalization (SC-2 / SC-3)
   const poolToScore = rawModels.filter((m) => m.qualified);
   const scoringSet = poolToScore.length > 0 ? poolToScore : rawModels;
 
@@ -2029,40 +2205,45 @@ export function runTargetModelingPipeline(
   }
   const stabilityPct = Number(((top1Wins / mcRuns) * 100).toFixed(1));
 
-  // T11 Diebold-Mariano & Corrected Resampled t-test (Top-1 vs Runner-up)
+  // T11 Diebold-Mariano with Newey-West HAC variance and HLN small-sample correction.
   let t11WinnerVsRunnerUp: TargetModelingBundle['t11WinnerVsRunnerUp'] = null;
   if (scoringSet.length >= 2) {
     const w1 = scoringSet[0];
     const w2 = scoringSet[1];
-    const nCmp = Math.min(w1.oofPredictions.length, w2.oofPredictions.length);
-    const dLoss = Array.from({ length: nCmp }, (_, i) => {
-      const e1 = w1.oofPredictions[i].actual - w1.oofPredictions[i].predicted;
-      const e2 = w2.oofPredictions[i].actual - w2.oofPredictions[i].predicted;
+    const byTimestamp1 = new Map(w1.oofPredictions.map((row) => [row.timestamp, row]));
+    const aligned = w2.oofPredictions.flatMap((row) => {
+      const first = byTimestamp1.get(row.timestamp);
+      return first ? [{ first, second: row }] : [];
+    });
+    const dLoss = aligned.map(({ first, second }) => {
+      const e1 = first.actual - first.predicted;
+      const e2 = second.actual - second.predicted;
       return e1 * e1 - e2 * e2;
     });
-    const dMean = mean(dLoss);
-    const dSe = (stdDev(dLoss) || 1e-6) / Math.sqrt(Math.max(1, nCmp));
-    const dmStat = dMean / dSe;
-    const dmP = normalPValueTwoSided(dmStat);
+    const dm = dieboldMarianoHlnTest(dLoss, 1);
 
-    // Nadeau-Bengio corrected resampled t-test on fold CV(RMSE)
+    // The fold-level corrected resampled comparison is retained as a separate diagnostic.
     const fDiffs = w1.foldCvRmses.map((v, i) => v - (w2.foldCvRmses[i] ?? v));
     const kf = fDiffs.length;
     const corrFactor = 1 / Math.max(1, kf) + 1 / Math.max(1, kf - 1);
     const cT = mean(fDiffs) / Math.max(1e-6, Math.sqrt(corrFactor * Math.max(1e-6, stdDev(fDiffs) ** 2)));
     const cP = tPValueTwoSided(cT, Math.max(1, kf - 1));
 
-    const indistinguishable = dmP >= 0.05 && cP >= 0.05;
-    w2.indistinguishableFromTop1 = indistinguishable;
-    t11WinnerVsRunnerUp = {
-      dmStat: Number(dmStat.toFixed(3)),
-      dmPValue: Number(dmP.toFixed(4)),
-      correctedTStat: Number(cT.toFixed(3)),
-      correctedTPValue: Number(cP.toFixed(4)),
-      interpretation: indistinguishable
-        ? `Top-1 (${w1.name}) and Runner-Up (${w2.name}) are statistically indistinguishable (DM p=${dmP.toFixed(3)}, Nadeau-Bengio p=${cP.toFixed(3)}).`
-        : `Top-1 (${w1.name}) significantly outperforms ${w2.name} on OOF squared errors (DM p=${dmP.toFixed(4)}).`,
-    };
+    if (dm) {
+      const indistinguishable = dm.pValue >= 0.05 && cP >= 0.05;
+      w2.indistinguishableFromTop1 = indistinguishable;
+      t11WinnerVsRunnerUp = {
+        dmStat: Number(dm.statistic.toFixed(3)),
+        dmPValue: Number(dm.pValue.toFixed(4)),
+        dmHacLag: dm.hacLag,
+        hlnFactor: Number(dm.hlnFactor.toFixed(5)),
+        correctedTStat: Number(cT.toFixed(3)),
+        correctedTPValue: Number(cP.toFixed(4)),
+        interpretation: indistinguishable
+          ? `Top-1 (${w1.name}) and Runner-Up (${w2.name}) are statistically indistinguishable (HAC-HLN DM p=${dm.pValue.toFixed(3)}, Nadeau-Bengio p=${cP.toFixed(3)}).`
+          : `HAC-HLN Diebold-Mariano comparison favors ${dm.statistic > 0 ? w2.name : w1.name} on aligned OOF squared errors (p=${dm.pValue.toFixed(4)}).`,
+      };
+    }
   }
 
   scoringSet.forEach((m, idx) => {

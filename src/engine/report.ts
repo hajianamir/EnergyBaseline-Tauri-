@@ -236,7 +236,7 @@ export function buildDeterministicReportModel(params: {
       title: 'Model Portfolio, Top-5 Shortlist, Decision Rationale & Model Cards',
       depthMin: 'Executive',
       purpose: 'Detail validation design, Top-5 leaderboard, why Top-1 won, why alternatives were rejected, and locked Model Card.',
-      method: 'Blocked K-Fold / Forward-Chaining with Purge Gap, 13-criteria min-max scoring, T11 DM test, NN Gate & Ensemble Gate across Classical, Boosted Trees (XGBoost/LightGBM/CatBoost/GBM), and Neural Networks.',
+      method: 'Expanding forward-chaining with a lag/window-derived purge gap, 13-criteria min-max scoring, HAC-HLN T11 DM test, NN Gate, and nested OOF ensemble selection across Classical, Boosted Trees (XGBoost/LightGBM/CatBoost/GBM), and Neural Networks.',
       settingsUsed: firstBundle
         ? `CV=${firstBundle.top5[0]?.cvScheme}, PurgeGap=${firstBundle.top5[0]?.purgeGapSteps} steps, Profile=${firstBundle.weightProfile}, Standard=${firstBundle.limits.citation} (CV≤${firstBundle.limits.maxCvRmse}%, |NMBE|≤${firstBundle.limits.maxAbsNmbe}%, R²≥${firstBundle.limits.minR2})`
         : 'Pending',

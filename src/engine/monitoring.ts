@@ -8,7 +8,7 @@ import {
 } from './types';
 import { getBaselineRows, mean, normalPValueTwoSided, stdDev } from './stats';
 import { deterministicHash } from './synthetic';
-import { computeRegressionMetrics, predictFromModelPayload, SerializedModelPayload } from './modeling';
+import { computeRegressionMetrics, predictFromModelPayload, SerializedModelPayload, TEMPORAL_FEATURE_LOOKBACK } from './modeling';
 import { DOMAIN_PROFILES } from './domains';
 
 interface PredictParamsShape {
@@ -22,6 +22,29 @@ interface PredictParamsShape {
   oofRmse: number;
   conformalHalfWidth: number;
   modelPayload?: SerializedModelPayload | null;
+}
+
+export function buildTemporalWarmupContext(
+  requestedRows: DatasetRow[],
+  trainingDataset: DatasetState,
+  warmupSteps = TEMPORAL_FEATURE_LOOKBACK
+): { rows: DatasetRow[]; scoreOffset: number; requestedOrder: number[] } {
+  const orderedRequests = requestedRows
+    .map((row, originalIndex) => ({ row, originalIndex }))
+    .sort((a, b) => a.row.timestamp.localeCompare(b.row.timestamp) || a.originalIndex - b.originalIndex);
+  if (orderedRequests.length === 0) return { rows: [], scoreOffset: 0, requestedOrder: [] };
+  const firstRequestedTimestamp = orderedRequests[0].row.timestamp;
+  const prefix = warmupSteps > 0
+    ? trainingDataset.rows
+        .filter((row) => row.timestamp < firstRequestedTimestamp)
+        .sort((a, b) => a.timestamp.localeCompare(b.timestamp))
+        .slice(-Math.floor(warmupSteps))
+    : [];
+  return {
+    rows: [...prefix, ...orderedRequests.map(({ row }) => row)],
+    scoreOffset: prefix.length,
+    requestedOrder: orderedRequests.map(({ originalIndex }) => originalIndex),
+  };
 }
 
 function evaluatePredictParamsOverRows(
@@ -73,6 +96,11 @@ function evaluatePredictParamsOverRows(
       const cdd = Math.max(0, tVal - pObj.bestTc);
       const hdd = Math.max(0, pObj.bestTh - tVal);
       pred = coeffs[0].value + coeffs[1].value * wknd + coeffs[2].value * cdd + coeffs[3].value * hdd + coeffs[4].value * wknd * cdd;
+      const otherFeatures = feats.filter((feature) => feature !== tempFeat && !/weekend/i.test(feature)).slice(0, 2);
+      otherFeatures.forEach((feature, index) => {
+        const value = typeof r[feature] === 'number' ? r[feature] as number : colMedians[feature] ?? 0;
+        pred += (coeffs[index + 5]?.value ?? 0) * value;
+      });
     } else if (coeffs.length >= 1) {
       pred = coeffs[0].value;
       feats.forEach((f, idx) => {
@@ -117,12 +145,20 @@ export function predictFromLockedBaseline(
   else if (alertRule === 'k_rmse_2') alertRuleDescription = `2 × OOF RMSE (±${rmseThresh.toFixed(1)}) threshold`;
   else if (alertRule === 'outside_interval') alertRuleDescription = 'Outside conformal prediction interval';
 
-  const forwardPreds = evaluatePredictParamsOverRows(
-    rows,
+  // Temporal models receive the immediately preceding baseline rows as causal warm-up
+  // context; only predictions aligned to the requested monitoring rows are scored.
+  const predictionContext = buildTemporalWarmupContext(rows, trainingDataset);
+  const contextPreds = evaluatePredictParamsOverRows(
+    predictionContext.rows,
     params,
     baseline.features,
     baseline.candidate.isParametric && !params.modelPayload
   );
+  const chronologicalPredictions = contextPreds.slice(predictionContext.scoreOffset);
+  const forwardPreds = new Array<number>(rows.length).fill(params.meanTarget);
+  predictionContext.requestedOrder.forEach((originalIndex, chronologicalIndex) => {
+    forwardPreds[originalIndex] = chronologicalPredictions[chronologicalIndex] ?? params.meanTarget;
+  });
 
   const points: PredictionMonitoringPoint[] = [];
   let cumDev = 0;

@@ -392,8 +392,10 @@ export function adjustPValues(pValues: (number | null)[], method: MultipleTestin
 
 export function getBaselineRows(dataset: DatasetState): DatasetRow[] {
   const { baselineStart, baselineEnd } = dataset.temporal;
-  const filtered = dataset.rows.filter((r) => r.timestamp >= baselineStart && r.timestamp <= baselineEnd);
-  return filtered.length >= 10 ? filtered : dataset.rows;
+  if (!baselineStart || !baselineEnd || baselineStart > baselineEnd) return [];
+  return dataset.rows
+    .filter((r) => r.timestamp >= baselineStart && r.timestamp <= baselineEnd)
+    .sort((a, b) => a.timestamp.localeCompare(b.timestamp));
 }
 
 export function getReportingRows(dataset: DatasetState): DatasetRow[] {
@@ -1070,6 +1072,40 @@ function olsSimple(x: number[], y: number[]): { slope: number; intercept: number
   const r2 = tss > 1e-12 ? Math.max(0, 1 - rss / tss) : 0;
   return { slope, intercept, seSlope, r2, rss };
 }
+
+/** Newey-West DM statistic with the Harvey-Leybourne-Newbold finite-sample correction. */
+export function dieboldMarianoHlnTest(
+  lossDifferential: number[],
+  forecastHorizon = 1
+): { statistic: number; pValue: number; hacLag: number; longRunVariance: number; hlnFactor: number; nUsed: number } | null {
+  const d = lossDifferential.filter(Number.isFinite);
+  const n = d.length;
+  const h = Math.max(1, Math.min(Math.floor(forecastHorizon), n));
+  if (n < 3) return null;
+  const dMean = mean(d);
+  const centered = d.map((value) => value - dMean);
+  const hacLag = Math.min(n - 1, Math.max(h - 1, Math.floor(4 * Math.pow(n / 100, 2 / 9))));
+  let longRunVariance = centered.reduce((sum, value) => sum + value * value, 0) / n;
+  for (let lag = 1; lag <= hacLag; lag++) {
+    let covariance = 0;
+    for (let t = lag; t < n; t++) covariance += centered[t] * centered[t - lag];
+    covariance /= n;
+    longRunVariance += 2 * (1 - lag / (hacLag + 1)) * covariance;
+  }
+  longRunVariance = Math.max(1e-12, longRunVariance);
+  const rawStatistic = dMean / Math.sqrt(longRunVariance / n);
+  const hlnFactor = Math.sqrt(Math.max(0, (n + 1 - 2 * h + h * (h - 1) / n) / n));
+  const statistic = rawStatistic * hlnFactor;
+  return {
+    statistic,
+    pValue: tPValueTwoSided(statistic, Math.max(1, n - 1)),
+    hacLag,
+    longRunVariance,
+    hlnFactor,
+    nUsed: n,
+  };
+}
+
 
 function adfTest(series: number[], maxLags: number): { stat: number; pVal: number; lags: number } {
   const n = series.length;
