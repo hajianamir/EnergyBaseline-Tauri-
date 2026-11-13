@@ -1,6 +1,6 @@
 {
   "name": "EnergyBaseline",
-  "description": "Offline Tauri 2 + Python sidecar M&V and statistical time-series baseline analytics platform with Variable Selection Gate, Test Configuration Policy, Conformal UQ, Drift Monitoring, and deterministic reporting.",
+  "description": "Offline-first EnergyBaseline prototype with a React/TypeScript M&V preview engine and Python sidecar scaffold. Production Tauri/sidecar integration and full statistical coverage remain unverified.",
   "requestFramePermissions": [],
   "majorCapabilities": []
 }
