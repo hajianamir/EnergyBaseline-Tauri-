@@ -25,7 +25,7 @@ import {
   generateSyntheticDataset,
   SyntheticPresetId,
 } from './engine/synthetic';
-import { resolveStandardForDomain } from './engine/domains';
+import { resolveThresholdProfileForDataset } from './engine/domains';
 import {
   buildDefaultVsgForTarget,
   computeEdaAndMining,
@@ -170,7 +170,7 @@ export default function App() {
   const [edaByTarget, setEdaByTarget] = useState<Record<string, EdaTargetSummary>>({});
   const [modelingByTarget, setModelingByTarget] = useState<Record<string, TargetModelingBundle>>({});
   const [thresholdProfile, setThresholdProfile] = useState<ThresholdProfileId>(() =>
-    resolveStandardForDomain(initialBoot.ds.domain)
+    resolveThresholdProfileForDataset(initialBoot.ds.domain, initialBoot.ds.temporal.targetGranularity)
   );
   const [customThresholds, setCustomThresholds] = useState<CustomThresholds>({
     maxCvRmse: 20,
@@ -298,7 +298,7 @@ export default function App() {
   const handleReplaceDataset = useCallback(
     (nextDs: DatasetState, reason: string, preserveGates = false) => {
       const init = initializeWorkspaceFromDataset(nextDs);
-      const shouldSwitchStd = nextDs.domain !== dataset.domain || nextDs.id !== dataset.id;
+      const shouldSwitchStd = nextDs.domain !== dataset.domain || nextDs.id !== dataset.id || nextDs.temporal.targetGranularity !== dataset.temporal.targetGranularity;
       setDataset(nextDs);
       setVsgByTarget(init.vsgByTarget);
       setProfilesByTarget(init.profilesByTarget);
@@ -306,7 +306,7 @@ export default function App() {
       setTcp(init.tcp);
       setAutoLogs((prev) => [...init.autoLogs, ...prev.slice(0, 80)]);
       if (shouldSwitchStd) {
-        setThresholdProfile(resolveStandardForDomain(nextDs.domain));
+        setThresholdProfile(resolveThresholdProfileForDataset(nextDs.domain, nextDs.temporal.targetGranularity));
       }
       if (init.targetNames.length > 0) {
         setActiveTarget((cur) => (init.targetNames.includes(cur) ? cur : init.targetNames[0]));
@@ -681,7 +681,7 @@ export default function App() {
   const handleRestoreEbproj = useCallback(
     (restored: Awaited<ReturnType<typeof importEbprojZipFile>>) => {
       const init = initializeWorkspaceFromDataset(restored.dataset);
-      const nextStd = resolveStandardForDomain(restored.dataset.domain);
+      const nextStd = resolveThresholdProfileForDataset(restored.dataset.domain, restored.dataset.temporal.targetGranularity);
       setDataset(restored.dataset);
       setThresholdProfile(nextStd);
       setVsgByTarget(restored.vsgByTarget ?? init.vsgByTarget);

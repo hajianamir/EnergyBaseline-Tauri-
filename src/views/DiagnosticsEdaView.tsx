@@ -240,7 +240,7 @@ export const DiagnosticsEdaView: React.FC<DiagnosticsEdaViewProps> = ({
             Diagnostics Suite, EDA Atlas & Data Mining
           </h1>
           <p className="text-sm text-slate-600 dark:text-slate-400 mt-1">
-            Pre-model core [M] &amp; extended [O] tests (T1–T14), F1–F9 EDA &amp; mining (autoencoder + regime rules), Data Quality Score, and Causal balance.
+            Pre-model core [M] &amp; extended [O] tests (T1–T14), F1–F9 EDA &amp; mining (autoencoder + target-tercile rules), in-app Data Quality Index, and Causal balance.
           </p>
         </div>
 
@@ -273,7 +273,9 @@ export const DiagnosticsEdaView: React.FC<DiagnosticsEdaViewProps> = ({
           ))}
         </div>
 
-        <div className="flex items-center gap-1 p-1 bg-slate-100 dark:bg-slate-800 rounded-lg">
+        <div className="flex items-center gap-3">
+          {eda && <span className="text-[11px] text-slate-500 font-mono">Engine v{eda.engine_version} · Target seed {eda.seed}</span>}
+          <div className="flex items-center gap-1 p-1 bg-slate-100 dark:bg-slate-800 rounded-lg">
           {(
             [
               ['tests', `Tests T1–T14 + [O] (${tests.length})`],
@@ -295,6 +297,7 @@ export const DiagnosticsEdaView: React.FC<DiagnosticsEdaViewProps> = ({
               {label}
             </button>
           ))}
+          </div>
         </div>
       </div>
 
@@ -302,13 +305,14 @@ export const DiagnosticsEdaView: React.FC<DiagnosticsEdaViewProps> = ({
       {eda && (
         <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 border border-slate-200 dark:border-slate-800 rounded-lg bg-white dark:bg-slate-900 p-4 tabular-nums">
           <div>
-            <div className="text-xs text-slate-500 dark:text-slate-400">Data Quality Score (F9)</div>
+            <div className="text-xs text-slate-500 dark:text-slate-400">In-app Data Quality Index (F9)</div>
             <div className="text-xl font-bold font-mono text-slate-900 dark:text-slate-100 mt-0.5">
-              {eda.dataQuality.overallScore} / 100
+              {eda.dataQuality.overallScore === null ? 'Not computed' : `${eda.dataQuality.overallScore} / 100`}
             </div>
             <div className="text-[11px] text-slate-500">
-              Completeness {eda.dataQuality.completeness.score}%
+              Completeness {eda.dataQuality.completeness.score === null ? '—' : `${eda.dataQuality.completeness.score}%`} · Type {eda.dataQuality.consistency.score === null ? '—' : `${eda.dataQuality.consistency.score}%`} · Order {eda.dataQuality.temporalOrder.score === null ? '—' : `${eda.dataQuality.temporalOrder.score}%`}
             </div>
+            <div className="text-[11px] text-slate-500">Descriptive in-app index; not a validated quality standard</div>
           </div>
           <div>
             <div className="text-xs text-slate-500 dark:text-slate-400">Significant Tests</div>
@@ -318,19 +322,19 @@ export const DiagnosticsEdaView: React.FC<DiagnosticsEdaViewProps> = ({
             <div className="text-[11px] text-slate-500">{flipCount} α-sensitive flips</div>
           </div>
           <div>
-            <div className="text-xs text-slate-500 dark:text-slate-400">Optimal Degree-Day Bases</div>
+            <div className="text-xs text-slate-500 dark:text-slate-400">Grid-Searched Degree-Day Bases</div>
             <div className="text-xl font-bold font-mono text-slate-900 dark:text-slate-100 mt-0.5">
-              {eda.timeSeriesMining.optimalBaseTempHeating}°C / {eda.timeSeriesMining.optimalBaseTempCooling}°C
+              {eda.timeSeriesMining.optimalBaseTempHeating === null ? '—' : `${eda.timeSeriesMining.optimalBaseTempHeating}°C`} / {eda.timeSeriesMining.optimalBaseTempCooling === null ? '—' : `${eda.timeSeriesMining.optimalBaseTempCooling}°C`}
             </div>
-            <div className="text-[11px] text-slate-500">Heating / Cooling change-points</div>
+            <div className="text-[11px] text-slate-500">1°C grid; squared Pearson-correlation heuristic</div>
           </div>
           <div>
-            <div className="text-xs text-slate-500 dark:text-slate-400">Regime Stability (ARI)</div>
+            <div className="text-xs text-slate-500 dark:text-slate-400">Bootstrap Tercile-Cut Stability (ARI)</div>
             <div className="text-xl font-bold font-mono text-slate-900 dark:text-slate-100 mt-0.5">
-              {eda.clustering.bootstrapAri}
+              {eda.clustering.bootstrapAri === null ? 'Not estimable' : eda.clustering.bootstrapAri}
             </div>
             <div className="text-[11px] text-slate-500">
-              Silhouette {eda.clustering.silhouette} · k={eda.clustering.k}
+              Target-value terciles · Silhouette {eda.clustering.silhouette ?? '—'} · k={eda.clustering.k}
             </div>
           </div>
         </div>
@@ -407,7 +411,7 @@ export const DiagnosticsEdaView: React.FC<DiagnosticsEdaViewProps> = ({
 
           <EChartBox
             title="PCA Scree & Cumulative Variance (F3)"
-            subtitle={`KMO=${eda.pca.kmo} · Bartlett p=${eda.pca.bartlettP.toExponential(1)}`}
+            subtitle={`KMO=${eda.pca.kmo === null ? 'not computed' : eda.pca.kmo} · Bartlett p=${eda.pca.bartlettP === null ? 'not computed' : eda.pca.bartlettP.toExponential(1)} · ${eda.pca.adequacyMethod}`}
             option={pcaOption}
             height={260}
             darkMode={darkMode}
@@ -420,14 +424,14 @@ export const DiagnosticsEdaView: React.FC<DiagnosticsEdaViewProps> = ({
           <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
             <EChartBox
               title="Autocorrelation (ACF & PACF)"
-              subtitle="Drives purge gap & block-bootstrap length (TC-2 / VAL-2)"
+              subtitle={eda.timeSeriesMining.acfAvailable ? 'Sample ACF; PACF via Levinson–Durbin recursion' : 'Not estimable: at least 4 finite, non-constant target observations are required'}
               option={acfOption}
               height={280}
               darkMode={darkMode}
             />
             <section className="border border-slate-200 dark:border-slate-800 rounded-lg bg-white dark:bg-slate-900 p-4 space-y-3">
               <h2 className="text-sm font-semibold font-display text-slate-900 dark:text-slate-100">
-                Operating Regimes (F4) & Feature Relevance Consensus (F8)
+                Target-Value Terciles (F4) & Univariate Associations (F8)
               </h2>
               <div className="grid grid-cols-3 gap-3 text-xs tabular-nums">
                 {eda.clustering.regimeMeans.map((rm) => (
@@ -439,13 +443,13 @@ export const DiagnosticsEdaView: React.FC<DiagnosticsEdaViewProps> = ({
                 ))}
               </div>
               <div className="text-xs text-slate-500 pt-1">
-                Feature consensus agreement (Kendall&apos;s W = {eda.kendallW}):
+                Ranked by univariate 8-bin mutual-information estimate (not model importance or consensus); fewer than 8 paired observations or constant inputs are not ranked:
               </div>
               <div className="space-y-1.5 text-xs">
                 {eda.featureRelevance.map((fr) => (
                   <div key={fr.feature} className="flex items-center justify-between font-mono border-b border-slate-100 dark:border-slate-800/70 pb-1">
-                    <span>#{fr.consensusRank} {fr.feature}</span>
-                    <span>MI={fr.miScore} · Perm={fr.permImportance} · Stab={fr.stabilityFreq}</span>
+                    <span>{fr.miRank === null ? '—' : `#${fr.miRank}`} {fr.feature}</span>
+                    <span>MI₈={fr.miScore ?? 'not computed'} · |Pearson r|={fr.absolutePearson ?? 'not computed'}</span>
                   </div>
                 ))}
               </div>
@@ -454,7 +458,7 @@ export const DiagnosticsEdaView: React.FC<DiagnosticsEdaViewProps> = ({
                 <span className="font-mono">{eda.anomalies.policyApplied}</span>.
                 {eda.timeSeriesMining.changePointTimestamp && (
                   <span className="block mt-1">
-                    Structural Change-Point (F7/T9): {eda.timeSeriesMining.changePointTimestamp.slice(0, 10)} (CI: {eda.timeSeriesMining.changePointCiLow?.slice(0, 10)} to {eda.timeSeriesMining.changePointCiHigh?.slice(0, 10)})
+                    Structural Change-Point (F7/T9): {eda.timeSeriesMining.changePointTimestamp.slice(0, 10)} (point estimate only; no confidence interval computed)
                   </span>
                 )}
               </div>
@@ -464,7 +468,7 @@ export const DiagnosticsEdaView: React.FC<DiagnosticsEdaViewProps> = ({
           {eda.regimeRules.length > 0 && (
             <section className="border border-slate-200 dark:border-slate-800 rounded-lg bg-white dark:bg-slate-900 overflow-hidden">
               <div className="px-4 py-3 border-b border-slate-200 dark:border-slate-800 text-sm font-semibold font-display">
-                Regime Association Rules (F6 Data Mining)
+                Target-Tercile Association Rules (F6 Data Mining)
               </div>
               <div className="overflow-x-auto">
                 <table className="w-full text-xs text-left tabular-nums">
@@ -490,6 +494,12 @@ export const DiagnosticsEdaView: React.FC<DiagnosticsEdaViewProps> = ({
               </div>
             </section>
           )}
+          <details className="border border-slate-200 dark:border-slate-800 rounded-lg bg-white dark:bg-slate-900 p-4">
+            <summary className="text-sm font-semibold cursor-pointer">Metric methods and assumptions</summary>
+            <ul className="mt-3 list-disc pl-5 space-y-2 text-xs text-slate-600 dark:text-slate-400">
+              {eda.methodAssumptions.map((assumption) => <li key={assumption}>{assumption}</li>)}
+            </ul>
+          </details>
         </div>
       )}
 

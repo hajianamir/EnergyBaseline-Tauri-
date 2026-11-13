@@ -25,7 +25,8 @@ import {
   tPValueTwoSided,
 } from './stats';
 import { createRng, deriveTargetSeed, deterministicHash } from './synthetic';
-import { resolveThresholdLimits } from './domains';
+import { ENGINE_VERSION } from './version';
+import { resolveThresholdLimits, STANDARD_PROFILES } from './domains';
 
 // ---------- Linear Algebra & Regression Primitives ----------
 
@@ -998,8 +999,16 @@ export function getScoringWeights(profile: WeightProfile, custom?: ScoringWeight
 export function getThresholdLimits(
   profile: ThresholdProfileId,
   granularity: DatasetState['temporal']['targetGranularity'],
+  domain: DatasetState['domain'],
   customThresholds?: CustomThresholds
-): { maxCvRmse: number; maxAbsNmbe: number; minR2: number; citation: string; normativeNote: string } {
+): { maxCvRmse: number; maxAbsNmbe: number; minR2: number; citation: string; version: string; normativeNote: string } {
+  if (profile === 'custom' && !customThresholds) {
+    throw new Error('Custom threshold values are required when the Custom profile is selected.');
+  }
+  const standard = STANDARD_PROFILES[profile];
+  if (!standard.applicableDomains.includes(domain)) {
+    throw new Error(`Threshold profile '${profile}' is not applicable to domain '${domain}'. Choose a matching profile or Custom.`);
+  }
   return resolveThresholdLimits(profile, granularity, customThresholds);
 }
 
@@ -1148,6 +1157,7 @@ export function runTargetModelingPipeline(
   customWeights?: ScoringWeights,
   customThresholds?: CustomThresholds
 ): TargetModelingBundle {
+  const limits = getThresholdLimits(thresholdProfile, dataset.temporal.targetGranularity, dataset.domain, customThresholds);
   const seed = deriveTargetSeed(globalSeed, targetName);
   const rows = getBaselineRows(dataset);
   const candidatePool = dataset.columns
@@ -1185,7 +1195,6 @@ export function runTargetModelingPipeline(
   let weekFeat = selectedFeatures.find((f) => /weekend/i.test(f));
   const effort = tcp.effortProfile;
   const nominalCov = tcp.confidenceLevel;
-  const limits = getThresholdLimits(thresholdProfile, dataset.temporal.targetGranularity, customThresholds);
   const signs = tcp.expectedSignsByTarget[targetName] ?? {};
   const weightProfile: WeightProfile = weightProfileOverride ?? (cleanRows.length >= 200 ? 'balanced' : 'interpretable');
   const weights = getScoringWeights(weightProfile, customWeights);
@@ -2265,6 +2274,7 @@ export function runTargetModelingPipeline(
   return {
     target: targetName,
     seed,
+    engine_version: ENGINE_VERSION,
     candidatePool,
     selectedFeatures,
     prunedCollinear,
@@ -2291,6 +2301,7 @@ export function createLockedBaseline(
   seed: number,
   customThresholds?: CustomThresholds
 ): LockedBaseline {
+  const limits = getThresholdLimits(thresholdProfile, dataset.temporal.targetGranularity, dataset.domain, customThresholds);
   const version = previousVersion + 1;
   const vsgHash = deterministicHash(JSON.stringify(vsg));
   const tcpHash = deterministicHash(JSON.stringify(tcp));
@@ -2332,7 +2343,7 @@ export function createLockedBaseline(
           : 'All expected-sign constraints satisfied.',
       ],
       calibrationSummary: `Empirical ${(candidate.conformalSummary.empiricalCoverage * 100).toFixed(1)}% vs nominal ${(candidate.conformalSummary.nominalCoverage * 100).toFixed(0)}% (Kupiec p=${candidate.conformalSummary.kupiecPofP}).`,
-      standardsNote: getThresholdLimits(thresholdProfile, dataset.temporal.targetGranularity, customThresholds).normativeNote,
+      standardsNote: limits.normativeNote,
     },
     candidate,
   };

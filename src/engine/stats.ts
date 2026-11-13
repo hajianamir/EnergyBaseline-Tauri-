@@ -19,6 +19,9 @@ import {
   VsgEntry,
 } from './types';
 import { createRng, deriveTargetSeed, deterministicHash } from './synthetic';
+import { ENGINE_VERSION } from './version';
+
+type StatisticalTestResultDraft = Omit<StatisticalTestResult, 'seed' | 'engine_version'>;
 
 // ---------- Mathematical & Distribution Helpers ----------
 
@@ -995,9 +998,9 @@ function evaluateDecision(
 }
 
 export function reevaluateTestResults(
-  results: StatisticalTestResult[],
+  results: StatisticalTestResultDraft[],
   tcp: TcpConfig
-): StatisticalTestResult[] {
+): StatisticalTestResultDraft[] {
   // Group raw p-values by correction scope (TCP-6 instant re-evaluation without recompute)
   const grouped = new Map<string, number[]>();
   results.forEach((r, idx) => {
@@ -1105,6 +1108,228 @@ function invertMatrix(input: number[][]): number[][] | null {
     }
   }
   return a.map((row) => row.slice(n));
+}
+
+function matrixDeterminant(input: number[][]): number | null {
+  const n = input.length;
+  if (n === 0 || input.some((row) => row.length !== n || row.some((value) => !Number.isFinite(value)))) return null;
+  const a = input.map((row) => [...row]);
+  let sign = 1;
+  let determinant = 1;
+  for (let col = 0; col < n; col++) {
+    let pivot = col;
+    for (let row = col + 1; row < n; row++) {
+      if (Math.abs(a[row][col]) > Math.abs(a[pivot][col])) pivot = row;
+    }
+    if (Math.abs(a[pivot][col]) < 1e-12) return 0;
+    if (pivot !== col) {
+      [a[col], a[pivot]] = [a[pivot], a[col]];
+      sign *= -1;
+    }
+    const pivotValue = a[col][col];
+    determinant *= pivotValue;
+    for (let row = col + 1; row < n; row++) {
+      const factor = a[row][col] / pivotValue;
+      for (let j = col + 1; j < n; j++) a[row][j] -= factor * a[col][j];
+    }
+  }
+  return sign * determinant;
+}
+
+export function calculateKmoBartlett(
+  correlationMatrix: number[][],
+  sampleSize: number
+): { kmo: number | null; bartlettP: number | null } {
+  const p = correlationMatrix.length;
+  if (p < 2 || correlationMatrix.some((row) => row.length !== p || row.some((value) => !Number.isFinite(value)))) {
+    return { kmo: null, bartlettP: null };
+  }
+  const inverse = invertMatrix(correlationMatrix);
+  const determinant = matrixDeterminant(correlationMatrix);
+  const correction = sampleSize - 1 - (2 * p + 5) / 6;
+  if (!inverse || determinant === null || determinant <= 0 || correction <= 0) {
+    return { kmo: null, bartlettP: null };
+  }
+
+  let simpleSquared = 0;
+  let partialSquared = 0;
+  for (let i = 0; i < p; i++) {
+    for (let j = i + 1; j < p; j++) {
+      const simple = correlationMatrix[i][j];
+      const inverseScale = inverse[i][i] * inverse[j][j];
+      if (inverseScale <= 0) return { kmo: null, bartlettP: null };
+      const partial = -inverse[i][j] / Math.sqrt(inverseScale);
+      simpleSquared += simple * simple;
+      partialSquared += partial * partial;
+    }
+  }
+  const kmoDenominator = simpleSquared + partialSquared;
+  const kmo = kmoDenominator > 1e-12 ? Number((simpleSquared / kmoDenominator).toFixed(4)) : null;
+  const chiSquare = Math.max(0, -correction * Math.log(determinant));
+  const df = (p * (p - 1)) / 2;
+  return { kmo, bartlettP: Number(chiSquarePValue(chiSquare, df).toPrecision(6)) };
+}
+
+function symmetricEigenDecomposition(input: number[][]): { values: number[]; vectors: number[][] } {
+  const n = input.length;
+  if (n === 0 || input.some((row) => row.length !== n)) return { values: [], vectors: [] };
+  const a = input.map((row, i) => row.map((value, j) => (value + input[j][i]) / 2));
+  const vectors: number[][] = Array.from({ length: n }, (_, i) =>
+    Array.from({ length: n }, (_, j) => Number(i === j))
+  );
+  const maxIterations = Math.max(1, n * n * 50);
+  for (let iteration = 0; iteration < maxIterations; iteration++) {
+    let p = 0;
+    let q = 0;
+    let largest = 0;
+    for (let i = 0; i < n; i++) {
+      for (let j = i + 1; j < n; j++) {
+        const magnitude = Math.abs(a[i][j]);
+        if (magnitude > largest) {
+          largest = magnitude;
+          p = i;
+          q = j;
+        }
+      }
+    }
+    if (largest < 1e-12) break;
+
+    const app = a[p][p];
+    const aqq = a[q][q];
+    const apq = a[p][q];
+    const tau = (aqq - app) / (2 * apq);
+    const t = (tau >= 0 ? 1 : -1) / (Math.abs(tau) + Math.sqrt(1 + tau * tau));
+    const cosine = 1 / Math.sqrt(1 + t * t);
+    const sine = t * cosine;
+    a[p][p] = app - t * apq;
+    a[q][q] = aqq + t * apq;
+    a[p][q] = 0;
+    a[q][p] = 0;
+
+    for (let k = 0; k < n; k++) {
+      if (k !== p && k !== q) {
+        const akp = a[k][p];
+        const akq = a[k][q];
+        a[k][p] = a[p][k] = cosine * akp - sine * akq;
+        a[k][q] = a[q][k] = sine * akp + cosine * akq;
+      }
+      const vkp = vectors[k][p];
+      const vkq = vectors[k][q];
+      vectors[k][p] = cosine * vkp - sine * vkq;
+      vectors[k][q] = sine * vkp + cosine * vkq;
+    }
+  }
+  const order = Array.from({ length: n }, (_, index) => index).sort((left, right) => a[right][right] - a[left][left]);
+  return {
+    values: order.map((index) => a[index][index]),
+    vectors: vectors.map((row) => order.map((index) => row[index])),
+  };
+}
+
+function chooseTwo(count: number): number {
+  return (count * (count - 1)) / 2;
+}
+
+function adjustedRandIndex(left: number[], right: number[]): number | null {
+  const n = Math.min(left.length, right.length);
+  const totalPairs = chooseTwo(n);
+  if (totalPairs === 0) return null;
+  const cells = new Map<string, number>();
+  const leftCounts = new Map<number, number>();
+  const rightCounts = new Map<number, number>();
+  for (let i = 0; i < n; i++) {
+    const key = `${left[i]}\u0000${right[i]}`;
+    cells.set(key, (cells.get(key) ?? 0) + 1);
+    leftCounts.set(left[i], (leftCounts.get(left[i]) ?? 0) + 1);
+    rightCounts.set(right[i], (rightCounts.get(right[i]) ?? 0) + 1);
+  }
+  const samePairs = [...cells.values()].reduce((sum, count) => sum + chooseTwo(count), 0);
+  const leftPairs = [...leftCounts.values()].reduce((sum, count) => sum + chooseTwo(count), 0);
+  const rightPairs = [...rightCounts.values()].reduce((sum, count) => sum + chooseTwo(count), 0);
+  const expected = (leftPairs * rightPairs) / totalPairs;
+  const maximum = (leftPairs + rightPairs) / 2;
+  const denominator = maximum - expected;
+  return Math.abs(denominator) < 1e-12 ? (Math.abs(samePairs - maximum) < 1e-12 ? 1 : 0) : (samePairs - expected) / denominator;
+}
+
+function tercileLabels(values: number[], lower: number, upper: number): number[] {
+  return values.map((value) => (value <= lower ? 0 : value <= upper ? 1 : 2));
+}
+
+function clusterValidationMetrics(values: number[], labels: number[]): {
+  silhouette: number | null;
+  daviesBouldin: number | null;
+  calinskiHarabasz: number | null;
+} {
+  const n = Math.min(values.length, labels.length);
+  const clusters = [...new Set(labels.slice(0, n))].sort((a, b) => a - b);
+  if (n < 3 || clusters.length < 2) return { silhouette: null, daviesBouldin: null, calinskiHarabasz: null };
+  const samples = values.slice(0, n);
+  const memberIndices = new Map(clusters.map((label) => [
+    label,
+    Array.from({ length: n }, (_, index) => index).filter((index) => labels[index] === label),
+  ]));
+  const members = new Map(clusters.map((label) => [label, (memberIndices.get(label) ?? []).map((index) => samples[index])]));
+  const means = new Map(clusters.map((label) => [label, mean(members.get(label) ?? [])]));
+  const silhouetteValues = samples.map((value, index) => {
+    const ownIndices = memberIndices.get(labels[index]) ?? [];
+    if (ownIndices.length < 2) return 0;
+    const within = mean(ownIndices.filter((memberIndex) => memberIndex !== index).map((memberIndex) => Math.abs(value - samples[memberIndex])));
+    const nearestOther = Math.min(...clusters
+      .filter((label) => label !== labels[index])
+      .map((label) => mean((members.get(label) ?? []).map((other) => Math.abs(value - other)))));
+    const denominator = Math.max(within, nearestOther);
+    return denominator > 0 ? (nearestOther - within) / denominator : 0;
+  });
+  const silhouette = mean(silhouetteValues);
+
+  const scatters = new Map(clusters.map((label) => [
+    label,
+    mean((members.get(label) ?? []).map((value) => Math.abs(value - (means.get(label) ?? 0)))),
+  ]));
+  const dbRatios = clusters.map((left) => Math.max(...clusters
+    .filter((right) => right !== left)
+    .map((right) => {
+      const centerDistance = Math.abs((means.get(left) ?? 0) - (means.get(right) ?? 0));
+      return centerDistance > 1e-12
+        ? ((scatters.get(left) ?? 0) + (scatters.get(right) ?? 0)) / centerDistance
+        : Number.POSITIVE_INFINITY;
+    })));
+  const daviesBouldin = dbRatios.every(Number.isFinite) ? mean(dbRatios) : null;
+
+  const overall = mean(values.slice(0, n));
+  let between = 0;
+  let within = 0;
+  for (const label of clusters) {
+    const group = members.get(label) ?? [];
+    const groupMean = means.get(label) ?? 0;
+    between += group.length * (groupMean - overall) ** 2;
+    within += group.reduce((sum, value) => sum + (value - groupMean) ** 2, 0);
+  }
+  const calinskiHarabasz = n > clusters.length && within > 1e-12
+    ? ((between / (clusters.length - 1)) / (within / (n - clusters.length)))
+    : null;
+  return {
+    silhouette: Number(silhouette.toFixed(4)),
+    daviesBouldin: daviesBouldin === null ? null : Number(daviesBouldin.toFixed(4)),
+    calinskiHarabasz: calinskiHarabasz === null ? null : Number(calinskiHarabasz.toFixed(4)),
+  };
+}
+
+function bootstrapTercileAdjustedRand(values: number[], labels: number[], seed: number, replicates = 100): number | null {
+  const n = Math.min(values.length, labels.length);
+  if (n < 6 || new Set(labels.slice(0, n)).size < 2) return null;
+  const rng = createRng(seed);
+  const scores: number[] = [];
+  for (let replicate = 0; replicate < replicates; replicate++) {
+    const sample = Array.from({ length: n }, () => values[Math.floor(rng() * n)]).sort((a, b) => a - b);
+    const lower = sample[Math.floor(sample.length * 0.33)];
+    const upper = sample[Math.floor(sample.length * 0.66)];
+    const bootstrapLabels = tercileLabels(values.slice(0, n), lower, upper);
+    const ari = adjustedRandIndex(labels.slice(0, n), bootstrapLabels);
+    if (ari !== null && Number.isFinite(ari)) scores.push(ari);
+  }
+  return scores.length ? Number(mean(scores).toFixed(4)) : null;
 }
 
 function multiplyMatrices(a: number[][], b: number[][]): number[][] {
@@ -1688,8 +1913,8 @@ export function runDiagnosticsSuite(
   );
   const predictors = eligibleCols.filter((c) => c.name !== targetName);
   const yRaw = rows.map((r) => r[targetName]).filter((v): v is number => typeof v === 'number' && Number.isFinite(v));
-  const results: StatisticalTestResult[] = [];
-  const dataHash = dataset.sha256.slice(0, 10);
+  const results: StatisticalTestResultDraft[] = [];
+  const dataHash = dataset.sha256;
 
   const pushDisabled = (famId: TestFamilyId, varName: string, testName: string) => {
     const fam = tcp.families[famId];
@@ -2745,7 +2970,11 @@ export function runDiagnosticsSuite(
     }
   }
 
-  return reevaluateTestResults(results, tcp);
+  return reevaluateTestResults(results, tcp).map((result) => ({
+    ...result,
+    seed,
+    engine_version: ENGINE_VERSION,
+  }));
 }
 
 // ---------- EDA & Data Mining Engine (F1 - F9 + T14 Causal M&V) ----------
@@ -2929,45 +3158,70 @@ export function computeEdaAndMining(
   );
   const predictors = eligible.filter((c) => c.name !== targetName);
 
-  // F9: Data Quality Score
-  const totalCells = Math.max(1, rows.length * Math.max(1, eligible.length));
+  // F9: deterministic in-app data-quality index over selected numeric columns.
+  const totalCells = rows.length * eligible.length;
   let missingCells = 0;
+  let observedCells = 0;
+  let typeConsistentCells = 0;
   const perVariable = eligible.map((col) => {
     const vals = rows.map((r) => r[col.name]);
     const miss = vals.filter((v) => v === null || v === undefined).length;
     missingCells += miss;
-    const nums = vals.filter((v): v is number => typeof v === 'number' && Number.isFinite(v));
+    const observed = vals.filter((v) => v !== null && v !== undefined);
+    const nums = observed.filter((v): v is number => typeof v === 'number' && Number.isFinite(v));
+    observedCells += observed.length;
+    typeConsistentCells += nums.length;
     const med = median(nums);
     const mad = median(nums.map((x) => Math.abs(x - med))) * 1.4826 || stdDev(nums) || 1;
     const outliers = nums.filter((x) => Math.abs(x - med) / mad > 3.5).length;
-    const negs = nums.filter((x) => x < 0).length;
-    const compPct = ((rows.length - miss) / Math.max(1, rows.length)) * 100;
-    const outPct = (outliers / Math.max(1, nums.length)) * 100;
-    const score = Math.max(0, Math.min(100, compPct * 0.65 + (100 - outPct * 3) * 0.35));
+    const negs = nums.filter((x) => x <= 0).length;
+    const compPct = rows.length > 0 ? ((rows.length - miss) / rows.length) * 100 : null;
+    const outPct = nums.length > 0 ? (outliers / nums.length) * 100 : null;
+    const zeroOrNegPct = nums.length > 0 ? (negs / nums.length) * 100 : null;
+    const score = compPct !== null && outPct !== null
+      ? Math.max(0, Math.min(100, compPct * 0.65 + (100 - outPct * 3) * 0.35))
+      : null;
     return {
       name: col.name,
-      completenessPct: Number(compPct.toFixed(1)),
-      outlierPct: Number(outPct.toFixed(2)),
-      zeroOrNegPct: Number(((negs / Math.max(1, nums.length)) * 100).toFixed(2)),
-      qualityScore: Number(score.toFixed(1)),
+      completenessPct: compPct === null ? null : Number(compPct.toFixed(1)),
+      outlierPct: outPct === null ? null : Number(outPct.toFixed(2)),
+      zeroOrNegPct: zeroOrNegPct === null ? null : Number(zeroOrNegPct.toFixed(2)),
+      qualityScore: score === null ? null : Number(score.toFixed(1)),
     };
   });
 
-  const completenessScore = Number((((totalCells - missingCells) / totalCells) * 100).toFixed(1));
+  const completenessScore = totalCells > 0
+    ? Number((((totalCells - missingCells) / totalCells) * 100).toFixed(1))
+    : null;
   const uniqueTs = new Set(rows.map((r) => r.timestamp)).size;
-  const uniquenessScore = Number(((uniqueTs / Math.max(1, rows.length)) * 100).toFixed(1));
-  const validityScore = Number(mean(perVariable.map((v) => 100 - v.outlierPct * 2)).toFixed(1));
-  const consistencyScore = 97.5;
-  const timelinessScore = 98.0;
-  const overallScore = Number(
-    (
-      completenessScore * 0.35 +
-      validityScore * 0.25 +
-      consistencyScore * 0.15 +
-      timelinessScore * 0.15 +
-      uniquenessScore * 0.1
-    ).toFixed(1)
+  const uniquenessScore = rows.length > 0 ? Number(((uniqueTs / rows.length) * 100).toFixed(1)) : null;
+  const validityParts = perVariable
+    .filter((variable) => variable.outlierPct !== null)
+    .map((variable) => Math.max(0, 100 - (variable.outlierPct as number) * 2));
+  const validityScore = validityParts.length > 0 ? Number(mean(validityParts).toFixed(1)) : null;
+  const consistencyScore = observedCells > 0 ? Number(((typeConsistentCells / observedCells) * 100).toFixed(1)) : null;
+  const timestampOrderRows = dataset.rows.filter((row) =>
+    row.timestamp >= dataset.temporal.baselineStart && row.timestamp <= dataset.temporal.baselineEnd
   );
+  const timestampMillis = timestampOrderRows.map((row) => Date.parse(row.timestamp));
+  const comparablePairs = Math.max(0, timestampMillis.length - 1);
+  const orderedPairs = timestampMillis.slice(1).filter((timestamp, index) =>
+    Number.isFinite(timestamp) && Number.isFinite(timestampMillis[index]) && timestamp > timestampMillis[index]
+  ).length;
+  const temporalOrderScore = comparablePairs === 0
+    ? null
+    : Number(((orderedPairs / comparablePairs) * 100).toFixed(1));
+  const scoreParts = [
+    { score: completenessScore, weight: 0.35 },
+    { score: validityScore, weight: 0.25 },
+    { score: consistencyScore, weight: 0.15 },
+    { score: temporalOrderScore, weight: 0.15 },
+    { score: uniquenessScore, weight: 0.1 },
+  ].filter((part): part is { score: number; weight: number } => part.score !== null);
+  const totalScoreWeight = scoreParts.reduce((sum, part) => sum + part.weight, 0);
+  const overallScore = rows.length > 0 && eligible.length > 0 && observedCells > 0 && totalScoreWeight > 0
+    ? Number((scoreParts.reduce((sum, part) => sum + part.score * part.weight, 0) / totalScoreWeight).toFixed(1))
+    : null;
 
   // F2: Correlation & Dependence Atlas
   const rawCorrs: CorrelationEntry[] = [];
@@ -3003,7 +3257,6 @@ export function computeEdaAndMining(
         kendall: Number(tau.toFixed(4)),
         distCorr: Number(dC.toFixed(4)),
         mutualInfo: Number(mi.toFixed(4)),
-        partialCorr: Number((rP * 0.88).toFixed(4)),
         ciLow: Number(ci.low.toFixed(3)),
         ciHigh: Number(ci.high.toFixed(3)),
         ciMethod: `Circular block bootstrap (L=${ci.blockLen})`,
@@ -3019,72 +3272,91 @@ export function computeEdaAndMining(
     c.pAdjusted = adjCorrP[idx] ?? c.pRaw;
   });
 
-  // F3: PCA (Power iteration on standardized predictor correlation matrix)
-  const pcaFeatures = predictors.slice(0, 6).map((p) => p.name);
+  // F3: PCA from the full eigenspectrum of the standardized predictor correlation matrix.
+  const pcaFeatures = predictors.filter((predictor) => {
+    const values = rows.map((row) => row[predictor.name]).filter((value): value is number => typeof value === 'number' && Number.isFinite(value));
+    return new Set(values).size > 1;
+  }).slice(0, 6).map((predictor) => predictor.name);
   const d = pcaFeatures.length;
   const explainedVarianceRatio: number[] = [];
   const loadingsPC1: number[] = new Array(d).fill(0);
   const loadingsPC2: number[] = new Array(d).fill(0);
+  let kmo: number | null = null;
+  let bartlettP: number | null = null;
+  let adequacyMethod = 'Unavailable: fewer than two non-constant numeric predictors.';
 
-  if (d >= 2) {
-    // Standardized data matrix
-    const mat: number[][] = pcaFeatures.map((fname) => {
-      const colVals = rows.map((r) => (typeof r[fname] === 'number' ? (r[fname] as number) : null));
-      const valid = colVals.filter((v): v is number => v !== null);
-      const m = mean(valid);
-      const s = stdDev(valid) || 1;
-      return colVals.map((v) => ((v ?? m) - m) / s);
+  if (d > 0) {
+    const standardized: number[][] = pcaFeatures.map((feature) => {
+      const values = rows.map((row) => (typeof row[feature] === 'number' && Number.isFinite(row[feature]) ? row[feature] as number : null));
+      const observed = values.filter((value): value is number => value !== null);
+      const center = mean(observed);
+      const scale = stdDev(observed) || 1;
+      return values.map((value) => ((value ?? center) - center) / scale);
     });
-    const cov: number[][] = Array.from({ length: d }, (_, i) =>
-      Array.from({ length: d }, (_, j) => pearsonCorr(mat[i], mat[j]))
+    const correlationMatrix = Array.from({ length: d }, (_, i) =>
+      Array.from({ length: d }, (_, j) => pearsonCorr(standardized[i], standardized[j]))
     );
-    const powerIter = (mMat: number[][]): { vec: number[]; val: number } => {
-      let vec = new Array(d).fill(1 / Math.sqrt(d));
-      for (let it = 0; it < 25; it++) {
-        const next = mMat.map((row) => row.reduce((acc, v, j) => acc + v * vec[j], 0));
-        const norm = Math.sqrt(next.reduce((acc, v) => acc + v * v, 0)) || 1;
-        vec = next.map((v) => v / norm);
-      }
-      const mv = mMat.map((row) => row.reduce((acc, v, j) => acc + v * vec[j], 0));
-      const val = Math.max(0.01, vec.reduce((acc, v, i) => acc + v * mv[i], 0));
-      return { vec, val };
-    };
-    const pc1 = powerIter(cov);
-    pc1.vec.forEach((v, i) => (loadingsPC1[i] = Number(v.toFixed(3))));
-    const deflated = cov.map((row, i) => row.map((v, j) => v - pc1.val * pc1.vec[i] * pc1.vec[j]));
-    const pc2 = powerIter(deflated);
-    pc2.vec.forEach((v, i) => (loadingsPC2[i] = Number(v.toFixed(3))));
-    const totalVar = d;
-    let rem = Math.max(0, totalVar - pc1.val - pc2.val);
-    explainedVarianceRatio.push(Number((pc1.val / totalVar).toFixed(3)));
-    explainedVarianceRatio.push(Number((pc2.val / totalVar).toFixed(3)));
-    for (let k = 2; k < d; k++) {
-      const share = rem / (d - 2);
-      explainedVarianceRatio.push(Number((share / totalVar).toFixed(3)));
+    const eigen = symmetricEigenDecomposition(correlationMatrix);
+    const positiveEigenvalues = eigen.values.map((value) => Math.max(0, value));
+    const totalVariance = positiveEigenvalues.reduce((sum, value) => sum + value, 0);
+    if (totalVariance > 1e-12) {
+      positiveEigenvalues.forEach((value) => explainedVarianceRatio.push(Number((value / totalVariance).toFixed(3))));
+      if (d > 0) eigen.vectors.forEach((row, i) => (loadingsPC1[i] = Number((row[0] * Math.sqrt(positiveEigenvalues[0])).toFixed(3))));
+      if (d > 1) eigen.vectors.forEach((row, i) => (loadingsPC2[i] = Number((row[1] * Math.sqrt(positiveEigenvalues[1])).toFixed(3))));
+    }
+
+    if (d >= 2) {
+      const completeRows = rows.filter((row) => pcaFeatures.every((feature) =>
+        typeof row[feature] === 'number' && Number.isFinite(row[feature])
+      ));
+      const completeCorrelation = Array.from({ length: d }, (_, i) =>
+        Array.from({ length: d }, (_, j) =>
+          pearsonCorr(
+            completeRows.map((row) => row[pcaFeatures[i]] as number),
+            completeRows.map((row) => row[pcaFeatures[j]] as number)
+          )
+        )
+      );
+      const adequacy = calculateKmoBartlett(completeCorrelation, completeRows.length);
+      kmo = adequacy.kmo;
+      bartlettP = adequacy.bartlettP;
+      adequacyMethod = 'Pearson correlation matrix; listwise-complete rows; Bartlett chi-square approximation.';
     }
   }
   const cumulativeVarianceRatio: number[] = [];
-  explainedVarianceRatio.reduce((acc, v, i) => {
-    const s = Math.min(1, acc + v);
-    cumulativeVarianceRatio[i] = Number(s.toFixed(3));
-    return s;
+  explainedVarianceRatio.reduce((acc, value, index) => {
+    const cumulative = Math.min(1, acc + value);
+    cumulativeVarianceRatio[index] = Number(cumulative.toFixed(3));
+    return cumulative;
   }, 0);
 
-  // F4: Regime Clustering (KMeans k=3 with silhouette & bootstrap ARI stability)
-  const ySeries = rows.map((r) => (typeof r[targetName] === 'number' ? (r[targetName] as number) : mean(rows.map((rr) => rr[targetName]).filter((v): v is number => typeof v === 'number'))));
+  // F4: Three target-value terciles, not unsupervised K-means clusters.
+  const targetSeries = rows.map((row): number | null =>
+    typeof row[targetName] === 'number' && Number.isFinite(row[targetName]) ? row[targetName] as number : null
+  );
+  const ySeries = targetSeries.filter((value): value is number => value !== null);
   const ySorted = [...ySeries].sort((a, b) => a - b);
   const q33 = ySorted[Math.floor(ySorted.length * 0.33)] ?? 0;
   const q66 = ySorted[Math.floor(ySorted.length * 0.66)] ?? 0;
-  const regimeLabels = ySeries.map((y) => (y <= q33 ? 0 : y <= q66 ? 1 : 2));
-  const regimeMeans = [0, 1, 2].map((reg) => {
-    const vals = ySeries.filter((_, i) => regimeLabels[i] === reg);
+  const validRegimeLabels = tercileLabels(ySeries, q33, q66);
+  const regimeLabels = rows.map((row) =>
+    typeof row[targetName] === 'number' && Number.isFinite(row[targetName])
+      ? (row[targetName] as number) <= q33 ? 0 : (row[targetName] as number) <= q66 ? 1 : 2
+      : -1
+  );
+  const presentRegimes = [...new Set(validRegimeLabels)].sort((a, b) => a - b);
+  const regimeMeans = presentRegimes.map((regime) => {
+    const values = ySeries.filter((_, index) => validRegimeLabels[index] === regime);
     return {
-      regime: reg,
-      count: vals.length,
-      targetMean: Number(mean(vals).toFixed(2)),
-      label: reg === 0 ? 'Baseload / Low Regime' : reg === 1 ? 'Moderate Regime' : 'Peak / High Regime',
+      regime,
+      count: values.length,
+      targetMean: Number(mean(values).toFixed(2)),
+      label: regime === 0 ? 'Lower Target Tercile' : regime === 1 ? 'Middle Target Tercile' : 'Upper Target Tercile',
     };
   });
+  const regimeMetrics = clusterValidationMetrics(ySeries, validRegimeLabels);
+  const bootstrapAri = bootstrapTercileAdjustedRand(ySeries, validRegimeLabels, seed + 404);
+  const regimeK = presentRegimes.length;
 
   // F5: Anomaly Voting (Hampel Z, Step Jump, Extreme Z, + Compact Bottleneck Autoencoder Vote)
   const yMed = median(ySeries);
@@ -3092,12 +3364,23 @@ export function computeEdaAndMining(
 
   // Deterministic bottleneck Autoencoder (dim = 1 + top 3 predictors -> bottleneck=2 -> reconstruction)
   const aeCols = [targetName, ...predictors.slice(0, 3).map((p) => p.name)];
-  const aeMat = rows.map((r) =>
-    aeCols.map((cn) => {
-      const colMean = mean(rows.map((rr) => (typeof rr[cn] === 'number' ? (rr[cn] as number) : 0)));
-      const colSd = stdDev(rows.map((rr) => (typeof rr[cn] === 'number' ? (rr[cn] as number) : colMean))) || 1;
-      const val = typeof r[cn] === 'number' ? (r[cn] as number) : colMean;
-      return (val - colMean) / colSd;
+  const aeColumnStats = aeCols.map((columnName) => {
+    const observed = rows.map((row) => row[columnName]).filter((value): value is number =>
+      typeof value === 'number' && Number.isFinite(value)
+    );
+    const columnMean = mean(observed);
+    const imputed = rows.map((row) => {
+      const value = row[columnName];
+      return typeof value === 'number' && Number.isFinite(value) ? value : columnMean;
+    });
+    return { mean: columnMean, scale: stdDev(imputed) || 1 };
+  });
+  const aeMat = rows.map((row) =>
+    aeCols.map((columnName, index) => {
+      const { mean: columnMean, scale: columnScale } = aeColumnStats[index];
+      const value = row[columnName];
+      const finiteValue = typeof value === 'number' && Number.isFinite(value) ? value : columnMean;
+      return (finiteValue - columnMean) / columnScale;
     })
   );
   const aeRng = createRng(seed + 505);
@@ -3137,9 +3420,11 @@ export function computeEdaAndMining(
   const scores: number[] = [];
   const voteCounts: number[] = [];
   rows.forEach((r, idx) => {
-    const z = Math.abs(ySeries[idx] - yMed) / yMad;
-    const prev = idx > 0 ? ySeries[idx - 1] : ySeries[idx];
-    const jumpZ = Math.abs(ySeries[idx] - prev) / yMad;
+    const yValue = targetSeries[idx];
+    if (yValue === null) return;
+    const z = Math.abs(yValue - yMed) / yMad;
+    const previousValue = idx > 0 ? targetSeries[idx - 1] : null;
+    const jumpZ = previousValue === null ? 0 : Math.abs(yValue - previousValue) / yMad;
     const aeVote = (aeErrors[idx] - aeMed) / aeMad > 2.8 ? 1 : 0;
     if (aeVote) autoencoderFlagCount++;
     const votes = (z > 3.0 ? 1 : 0) + (jumpZ > 2.8 ? 1 : 0) + (z > 3.8 ? 1 : 0) + aeVote;
@@ -3153,9 +3438,11 @@ export function computeEdaAndMining(
 
   // F6: Regime Association Rule Extraction (support, confidence, lift across regimes)
   const regimeRules: EdaTargetSummary['regimeRules'] = [];
-  const totalN = Math.max(1, rows.length);
+  const totalN = Math.max(1, ySeries.length);
   for (const pred of predictors.slice(0, 4)) {
-    const pVals = rows.map((r) => (typeof r[pred.name] === 'number' ? (r[pred.name] as number) : null));
+    const pVals = rows.map((row) =>
+      typeof row[pred.name] === 'number' && Number.isFinite(row[pred.name]) ? row[pred.name] as number : null
+    );
     const valid = pVals.filter((v): v is number => v !== null).sort((a, b) => a - b);
     if (valid.length < 15) continue;
     const pLow = valid[Math.floor(valid.length * 0.33)];
@@ -3172,7 +3459,7 @@ export function computeEdaAndMining(
         let bothCount = 0;
         for (let i = 0; i < rows.length; i++) {
           const pv = pVals[i];
-          if (pv !== null && chk.match(pv)) {
+          if (pv !== null && regimeLabels[i] >= 0 && chk.match(pv)) {
             condCount++;
             if (regimeLabels[i] === regMeta.regime) bothCount++;
           }
@@ -3195,93 +3482,161 @@ export function computeEdaAndMining(
   regimeRules.sort((a, b) => b.lift - a.lift || b.confidencePct - a.confidencePct);
   const topRegimeRules = regimeRules.slice(0, 6);
 
-  // F7: Time Series Mining (ACF, PACF, Optimal Degree-Day Base Temp, Change-point)
-  const maxLag = Math.min(14, Math.floor(ySeries.length / 4));
-  const acf: number[] = [1];
-  const pacf: number[] = [1];
-  const my = mean(ySeries);
-  const denom = ySeries.reduce((acc, v) => acc + (v - my) ** 2, 0) || 1;
+  // F7: sample ACF and PACF. PACF is calculated by Levinson-Durbin recursion.
+  const targetMean = mean(ySeries);
+  const targetVarianceSum = ySeries.reduce((sum, value) => sum + (value - targetMean) ** 2, 0);
+  const acfAvailable = ySeries.length >= 4 && targetVarianceSum > 1e-12;
+  const maxLag = acfAvailable ? Math.min(14, Math.floor(ySeries.length / 4)) : 0;
+  const rawAcf: number[] = acfAvailable ? [1] : [];
+  const denom = targetVarianceSum || 1;
   for (let lag = 1; lag <= maxLag; lag++) {
-    let num = 0;
-    for (let t = lag; t < ySeries.length; t++) num += (ySeries[t] - my) * (ySeries[t - lag] - my);
-    const r = Number((num / denom).toFixed(3));
-    acf.push(r);
-    pacf.push(Number((r * Math.pow(0.78, lag - 1)).toFixed(3)));
+    let numerator = 0;
+    for (let t = lag; t < targetSeries.length; t++) {
+      const current = targetSeries[t];
+      const previous = targetSeries[t - lag];
+      if (current !== null && previous !== null) numerator += (current - targetMean) * (previous - targetMean);
+    }
+    rawAcf.push(numerator / denom);
+  }
+  const acf = rawAcf.map((value) => Number(value.toFixed(3)));
+  const pacf: number[] = acfAvailable ? [1] : [];
+  let arCoefficients: number[] = [];
+  for (let lag = 1; lag <= maxLag; lag++) {
+    let numerator = rawAcf[lag];
+    let denominator = 1;
+    for (let j = 1; j < lag; j++) {
+      numerator -= arCoefficients[j - 1] * rawAcf[lag - j];
+      denominator -= arCoefficients[j - 1] * rawAcf[j];
+    }
+    const reflection = Math.abs(denominator) > 1e-12 ? numerator / denominator : 0;
+    const nextCoefficients = new Array(lag);
+    for (let j = 1; j < lag; j++) {
+      nextCoefficients[j - 1] = arCoefficients[j - 1] - reflection * arCoefficients[lag - j - 1];
+    }
+    nextCoefficients[lag - 1] = reflection;
+    arCoefficients = nextCoefficients;
+    pacf.push(Number(reflection.toFixed(3)));
   }
 
-  // Optimal degree-day base temperature search if temperature predictor exists
-  const tempCol = predictors.find((p) => /temp/i.test(p.name));
-  let optHeat = 12;
-  let optCool = 18;
+  // Degree-day base temperatures are a coarse 1°C grid search, not inferential optima.
+  const tempCol = predictors.find((predictor) => /temp/i.test(predictor.name));
+  let optHeat: number | null = null;
+  let optCool: number | null = null;
   if (tempCol) {
     const tx: number[] = [];
     const ty: number[] = [];
-    for (const r of rows) {
-      const tv = r[tempCol.name];
-      const yv = r[targetName];
-      if (typeof tv === 'number' && typeof yv === 'number') {
-        tx.push(tv);
-        ty.push(yv);
+    for (const row of rows) {
+      const temperature = row[tempCol.name];
+      const target = row[targetName];
+      if (typeof temperature === 'number' && Number.isFinite(temperature) && typeof target === 'number' && Number.isFinite(target)) {
+        tx.push(temperature);
+        ty.push(target);
       }
     }
-    let bestR2 = -1;
-    for (let th = 10; th <= 15; th += 1) {
-      for (let tc = 16; tc <= 22; tc += 1) {
-        const dd = tx.map((t) => Math.max(0, t - tc) + 0.7 * Math.max(0, th - t));
-        const r = pearsonCorr(dd, ty);
-        if (r * r > bestR2) {
-          bestR2 = r * r;
-          optHeat = th;
-          optCool = tc;
+    if (tx.length >= 3 && new Set(tx).size > 1 && new Set(ty).size > 1) {
+      let bestR2 = 0;
+      for (let heating = 10; heating <= 15; heating += 1) {
+        for (let cooling = 16; cooling <= 22; cooling += 1) {
+          const degreeDays = tx.map((temperature) => Math.max(0, temperature - cooling) + 0.7 * Math.max(0, heating - temperature));
+          const correlationSquared = pearsonCorr(degreeDays, ty) ** 2;
+          if (Number.isFinite(correlationSquared) && correlationSquared > bestR2) {
+            bestR2 = correlationSquared;
+            optHeat = heating;
+            optCool = cooling;
+          }
         }
       }
     }
   }
 
-  // Change point across full dataset
-  const fullY = dataset.rows.map((r) => r[targetName]).filter((v): v is number => typeof v === 'number');
+  // Change point across chronological, pairwise-finite full-dataset rows; only the point estimate is returned.
+  const changePointRows = dataset.rows.filter((row) =>
+    Number.isFinite(Date.parse(row.timestamp)) &&
+    typeof row[targetName] === 'number' && Number.isFinite(row[targetName]) &&
+    (!tempCol || (typeof row[tempCol.name] === 'number' && Number.isFinite(row[tempCol.name])))
+  ).sort((left, right) => left.timestamp.localeCompare(right.timestamp));
+  const fullY = changePointRows.map((row) => row[targetName] as number);
   const fullX = tempCol
-    ? dataset.rows.map((r) => (typeof r[tempCol.name] === 'number' ? (r[tempCol.name] as number) : 16))
-    : Array.from({ length: fullY.length }, (_, i) => i);
-  const qa = fullY.length > 30 ? quandtAndrewsSupF(fullX.slice(0, fullY.length), fullY, seed + 12) : null;
+    ? changePointRows.map((row) => row[tempCol.name] as number)
+    : Array.from({ length: fullY.length }, (_, index) => index);
+  const qa = fullY.length > 30 ? quandtAndrewsSupF(fullX, fullY, seed + 12) : null;
 
-  // F8: Feature Relevance Consensus
-  const featureRelevance = predictors.map((pred) => {
-    const px: number[] = [];
-    const py: number[] = [];
-    for (const r of rows) {
-      const a = r[pred.name];
-      const b = r[targetName];
-      if (typeof a === 'number' && typeof b === 'number') {
-        px.push(a);
-        py.push(b);
+  const featureRelevance = predictors.map((predictor) => {
+    const featureValues: number[] = [];
+    const targetValues: number[] = [];
+    for (const row of rows) {
+      const featureValue = row[predictor.name];
+      const targetValue = row[targetName];
+      if (typeof featureValue === 'number' && Number.isFinite(featureValue) && typeof targetValue === 'number' && Number.isFinite(targetValue)) {
+        featureValues.push(featureValue);
+        targetValues.push(targetValue);
       }
     }
-    const r = Math.abs(pearsonCorr(px, py));
-    const mi = binnedMutualInfo(px, py);
-    const fVal = (r * r * Math.max(1, px.length - 2)) / Math.max(0.01, 1 - r * r);
+    const estimable = featureValues.length >= 8 && new Set(featureValues).size > 1 && new Set(targetValues).size > 1;
     return {
-      feature: pred.name,
-      miScore: Number(mi.toFixed(3)),
-      anovaF: Number(fVal.toFixed(2)),
-      permImportance: Number((r * 0.85 + mi * 0.15).toFixed(3)),
-      stabilityFreq: Number(Math.min(1, 0.4 + r * 0.6).toFixed(2)),
-      shapMeanAbs: Number((r * stdDev(py) * 0.45).toFixed(2)),
-      consensusRank: 1,
+      feature: predictor.name,
+      miScore: estimable ? Number(binnedMutualInfo(featureValues, targetValues, 8).toFixed(3)) : null,
+      absolutePearson: estimable ? Number(Math.abs(pearsonCorr(featureValues, targetValues)).toFixed(3)) : null,
+      miRank: null as number | null,
     };
   });
-  featureRelevance.sort((a, b) => b.permImportance - a.permImportance);
-  featureRelevance.forEach((f, idx) => (f.consensusRank = idx + 1));
+  featureRelevance.sort((left, right) => {
+    if (left.miScore === null || right.miScore === null) {
+      return left.miScore === null
+        ? right.miScore === null ? left.feature.localeCompare(right.feature) : 1
+        : -1;
+    }
+    return right.miScore - left.miScore || (right.absolutePearson ?? 0) - (left.absolutePearson ?? 0) || left.feature.localeCompare(right.feature);
+  });
+  let miRank = 0;
+  featureRelevance.forEach((feature) => {
+    if (feature.miScore !== null) feature.miRank = ++miRank;
+  });
+  const changePointRow = qa ? changePointRows[qa.bestIdx] : undefined;
+  const changePointIndex = changePointRow ? dataset.rows.indexOf(changePointRow) : null;
+  const methodAssumptions = [
+    'Data-quality index is an in-app descriptive heuristic, not a validated external quality standard. It uses completeness (0.35), a univariate 3.5 scaled-MAD outlier screen (0.25; sample-SD then unit-scale fallback when MAD is zero), finite-number type consistency (0.15), strictly increasing adjacent timestamp order (0.15), and timestamp-string uniqueness (0.10); unavailable components are omitted and remaining weights renormalized; the overall index is withheld without selected numeric cells and observations. Per-variable scores use 65% completeness and a 35% penalty of 3 × outlier percentage, and are null when either component is unavailable.',
+    'PCA uses up to six non-constant selected numeric predictors; missing values are mean-imputed per predictor for the eigenspectrum. KMO and Bartlett use listwise-complete rows; Bartlett p is an asymptotic chi-square approximation, and either adequacy metric may be unavailable for singular or undersampled matrices.',
+    'Regimes are target-value terciles, not K-means clusters. Silhouette, Davies-Bouldin, and Calinski-Harabasz are calculated in one-dimensional target space; bootstrap ARI averages 100 seeded resamples of tercile cut points evaluated on the original target values.',
+    'Feature relevance is univariate: mutual information is an 8-bin plug-in estimate and Pearson is absolute linear association; both require at least 8 paired finite, non-constant observations. No permutation importance, selection stability, SHAP value, ANOVA F statistic, or Kendall-W consensus is computed.',
+    'Correlation intervals use a circular block bootstrap with 80 seeded replicates; Pearson p-values use the conventional IID t approximation, not a time-series-adjusted test, and should be read as screening results.',
+    'Partial correlations, spectral entropy, trend/seasonal strengths, and change-point confidence intervals are not computed or returned.',
+    'ACF is available only with at least four finite, non-constant target observations and uses a biased covariance estimator over available lag pairs; PACF uses Levinson-Durbin recursion on unrounded sample ACF values. Both are rounded to three decimals for output. Distance correlation uses the first 160 paired observations to bound quadratic work; row order can affect that estimate.',
+    'Degree-day bases search heating 10–15°C and cooling 16–22°C on a 1°C grid, scored by squared Pearson correlation, not inferential optima; no base is emitted if the inputs are constant or no positive score is estimable. Change-point analysis uses chronological, pairwise-finite full-dataset target/temperature rows (or row index without temperature) and returns a point estimate only; no confidence interval or p-value is returned.',
+  ];
 
   return {
     target: targetName,
+    seed,
+    engine_version: ENGINE_VERSION,
+    methodAssumptions,
     dataQuality: {
       overallScore,
-      completeness: { score: completenessScore, weight: 0.35, detail: `${missingCells} missing cells across ${totalCells} observations` },
-      validity: { score: validityScore, weight: 0.25, detail: 'Out-of-fence anomaly & range check' },
-      consistency: { score: consistencyScore, weight: 0.15, detail: 'Unit & role schema consistency' },
-      timeliness: { score: timelinessScore, weight: 0.15, detail: 'Monotonic UTC sequence & DST flags' },
-      uniqueness: { score: uniquenessScore, weight: 0.1, detail: `${uniqueTs}/${rows.length} unique timestamps` },
+      completeness: {
+        score: completenessScore,
+        weight: 0.35,
+        detail: totalCells > 0 ? `${missingCells} missing cells across ${totalCells} selected numeric cells` : 'Not computed: no selected numeric baseline cells.',
+      },
+      validity: {
+        score: validityScore,
+        weight: 0.25,
+        detail: validityScore === null ? 'Not computed: no finite selected numeric values.' : '100 minus 2 × percent outside a 3.5 scaled-MAD screen; not domain-range validation',
+      },
+      consistency: {
+        score: consistencyScore,
+        weight: 0.15,
+        detail: observedCells > 0 ? 'Finite numeric values among non-missing selected numeric cells; units and role semantics are not checked' : 'Not computed: no non-missing selected numeric cells.',
+      },
+      temporalOrder: {
+        score: temporalOrderScore,
+        weight: 0.15,
+        detail: temporalOrderScore === null ? 'Not computed: at least two baseline timestamps are required.' : 'Share of adjacent baseline timestamps in input order that parse and strictly increase; freshness is not measured',
+      },
+      uniqueness: {
+        score: uniquenessScore,
+        weight: 0.1,
+        detail: rows.length > 0 ? `${uniqueTs}/${rows.length} distinct timestamp strings` : 'Not computed: no baseline timestamps.',
+      },
       perVariable,
     },
     correlations: rawCorrs,
@@ -3291,15 +3646,17 @@ export function computeEdaAndMining(
       featureNames: pcaFeatures,
       loadingsPC1,
       loadingsPC2,
-      kmo: 0.76,
-      bartlettP: 1e-8,
+      kmo,
+      bartlettP,
+      adequacyMethod,
     },
     clustering: {
-      k: 3,
-      silhouette: 0.54,
-      daviesBouldin: 0.68,
-      calinskiHarabasz: 184.2,
-      bootstrapAri: 0.89,
+      algorithm: 'target_terciles',
+      k: regimeK,
+      silhouette: regimeMetrics.silhouette,
+      daviesBouldin: regimeMetrics.daviesBouldin,
+      calinskiHarabasz: regimeMetrics.calinskiHarabasz,
+      bootstrapAri,
       regimeLabels,
       regimeMeans,
     },
@@ -3313,20 +3670,15 @@ export function computeEdaAndMining(
     },
     regimeRules: topRegimeRules,
     timeSeriesMining: {
-      spectralEntropy: 0.42,
-      trendStrength: 0.31,
-      seasonalStrength: 0.78,
       optimalBaseTempHeating: optHeat,
       optimalBaseTempCooling: optCool,
-      changePointIndex: qa ? qa.bestIdx : null,
-      changePointTimestamp: qa ? dataset.rows[qa.bestIdx]?.timestamp ?? null : null,
-      changePointCiLow: qa ? dataset.rows[Math.max(0, qa.bestIdx - 7)]?.timestamp ?? null : null,
-      changePointCiHigh: qa ? dataset.rows[Math.min(dataset.rows.length - 1, qa.bestIdx + 7)]?.timestamp ?? null : null,
+      changePointIndex,
+      changePointTimestamp: changePointRow?.timestamp ?? null,
+      acfAvailable,
       acf,
       pacf,
     },
     featureRelevance,
-    kendallW: 0.84,
-    causalMv: computeCausalMv(dataset, targetName, predictors.map((p) => p.name)),
+    causalMv: computeCausalMv(dataset, targetName, predictors.map((predictor) => predictor.name)),
   };
 }

@@ -2,12 +2,16 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   aggregateRowsToTargetGranularity,
+  deriveTargetSeed,
+  deterministicHash,
   generateSyntheticDataset,
+  parseCsvToDataset,
   validateGranularityTransition,
 } from './synthetic';
 import { executeGuardedLocalSql, MAX_SQL_BYTES, validateReadOnlySql } from './sqlGuard';
 import {
   buildDefaultVsgForTarget,
+  calculateKmoBartlett,
   computeCausalMv,
   computeEdaAndMining,
   computeMultivariateVif,
@@ -27,6 +31,7 @@ import {
   derivePurgeGapSteps,
   fitNestedBlendWeights,
   getScoringWeights,
+  getThresholdLimits,
   prepareTrainingFold,
   runTargetModelingPipeline,
   shouldFitStackedEnsemble,
@@ -37,7 +42,7 @@ import JSZip from 'jszip';
 import { buildDeterministicReportModel, exportEbprojZipBlob, importEbprojZipFile, renderHtmlReport, verifyReportNarrativeConsistency } from './report';
 import type { ReportModel, ReportSection } from './report';
 import { EBPROJ_LIMITS } from './projectArchive';
-import { resolveStandardForDomain } from './domains';
+import { resolveStandardForDomain, resolveThresholdLimits, resolveThresholdProfileForDataset } from './domains';
 
 function makeEbprojFixture() {
   const dataset = generateSyntheticDataset('energy_mv', 42);
@@ -129,6 +134,58 @@ test('Synthetic ground-truth generator is deterministic for a fixed seed', () =>
   assert.equal(ds1.sha256, ds2.sha256);
   assert.equal(ds1.rows.length, 365);
   assert.deepEqual(ds1.rows[0], ds2.rows[0]);
+});
+
+test('Wave 2.1 / STAT-04: dataset identities use full UTF-8 SHA-256 digests', async () => {
+  assert.equal(deterministicHash('abc'), 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad');
+  assert.equal(deterministicHash('é'), '4a99557e4033c3539de2eb65472017cad5f9557f7a0625a09f1c3f6e2ba69c4c');
+  const longText = 'a'.repeat(1000);
+  const expected = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(longText));
+  assert.equal(
+    deterministicHash(longText),
+    Array.from(new Uint8Array(expected), (byte) => byte.toString(16).padStart(2, '0')).join('')
+  );
+  const dataset = generateSyntheticDataset('energy_mv', 42);
+  assert.match(dataset.sha256, /^[0-9a-f]{64}$/);
+  assert.equal(dataset.sha256, deterministicHash(JSON.stringify(dataset.rows)));
+
+  const csvRows = Array.from({ length: 200 }, (_, i) => `${new Date(Date.UTC(2025, 0, i + 1)).toISOString()},${i}`);
+  const csv = `timestamp,value\n${csvRows.join('\n')}`;
+  const changedCsv = `timestamp,value\n${[...csvRows.slice(0, -1), `${new Date(Date.UTC(2025, 0, 200)).toISOString()},999`].join('\n')}`;
+  const parsed = parseCsvToDataset(csv, 'sample.csv');
+  const changed = parseCsvToDataset(changedCsv, 'sample.csv');
+  assert.equal(parsed.sha256, deterministicHash(csv));
+  assert.notEqual(parsed.sha256, changed.sha256, 'changes after the 2 KiB prefix must change the file identity');
+});
+
+test('Wave 2.1 / STAT-05: seeded diagnostic and EDA results record seed and engine version', () => {
+  const dataset = generateSyntheticDataset('energy_mv', 42);
+  const vsg = buildDefaultVsgForTarget(dataset, 'kwh_total', '2026-01-01T00:00:00Z');
+  const tcp = createDefaultTcpConfig(dataset);
+  const diagnostics = runDiagnosticsSuite(dataset, 'kwh_total', vsg.entries, tcp, 42);
+  const diagnosticsJson = JSON.parse(JSON.stringify(diagnostics)) as { seed?: number; engine_version?: string }[];
+  assert.ok(diagnosticsJson.length > 0);
+  assert.ok(diagnosticsJson.every((result) => result.seed === deriveTargetSeed(42, 'kwh_total')));
+  assert.ok(diagnosticsJson.every((result) => result.engine_version === '1.1.0'));
+
+  const eda = computeEdaAndMining(dataset, 'kwh_total', vsg.entries, tcp, 42);
+  const edaJson = JSON.parse(JSON.stringify(eda)) as { seed?: number; engine_version?: string };
+  assert.equal(edaJson.seed, deriveTargetSeed(42, 'kwh_total'));
+  assert.equal(edaJson.engine_version, '1.1.0');
+  assert.deepEqual(eda, computeEdaAndMining(dataset, 'kwh_total', vsg.entries, tcp, 42));
+  assert.deepEqual(
+    diagnostics.map((result) => [result.statistic, result.pRaw, result.pAdjusted]),
+    runDiagnosticsSuite(dataset, 'kwh_total', vsg.entries, tcp, 42).map((result) => [result.statistic, result.pRaw, result.pAdjusted])
+  );
+
+  const modelBundle = runTargetModelingPipeline(dataset, 'kwh_total', vsg.entries, tcp, 42, 'ashrae14');
+  const repeatedModelBundle = runTargetModelingPipeline(dataset, 'kwh_total', vsg.entries, tcp, 42, 'ashrae14');
+  assert.equal(modelBundle.seed, deriveTargetSeed(42, 'kwh_total'));
+  assert.equal(modelBundle.engine_version, '1.1.0');
+  assert.deepEqual(
+    modelBundle.top5.map((model) => [model.id, model.oofCvRmse, model.oofNmbe, model.oofR2, model.compositeScore]),
+    repeatedModelBundle.top5.map((model) => [model.id, model.oofCvRmse, model.oofNmbe, model.oofR2, model.compositeScore])
+  );
 });
 
 function makePanelDataset(earlyPlaceboEffect = false): DatasetState {
@@ -574,6 +631,7 @@ test('F-09: HTML report export escapes company, dataset, and section text as ine
     datasetSha256: payload,
     domain: 'custom',
     seed: 42,
+    engine_version: '1.0.0',
     sections: [],
     glossary: [],
     howToRead: [],
@@ -723,6 +781,9 @@ test('Multi-target modeling, XGBoost/NN portfolio, Non-Parametric inference, Cus
   const bundle2 = runTargetModelingPipeline(ds, 'chilled_water_tons', vsg2.entries, tcp, 42, 'ashrae14');
 
   assert.notEqual(bundle1.seed, bundle2.seed);
+  assert.equal(bundle1.seed, deriveTargetSeed(42, 'kwh_total'));
+  assert.equal(bundle1.engine_version, '1.1.0');
+  assert.equal(bundle1.limits.version, '2014-v1');
   assert.ok(bundle1.top5.length >= 3);
   assert.ok(bundle1.top5[0].oofCvRmse < 12, `Expected accurate Top-1 fit, got ${bundle1.top5[0].oofCvRmse}%`);
   assert.ok(bundle1.rejected.some((r) => r.isNeuralNet), 'NN Gate should explicitly evaluate/reject NN if not >5% better');
@@ -763,6 +824,15 @@ test('Multi-target modeling, XGBoost/NN portfolio, Non-Parametric inference, Cus
     'Unit test lock',
     bundle1.seed
   );
+  assert.equal(locked.vsgSnapshotHash, deterministicHash(JSON.stringify(vsg1.entries)));
+  assert.equal(locked.tcpSnapshotHash, deterministicHash(JSON.stringify(tcp)));
+  assert.equal(
+    locked.artifactSha256,
+    deterministicHash(`${bundle1.top5[0].id}:${locked.version}:${locked.vsgSnapshotHash}:${locked.tcpSnapshotHash}:${ds.sha256}`)
+  );
+  for (const digest of [locked.vsgSnapshotHash, locked.tcpSnapshotHash, locked.artifactSha256]) {
+    assert.match(digest, /^[0-9a-f]{64}$/);
+  }
   const mon = predictFromLockedBaseline(locked, reportingRows, ds, 'auto');
   const avgDev = mon.points.reduce((a, p) => a + (p.deviation ?? 0), 0) / mon.points.length;
   assert.ok(avgDev < -100, `Expected negative deviation from planted -215 savings, got ${avgDev}`);
@@ -789,6 +859,175 @@ test('Multi-target modeling, XGBoost/NN portfolio, Non-Parametric inference, Cus
   });
   const consistency = verifyReportNarrativeConsistency(report);
   assert.equal(consistency.ok, true, consistency.mismatches.join('; '));
+  const edaReportSection = report.sections.find((section) => section.id === 'eda-correlation-mining')!;
+  assert.match(edaReportSection.method, /target-tercile validation/i);
+  assert.match(edaReportSection.caveats, /not a time-series-adjusted test/i);
+  assert.doesNotMatch(edaReportSection.resultsSummary, /Kendall W|feature consensus/i);
+  const modelReportSection = report.sections.find((section) => section.id === 'modeling-top5-rationale')!;
+  assert.match(modelReportSection.caveats, /application-defined|source-verified/i);
+  assert.match(modelReportSection.settingsUsed, /Threshold reference=.*v2014-v1/);
+  assert.equal(report.engine_version, '1.1.0');
+  assert.ok(renderHtmlReport('Example', 'Standard', report, report.sections).includes('Engine version: 1.1.0'));
+});
+
+test('Wave 2.1 / STAT-03: EDA metrics are data-derived and unsupported proxies are not emitted', () => {
+  const dataset = generateSyntheticDataset('energy_mv', 42);
+  const vsg = buildDefaultVsgForTarget(dataset, 'kwh_total', '2026-01-01T00:00:00Z');
+  const tcp = createDefaultTcpConfig(dataset);
+  const eda = computeEdaAndMining(dataset, 'kwh_total', vsg.entries, tcp, 42);
+
+  const qualityDataset = structuredClone(dataset);
+  qualityDataset.rows = dataset.rows.slice(0, 10).reverse().map((row) => ({ ...row }));
+  qualityDataset.rawRowCount = qualityDataset.rows.length;
+  qualityDataset.temporal = { ...dataset.temporal, baselineEnd: dataset.rows[9].timestamp };
+  qualityDataset.rows[0].outdoor_temp_c = null;
+  qualityDataset.rows[1].kwh_total = 'invalid numeric value';
+  qualityDataset.rows[2].timestamp = qualityDataset.rows[1].timestamp;
+  const qualityRows = getBaselineRows(qualityDataset);
+  const qualityColumns = qualityDataset.columns.filter((column) =>
+    column.dtype === 'numeric' && vsg.entries[column.name] && vsg.entries[column.name].state !== 'exclude'
+  );
+  const qualityCells = qualityRows.length * qualityColumns.length;
+  const missingCells = qualityRows.reduce((count, row) => count + qualityColumns.filter((column) => row[column.name] === null || row[column.name] === undefined).length, 0);
+  const observedCells = qualityRows.reduce((count, row) => count + qualityColumns.filter((column) => row[column.name] !== null && row[column.name] !== undefined).length, 0);
+  const finiteCells = qualityRows.reduce((count, row) => count + qualityColumns.filter((column) => typeof row[column.name] === 'number' && Number.isFinite(row[column.name])).length, 0);
+  const qualityEda = computeEdaAndMining(qualityDataset, 'kwh_total', vsg.entries, tcp, 42);
+  assert.equal(qualityEda.dataQuality.completeness.score, Number(((qualityCells - missingCells) / qualityCells * 100).toFixed(1)));
+  assert.equal(qualityEda.dataQuality.consistency.score, Number((finiteCells / observedCells * 100).toFixed(1)));
+  const timestampOrderRows = qualityDataset.rows.filter((row) => row.timestamp >= qualityDataset.temporal.baselineStart && row.timestamp <= qualityDataset.temporal.baselineEnd);
+  assert.equal(qualityEda.dataQuality.temporalOrder.score, Number((timestampOrderRows.slice(1).filter((row, index) => Date.parse(row.timestamp) > Date.parse(timestampOrderRows[index].timestamp)).length / (timestampOrderRows.length - 1) * 100).toFixed(1)));
+  assert.equal(qualityEda.dataQuality.uniqueness.score, Number((new Set(qualityRows.map((row) => row.timestamp)).size / qualityRows.length * 100).toFixed(1)));
+
+  const emptyDataset = { ...dataset, rows: [], rawRowCount: 0 };
+  const emptyEda = computeEdaAndMining(emptyDataset, 'kwh_total', vsg.entries, tcp, 42);
+  assert.equal(emptyEda.dataQuality.overallScore, null);
+  assert.equal(emptyEda.dataQuality.completeness.score, null);
+  assert.equal(emptyEda.dataQuality.validity.score, null);
+  assert.equal(emptyEda.dataQuality.consistency.score, null);
+  assert.equal(emptyEda.dataQuality.temporalOrder.score, null);
+  assert.equal(emptyEda.dataQuality.uniqueness.score, null);
+
+  const degenerateDataset = structuredClone(dataset);
+  for (const row of degenerateDataset.rows) {
+    row.outdoor_temp_c = 10;
+    row.relative_humidity_pct = Number.NaN;
+  }
+  const degenerateEda = computeEdaAndMining(degenerateDataset, 'kwh_total', vsg.entries, tcp, 42);
+  assert.equal(degenerateEda.timeSeriesMining.optimalBaseTempHeating, null);
+  assert.equal(degenerateEda.timeSeriesMining.optimalBaseTempCooling, null);
+  const constantFeature = degenerateEda.featureRelevance.find((feature) => feature.feature === 'outdoor_temp_c');
+  assert.deepEqual(constantFeature && [constantFeature.miScore, constantFeature.absolutePearson, constantFeature.miRank], [null, null, null]);
+  assert.ok(degenerateEda.anomalies.scores.every(Number.isFinite), 'non-finite predictor inputs must not contaminate anomaly scores');
+  const constantTargetDataset = structuredClone(dataset);
+  for (const row of constantTargetDataset.rows) row.kwh_total = 100;
+  const constantTargetEda = computeEdaAndMining(constantTargetDataset, 'kwh_total', vsg.entries, tcp, 42);
+  assert.equal(constantTargetEda.timeSeriesMining.acfAvailable, false);
+  assert.deepEqual(constantTargetEda.timeSeriesMining.acf, []);
+  assert.deepEqual(constantTargetEda.timeSeriesMining.pacf, []);
+  assert.equal(constantTargetEda.timeSeriesMining.optimalBaseTempHeating, null);
+  assert.ok(constantTargetEda.featureRelevance.every((feature) => feature.miRank === null));
+
+  assert.notEqual(eda.pca.kmo, 0.76);
+  assert.notEqual(eda.pca.bartlettP, 1e-8);
+  assert.notEqual(eda.clustering.silhouette, 0.54);
+  assert.notEqual(eda.clustering.daviesBouldin, 0.68);
+  assert.notEqual(eda.clustering.calinskiHarabasz, 184.2);
+  assert.notEqual(eda.clustering.bootstrapAri, 0.89);
+  assert.equal(eda.clustering.algorithm, 'target_terciles');
+  assert.ok(eda.clustering.daviesBouldin !== null && Number.isFinite(eda.clustering.daviesBouldin));
+  assert.ok(eda.clustering.calinskiHarabasz !== null && Number.isFinite(eda.clustering.calinskiHarabasz));
+  assert.equal(eda.clustering.regimeMeans.reduce((sum, regime) => sum + regime.count, 0), getBaselineRows(dataset).filter((row) => typeof row.kwh_total === 'number' && Number.isFinite(row.kwh_total)).length);
+  assert.equal(eda.pca.explainedVarianceRatio.length, eda.pca.featureNames.length);
+  assert.ok(Math.abs(eda.pca.explainedVarianceRatio.reduce((sum, value) => sum + value, 0) - 1) < 0.005);
+  assert.ok(new Set(eda.pca.explainedVarianceRatio.slice(2)).size > 1, 'later PCA components must use their eigenvalues, not evenly split residual variance');
+  assert.ok(eda.clustering.silhouette !== null && eda.clustering.silhouette >= -1 && eda.clustering.silhouette <= 1);
+  assert.ok(eda.clustering.bootstrapAri !== null && eda.clustering.bootstrapAri >= -1 && eda.clustering.bootstrapAri <= 1);
+  const kmoBartlett = calculateKmoBartlett([[1, 0.5], [0.5, 1]], 100);
+  assert.equal(kmoBartlett.kmo, 0.5);
+  assert.ok(kmoBartlett.bartlettP !== null && kmoBartlett.bartlettP < 0.01);
+  const independent = calculateKmoBartlett([[1, 0], [0, 1]], 100);
+  assert.equal(independent.kmo, null);
+  assert.equal(independent.bartlettP, 1);
+  assert.ok(eda.timeSeriesMining.pacf.length > 2);
+  const acfRaw = (lag: number): number => {
+    const target = getBaselineRows(dataset).map((row) => row.kwh_total as number);
+    const targetMean = target.reduce((sum, value) => sum + value, 0) / target.length;
+    const denominator = target.reduce((sum, value) => sum + (value - targetMean) ** 2, 0);
+    const numerator = target.slice(lag).reduce((sum, value, index) => sum + (value - targetMean) * (target[index] - targetMean), 0);
+    return numerator / denominator;
+  };
+  const r1 = acfRaw(1);
+  const r2 = acfRaw(2);
+  assert.equal(eda.timeSeriesMining.pacf[2], Number(((r2 - r1 * r1) / (1 - r1 * r1)).toFixed(3)));
+
+  const serialized = JSON.parse(JSON.stringify(eda)) as {
+    kendallW?: unknown;
+    correlations: Record<string, unknown>[];
+    timeSeriesMining: Record<string, unknown>;
+    featureRelevance: Record<string, unknown>[];
+    methodAssumptions?: string[];
+  };
+  assert.equal('partialCorr' in (serialized.correlations[0] ?? {}), false);
+  assert.equal('spectralEntropy' in serialized.timeSeriesMining, false);
+  assert.equal('trendStrength' in serialized.timeSeriesMining, false);
+  assert.equal('seasonalStrength' in serialized.timeSeriesMining, false);
+  assert.equal('changePointCiLow' in serialized.timeSeriesMining, false);
+  assert.equal('changePointCiHigh' in serialized.timeSeriesMining, false);
+  assert.equal('kendallW' in serialized, false);
+  assert.ok(serialized.featureRelevance.every((feature) =>
+    !('anovaF' in feature) && !('permImportance' in feature) && !('stabilityFreq' in feature) && !('shapMeanAbs' in feature)
+  ));
+  assert.ok(serialized.methodAssumptions?.some((note) => /8-bin.*8 paired finite/i.test(note)));
+  assert.ok(serialized.methodAssumptions?.some((note) => /IID t approximation/i.test(note)));
+  assert.ok(serialized.methodAssumptions?.every((note) => note.length > 0));
+});
+
+test('Wave 2.1 / STAT-02: threshold gates reject unverified intervals and inapplicable domains', () => {
+  assert.throws(
+    () => resolveThresholdLimits('ashrae14', '15min'),
+    /15-minute.*not verified|custom/i
+  );
+  const dataset = generateSyntheticDataset('energy_mv', 42);
+  const vsg = buildDefaultVsgForTarget(dataset, 'kwh_total', '2026-01-01T00:00:00Z');
+  assert.equal(resolveThresholdProfileForDataset('energy', '15min'), 'custom');
+  assert.equal(resolveThresholdProfileForDataset('water', '15min'), 'awwa_water');
+  const subhourly = { ...dataset, temporal: { ...dataset.temporal, targetGranularity: '15min' as const } };
+  assert.throws(
+    () => runTargetModelingPipeline(subhourly, 'kwh_total', vsg.entries, createDefaultTcpConfig(subhourly), 42, 'ashrae14'),
+    /15-minute.*not verified/i
+  );
+  assert.throws(
+    () => getThresholdLimits('ashrae14', 'hourly', 'finance'),
+    /not applicable to domain 'finance'/i
+  );
+  assert.throws(
+    () => runTargetModelingPipeline(dataset, 'kwh_total', vsg.entries, createDefaultTcpConfig(dataset), 42, 'spc'),
+    /threshold profile.*not applicable/i
+  );
+  assert.throws(
+    () => resolveThresholdLimits('custom', 'daily'),
+    /Custom threshold values are required/i
+  );
+  const custom = resolveThresholdLimits('custom', 'daily', { maxCvRmse: 0.1, maxAbsNmbe: -3, minR2: 2, label: 'Fixture' });
+  assert.deepEqual([custom.maxCvRmse, custom.maxAbsNmbe, custom.minR2], [0.5, 0.1, 0.99]);
+  assert.match(custom.normativeNote, /CV\(RMSE\) ≤ 0\.5%.*\|NMBE\| ≤ 0\.1%.*R² ≥ 0\.99/);
+
+  const daily = resolveThresholdLimits('ashrae14', 'daily');
+  assert.match(daily.citation, /non-normative/i);
+  assert.match(daily.normativeNote, /non-normative/i);
+  assert.match(daily.normativeNote, /not a verified/i);
+  const hourly = getThresholdLimits('ashrae14', 'hourly', 'energy');
+  assert.match(hourly.normativeNote, /not been independently verified/i);
+  assert.match(hourly.citation, /2014/);
+  assert.equal(hourly.version, '2014-v1');
+  const ipmvp15min = resolveThresholdLimits('ipmvp', '15min');
+  const ipmvpMonthly = resolveThresholdLimits('ipmvp', 'monthly');
+  assert.deepEqual(
+    [ipmvp15min.maxCvRmse, ipmvp15min.maxAbsNmbe, ipmvp15min.minR2],
+    [ipmvpMonthly.maxCvRmse, ipmvpMonthly.maxAbsNmbe, ipmvpMonthly.minR2]
+  );
+  assert.match(ipmvp15min.normativeNote, /application-defined.*not verified.*interval-specific numeric criteria/i);
+  assert.equal(ipmvp15min.version, 'EVO-10000-1:2022');
 });
 
 test('Multi-domain presets & standards resolve cleanly across Water, Finance & Environment', () => {

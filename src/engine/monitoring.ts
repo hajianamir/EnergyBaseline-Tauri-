@@ -340,7 +340,7 @@ export function createMonitoringSnapshot(
     id: `snap-${baseline.target}-${Date.now()}`,
     target: baseline.target,
     baselineVersion: baseline.version,
-    inputHash: deterministicHash(JSON.stringify(rows.slice(0, 20)) + rows.length),
+    inputHash: deterministicHash(JSON.stringify(rows)),
     source,
     createdAt: new Date().toISOString(),
     points: result.points,

@@ -225,6 +225,8 @@ export interface TcpConfig {
 export interface StatisticalTestResult {
   id: string;
   target: string;
+  seed: number;
+  engine_version: string;
   variable: string;
   familyId: TestFamilyId;
   testName: string;
@@ -264,7 +266,6 @@ export interface CorrelationEntry {
   kendall: number;
   distCorr: number;
   mutualInfo: number;
-  partialCorr: number;
   ciLow: number;
   ciHigh: number;
   ciMethod: string;
@@ -275,23 +276,26 @@ export interface CorrelationEntry {
 }
 
 export interface DataQualityBreakdown {
-  overallScore: number;
-  completeness: { score: number; weight: number; detail: string };
-  validity: { score: number; weight: number; detail: string };
-  consistency: { score: number; weight: number; detail: string };
-  timeliness: { score: number; weight: number; detail: string };
-  uniqueness: { score: number; weight: number; detail: string };
+  overallScore: number | null;
+  completeness: { score: number | null; weight: number; detail: string };
+  validity: { score: number | null; weight: number; detail: string };
+  consistency: { score: number | null; weight: number; detail: string };
+  temporalOrder: { score: number | null; weight: number; detail: string };
+  uniqueness: { score: number | null; weight: number; detail: string };
   perVariable: {
     name: string;
-    completenessPct: number;
-    outlierPct: number;
-    zeroOrNegPct: number;
-    qualityScore: number;
+    completenessPct: number | null;
+    outlierPct: number | null;
+    zeroOrNegPct: number | null;
+    qualityScore: number | null;
   }[];
 }
 
 export interface EdaTargetSummary {
   target: string;
+  seed: number;
+  engine_version: string;
+  methodAssumptions: string[];
   dataQuality: DataQualityBreakdown;
   correlations: CorrelationEntry[];
   pca: {
@@ -300,15 +304,17 @@ export interface EdaTargetSummary {
     featureNames: string[];
     loadingsPC1: number[];
     loadingsPC2: number[];
-    kmo: number;
-    bartlettP: number;
+    kmo: number | null;
+    bartlettP: number | null;
+    adequacyMethod: string;
   };
   clustering: {
+    algorithm: 'target_terciles';
     k: number;
-    silhouette: number;
-    daviesBouldin: number;
-    calinskiHarabasz: number;
-    bootstrapAri: number;
+    silhouette: number | null;
+    daviesBouldin: number | null;
+    calinskiHarabasz: number | null;
+    bootstrapAri: number | null;
     regimeLabels: number[];
     regimeMeans: { regime: number; count: number; targetMean: number; label: string }[];
   };
@@ -328,28 +334,20 @@ export interface EdaTargetSummary {
     lift: number;
   }[];
   timeSeriesMining: {
-    spectralEntropy: number;
-    trendStrength: number;
-    seasonalStrength: number;
-    optimalBaseTempHeating: number;
-    optimalBaseTempCooling: number;
+    optimalBaseTempHeating: number | null;
+    optimalBaseTempCooling: number | null;
     changePointIndex: number | null;
     changePointTimestamp: string | null;
-    changePointCiLow: string | null;
-    changePointCiHigh: string | null;
+    acfAvailable: boolean;
     acf: number[];
     pacf: number[];
   };
   featureRelevance: {
     feature: string;
-    miScore: number;
-    anovaF: number;
-    permImportance: number;
-    stabilityFreq: number;
-    shapMeanAbs: number;
-    consensusRank: number;
+    miScore: number | null;
+    absolutePearson: number | null;
+    miRank: number | null;
   }[];
-  kendallW: number;
   causalMv: {
     available: boolean;
     groupColumn: string | null;
@@ -520,6 +518,7 @@ export interface LockedBaseline {
 export interface TargetModelingBundle {
   target: string;
   seed: number;
+  engine_version: string;
   candidatePool: string[];
   selectedFeatures: string[];
   prunedCollinear: { feature: string; reason: string }[];
@@ -530,7 +529,7 @@ export interface TargetModelingBundle {
   weightProfile: WeightProfile;
   weights: ScoringWeights;
   thresholdProfile: ThresholdProfileId;
-  limits: { maxCvRmse: number; maxAbsNmbe: number; minR2: number; citation: string; normativeNote: string };
+  limits: { maxCvRmse: number; maxAbsNmbe: number; minR2: number; citation: string; version: string; normativeNote: string };
   t11WinnerVsRunnerUp: {
     dmStat: number;
     dmPValue: number;

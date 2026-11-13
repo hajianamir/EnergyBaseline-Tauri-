@@ -1,4 +1,5 @@
 import { DOMAIN_PROFILES } from './domains';
+import { ENGINE_VERSION } from './version';
 import {
   AuditEvent,
   AutoDecisionEntry,
@@ -34,6 +35,7 @@ export interface ReportModel {
   datasetSha256: string;
   domain: string;
   seed: number;
+  engine_version: string;
   sections: ReportSection[];
   glossary: { term: string; definition: string }[];
   howToRead: string[];
@@ -65,7 +67,7 @@ export function renderHtmlReport(
     `<section><h2>${text(section.title)}</h2><p><strong>Purpose:</strong> ${text(section.purpose)}</p><p><strong>Method:</strong> ${text(section.method)}</p><p><strong>Settings:</strong> ${text(section.settingsUsed)}</p><p><strong>Results:</strong> ${text(section.resultsSummary)}</p><p><strong>Interpretation:</strong> ${text(section.interpretation)}</p><p><strong>Decision Impact:</strong> ${text(section.decisionImpact)}</p><p><strong>Caveats:</strong> ${text(section.caveats)}</p></section>`
   ).join('');
 
-  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>${text(companyName)} — EnergyBaseline Report</title><style>body{font-family:system-ui,sans-serif;max-width:960px;margin:2rem auto;padding:0 1rem;color:#0f172a}h1,h2{color:#0369a1}table{border-collapse:collapse;width:100%;margin:1rem 0;font-size:12px}th,td{border:1px solid #cbd5e1;padding:6px;text-align:left}</style></head><body><h1>${text(companyName)} — M&amp;V Baseline Report (${text(depth)})</h1><p>Dataset: ${text(report.datasetName)} (SHA-256: ${text(report.datasetSha256)}) · Seed: ${text(report.seed)}</p>${sections}</body></html>`;
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>${text(companyName)} — EnergyBaseline Report</title><style>body{font-family:system-ui,sans-serif;max-width:960px;margin:2rem auto;padding:0 1rem;color:#0f172a}h1,h2{color:#0369a1}table{border-collapse:collapse;width:100%;margin:1rem 0;font-size:12px}th,td{border:1px solid #cbd5e1;padding:6px;text-align:left}</style></head><body><h1>${text(companyName)} — M&amp;V Baseline Report (${text(depth)})</h1><p>Dataset: ${text(report.datasetName)} (SHA-256: ${text(report.datasetSha256)}) · Seed: ${text(report.seed)} · Engine version: ${text(report.engine_version)}</p>${sections}</body></html>`;
 }
 
 export function buildDeterministicReportModel(params: {
@@ -169,17 +171,21 @@ export function buildDeterministicReportModel(params: {
       id: 'temporal-data-dict',
       title: 'Temporal Configuration, Input Data & Data Quality',
       depthMin: 'Standard',
-      purpose: 'Document sampling resolution, UTC/DST policy, baseline/reporting windows, and Data Quality Score (F9).',
-      method: 'UTC timestamp normalization, DAT-2/DAT-3 granularity rules, and weighted 5-pillar quality scoring.',
+      purpose: 'Document sampling resolution, UTC/DST policy, baseline/reporting windows, and the in-app descriptive data-quality index (F9).',
+      method: 'UTC timestamp normalization plus a weighted completeness, robust-outlier-screen, type-consistency, timestamp-order, and uniqueness heuristic; this index is not a validated external quality standard.',
       settingsUsed: `Source=${dataset.temporal.sourceGranularity}, Target=${dataset.temporal.targetGranularity}, TZ=${dataset.temporal.timezone}, Completeness≥${(dataset.temporal.completenessThreshold * 100).toFixed(0)}%`,
       resultsSummary: firstEda
-        ? `Data Quality Score: ${firstEda.dataQuality.overallScore}/100 (Completeness ${firstEda.dataQuality.completeness.score}%, Validity ${firstEda.dataQuality.validity.score}%).`
-        : 'Quality score pending.',
+        ? firstEda.dataQuality.overallScore === null
+          ? 'In-app data-quality index not computed because no weighted components were available.'
+          : `In-app Data Quality Index: ${firstEda.dataQuality.overallScore}/100 (Completeness ${firstEda.dataQuality.completeness.score === null ? 'not computed' : `${firstEda.dataQuality.completeness.score}%`}, robust outlier-screen validity ${firstEda.dataQuality.validity.score === null ? 'not computed' : `${firstEda.dataQuality.validity.score}%`}, type consistency ${firstEda.dataQuality.consistency.score === null ? 'not computed' : `${firstEda.dataQuality.consistency.score}%`}, timestamp order ${firstEda.dataQuality.temporalOrder.score === null ? 'not computed' : `${firstEda.dataQuality.temporalOrder.score}%`}, timestamp-string uniqueness ${firstEda.dataQuality.uniqueness.score === null ? 'not computed' : `${firstEda.dataQuality.uniqueness.score}%`}).`
+        : 'In-app quality index pending.',
       interpretation: firstEda
         ? `Evaluated ${dataset.rows.length} rows (${dataset.sha256.slice(0, 12)}). No target imputation was performed in validation/evaluation sets (DAT-5).`
         : 'Pending.',
       decisionImpact: 'Coarser aggregation requests are refused with DATA_REFUSED (DAT-3).',
-      caveats: 'Non-Routine Events are flagged transparently without silent row removal.',
+      caveats: firstEda
+        ? `Non-Routine Events are flagged transparently without silent row removal. ${firstEda.methodAssumptions[0]}`
+        : 'Non-Routine Events are flagged transparently without silent row removal.',
       citedArtifacts: [],
       tableRows: dataset.columns.map((c) => ({
         Column: c.name,
@@ -211,17 +217,19 @@ export function buildDeterministicReportModel(params: {
       id: 'eda-correlation-mining',
       title: 'EDA Atlas, Correlation & Dependence Atlas & Data Mining',
       depthMin: 'Standard',
-      purpose: 'Present univariate profiling, Pearson/Spearman/Kendall/Distance-Corr/MI with CIs, PCA, regimes, anomalies (autoencoder), and association rules (F1–F9).',
-      method: 'Circular block-bootstrap CIs (CI-2), PCA eigen-decomposition, K=3 regime clustering, ensemble + bottleneck autoencoder anomaly voting, regime association rules.',
-      settingsUsed: `Confidence=${(tcp.confidenceLevel * 100).toFixed(0)}%, Domain=${domainProf.label}`,
+      purpose: 'Present univariate correlations, block-bootstrap Pearson intervals, PCA, target-value terciles, anomaly votes, and association rules (F1–F9).',
+      method: 'Pearson/Spearman/Kendall/Distance-Corr and 8-bin MI; Jacobi eigendecomposition; listwise-complete KMO/Bartlett; target-tercile validation and seeded cutpoint bootstrap; ensemble + bottleneck autoencoder anomaly voting.',
+      settingsUsed: `Confidence=${(tcp.confidenceLevel * 100).toFixed(0)}%, Domain=${domainProf.label}, TargetSeed=${firstEda?.seed ?? 'N/A'}, Engine=${firstEda?.engine_version ?? 'N/A'}`,
       resultsSummary: firstEda
-        ? `Optimal change bases: Low=${firstEda.timeSeriesMining.optimalBaseTempHeating}°C, High=${firstEda.timeSeriesMining.optimalBaseTempCooling}°C · Clustering Silhouette=${firstEda.clustering.silhouette}, Bootstrap ARI=${firstEda.clustering.bootstrapAri} · Anomalies=${firstEda.anomalies.flaggedIndices.length} (autoencoder votes=${firstEda.anomalies.autoencoderFlagCount}) · Regime Rules=${firstEda.regimeRules.length} · Feature Consensus Kendall W=${firstEda.kendallW}.`
+        ? `Degree-day grid search: Heating=${firstEda.timeSeriesMining.optimalBaseTempHeating ?? 'N/A'}°C, Cooling=${firstEda.timeSeriesMining.optimalBaseTempCooling ?? 'N/A'}°C · PCA KMO=${firstEda.pca.kmo ?? 'N/A'}, Bartlett p=${firstEda.pca.bartlettP ?? 'N/A'} · Target-tercile silhouette=${firstEda.clustering.silhouette ?? 'N/A'}, bootstrap cutpoint ARI=${firstEda.clustering.bootstrapAri ?? 'N/A'} · Anomalies=${firstEda.anomalies.flaggedIndices.length} (autoencoder votes=${firstEda.anomalies.autoencoderFlagCount}) · Target-tercile rules=${firstEda.regimeRules.length} · Univariate MI-ranked features=${firstEda.featureRelevance.filter((feature) => feature.miRank !== null).length}.`
         : 'Pending.',
       interpretation: firstEda?.causalMv.available
         ? `Causal Attribution (${firstEda.causalMv.groupColumn}): ${firstEda.causalMv.interpretation}`
-        : 'Regime clustering, association rules, and feature relevance consensus guide engineering intuition without target leakage.',
-      decisionImpact: 'Informs change-point initialization, regime rules, and regime-conditional UQ calibration.',
-      caveats: 'Granger/Transfer-Entropy/correlation findings are screening signals only and do not establish causation (TC-3).',
+        : 'Target terciles and univariate MI/absolute-Pearson ranks are descriptive EDA, not K-means, model feature importance, or causal estimates.',
+      decisionImpact: 'Descriptive EDA informs inspection; change-point intervals and unsupported importance/strength metrics are not reported.',
+      caveats: firstEda
+        ? firstEda.methodAssumptions.join(' ')
+        : 'Correlation findings are screening signals only and do not establish causation (TC-3).',
       citedArtifacts: [],
       tableRows: firstEda?.correlations.map((c) => ({
         Pair: `${c.varA} ↔ ${c.varB}`,
@@ -266,14 +274,14 @@ export function buildDeterministicReportModel(params: {
       purpose: 'Detail validation design, Top-5 leaderboard, why Top-1 won, why alternatives were rejected, and locked Model Card.',
       method: 'Expanding forward-chaining with a lag/window-derived purge gap, 13-criteria min-max scoring, HAC-HLN T11 DM test, NN Gate, and nested OOF ensemble selection across Classical, Boosted Trees (XGBoost/LightGBM/CatBoost/GBM), and Neural Networks.',
       settingsUsed: firstBundle
-        ? `CV=${firstBundle.top5[0]?.cvScheme}, PurgeGap=${firstBundle.top5[0]?.purgeGapSteps} steps, Profile=${firstBundle.weightProfile}, Standard=${firstBundle.limits.citation} (CV≤${firstBundle.limits.maxCvRmse}%, |NMBE|≤${firstBundle.limits.maxAbsNmbe}%, R²≥${firstBundle.limits.minR2})`
+        ? `CV=${firstBundle.top5[0]?.cvScheme}, PurgeGap=${firstBundle.top5[0]?.purgeGapSteps} steps, Profile=${firstBundle.weightProfile}, Threshold reference=${firstBundle.limits.citation} v${firstBundle.limits.version} (CV≤${firstBundle.limits.maxCvRmse}%, |NMBE|≤${firstBundle.limits.maxAbsNmbe}%, R²≥${firstBundle.limits.minR2})`
         : 'Pending',
       resultsSummary: firstBundle
         ? `Qualified=${firstBundle.top5.length + firstBundle.qualifiedNotShortlisted.length}, Rejected=${firstBundle.rejected.length}. Top-1 Rank Stability (±20% weights)=${firstBundle.top5[0]?.rankStabilityPct ?? 0}%.`
         : 'Pending.',
       interpretation: firstBundle?.t11WinnerVsRunnerUp?.interpretation ?? 'Top-5 shortlist ranked by composite score.',
       decisionImpact: 'Selected baseline is locked immutably with SHA-256 artifact hash and Model Card.',
-      caveats: 'Non-parametric models display architecture + global linear surrogate (never presented as exact formula).',
+      caveats: `${firstBundle ? `${firstBundle.limits.normativeNote} ` : ''}Non-parametric models display architecture + global linear surrogate (never presented as exact formula).`,
       citedArtifacts: [],
       tableRows: firstBundle?.allModels.map((m) => ({
         Rank: m.rank ?? '-',
@@ -349,13 +357,14 @@ export function buildDeterministicReportModel(params: {
     datasetSha256: dataset.sha256,
     domain: dataset.domain,
     seed,
+    engine_version: ENGINE_VERSION,
     sections,
     howToRead: [
       'Sections follow a uniform 8-part template: Purpose → Method → Settings → Results → Interpretation → Decision Impact → Caveats.',
       `Domain & Deviation Context (${domainProf.label}): ${domainProf.deviationHintNegative}`,
       'Primary modeling metrics (CV(RMSE), NMBE, R²) are out-of-fold (OOF) without DoF adjustment; DoF-adjusted in-sample values are reported separately.',
       'Deviation in Monitoring is strictly defined as Actual − Baseline.',
-      `Criteria are stated as "aligned with ${firstBundle?.limits.citation ?? 'selected tolerance standard'}", never claiming formal certification.`,
+      `Threshold references are contextual only; the active gate caveat states whether criteria are source-verified or application-defined. No gate claims standards certification.`,
     ],
     glossary: [
       { term: 'CV(RMSE)', definition: 'Coefficient of Variation of Root Mean Squared Error: RMSE / mean(y) × 100 (%).' },

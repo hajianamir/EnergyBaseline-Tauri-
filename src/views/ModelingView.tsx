@@ -48,7 +48,7 @@ const WEIGHT_LABELS: { key: keyof ScoringWeights; label: string }[] = [
   { key: 'residualDiagnostics', label: 'T10 Diagnostics' },
   { key: 'physicalPlausibility', label: 'Sign Plausibility' },
   { key: 'interpretability', label: 'Interpretability' },
-  { key: 'standardsAlignment', label: 'Standard Fit' },
+  { key: 'standardsAlignment', label: 'Profile Gate Fit' },
   { key: 'uncertaintyWidth', label: 'Conformal Width' },
   { key: 'dataSufficiency', label: 'Data Sufficiency' },
 ];
@@ -194,7 +194,7 @@ export const ModelingView: React.FC<ModelingViewProps> = ({
 
           <div className="flex flex-wrap items-center gap-3 text-xs">
             <label className="inline-flex items-center gap-1.5">
-              <span className="text-slate-500">Standard / Thresholds:</span>
+              <span className="text-slate-500">Threshold Profile (not certification):</span>
               <select
                 aria-label="Threshold Profile"
                 value={thresholdProfile}
@@ -210,11 +210,17 @@ export const ModelingView: React.FC<ModelingViewProps> = ({
                 }}
                 className="px-2 py-1 rounded border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-950"
               >
-                {Object.values(STANDARD_PROFILES).map((std) => (
-                  <option key={std.id} value={std.id}>
-                    {std.name}
-                  </option>
-                ))}
+                {Object.values(STANDARD_PROFILES).map((std) => {
+                  const domainApplicable = std.applicableDomains.includes(dataset.domain);
+                  const intervalQualified = !(std.id === 'ashrae14' && dataset.temporal.targetGranularity === '15min');
+                  return (
+                    <option key={std.id} value={std.id} disabled={!domainApplicable || !intervalQualified}>
+                      {std.name} — {std.version} · {std.applicableDomains.join(', ')}
+                      {!domainApplicable ? ` · not applicable to ${dataset.domain}` : ''}
+                      {!intervalQualified ? ' · no verified 15-minute gate' : ''}
+                    </option>
+                  );
+                })}
               </select>
             </label>
             <label className="inline-flex items-center gap-1.5">
@@ -245,7 +251,7 @@ export const ModelingView: React.FC<ModelingViewProps> = ({
 
         <div className="text-[11px] font-mono text-slate-600 dark:text-slate-400 border-t border-slate-100 dark:border-slate-800 pt-2 flex flex-wrap items-center justify-between gap-2 tabular-nums">
           <span>
-            Active Gate ({dataset.domain}): {bundle.limits.citation} · Max CV(RMSE) ≤ {bundle.limits.maxCvRmse}% · Max |NMBE| ≤ {bundle.limits.maxAbsNmbe}% · Min R² ≥ {bundle.limits.minR2}
+            In-app Gate ({dataset.domain}): {bundle.limits.citation} · Profile version {bundle.limits.version} · Max CV(RMSE) ≤ {bundle.limits.maxCvRmse}% · Max |NMBE| ≤ {bundle.limits.maxAbsNmbe}% · Min R² ≥ {bundle.limits.minR2}
           </span>
           <span className="text-slate-500 font-sans">{bundle.limits.normativeNote}</span>
         </div>
@@ -389,7 +395,7 @@ export const ModelingView: React.FC<ModelingViewProps> = ({
         <div>
           <div className="text-slate-500">Target Seed (MT-4)</div>
           <div className="font-mono font-bold text-base mt-0.5">{bundle.seed}</div>
-          <div className="text-[11px] text-slate-500">Purge gap: {bundle.top5[0]?.purgeGapSteps ?? 2} steps</div>
+          <div className="text-[11px] text-slate-500">Engine v{bundle.engine_version} · Purge gap: {bundle.top5[0]?.purgeGapSteps ?? 2} steps</div>
         </div>
         <div>
           <div className="text-slate-500">Selected Features (VAL-6)</div>
@@ -424,7 +430,7 @@ export const ModelingView: React.FC<ModelingViewProps> = ({
         <div role="alert" className="border border-amber-300 dark:border-amber-800 bg-amber-50 dark:bg-amber-950/40 rounded-lg p-3 text-xs text-amber-900 dark:text-amber-200 space-y-2">
           <div className="font-semibold flex items-center gap-1.5">
             <AlertTriangle className="w-4 h-4 shrink-0" aria-hidden="true" />
-            SC-9 Notice: No model met all acceptance thresholds; showing best available fallback.
+            SC-9 Notice: No model met all selected in-app gate criteria; showing best available fallback.
           </div>
           <label className="inline-flex items-center gap-2">
             <input
@@ -591,7 +597,7 @@ export const ModelingView: React.FC<ModelingViewProps> = ({
                     type="text"
                     value={lockNote}
                     onChange={(e) => setLockNote(e.target.value)}
-                    placeholder="e.g., Selected 5P Change-Point aligned with ASHRAE 14 criteria"
+                    placeholder="e.g., Reviewed change-point under the selected application gate"
                     className="w-full px-2.5 py-1.5 rounded border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-950"
                   />
                 </label>

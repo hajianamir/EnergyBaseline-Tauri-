@@ -106,7 +106,7 @@ export const STANDARD_PROFILES: Record<ThresholdProfileId, StandardProfile> = {
     defaultMaxCvRmse: 20,
     defaultMaxAbsNmbe: 5,
     defaultMinR2: 0.70,
-    normativeNote: 'Criteria aligned with ASHRAE 14 (monthly ≤15%/±5%, hourly ≤30%/±10%; daily labeled non-normative). Never claims formal certification.',
+    normativeNote: 'ASHRAE 14-2014 is the profile reference. Monthly/hourly thresholds below are encoded as app gates but have not been independently source-verified in this build; daily is non-normative. No gate claims certification.',
   },
   ipmvp: {
     id: 'ipmvp',
@@ -117,7 +117,7 @@ export const STANDARD_PROFILES: Record<ThresholdProfileId, StandardProfile> = {
     defaultMaxCvRmse: 20,
     defaultMaxAbsNmbe: 5,
     defaultMinR2: 0.75,
-    normativeNote: 'Criteria aligned with IPMVP counterfactual baseline + Non-Routine Event (NRE) adjustment documentation.',
+    normativeNote: 'Application-defined default gates; the cited IPMVP reference is contextual only. This build has not verified a source-to-threshold mapping or interval-specific numeric criteria. Not an IPMVP compliance claim.',
   },
   iso50015: {
     id: 'iso50015',
@@ -128,7 +128,7 @@ export const STANDARD_PROFILES: Record<ThresholdProfileId, StandardProfile> = {
     defaultMaxCvRmse: 20,
     defaultMaxAbsNmbe: 5,
     defaultMinR2: 0.70,
-    normativeNote: 'Criteria aligned with ISO 50015 M&V baseline tolerance and ISO 50006 Energy Performance Indicator (EnPI) framing.',
+    normativeNote: 'Application-defined default gates; the cited ISO references are contextual only. This build has not verified a source-to-threshold mapping or interval-specific numeric criteria. Not an ISO compliance claim.',
   },
   spc: {
     id: 'spc',
@@ -139,7 +139,7 @@ export const STANDARD_PROFILES: Record<ThresholdProfileId, StandardProfile> = {
     defaultMaxCvRmse: 12,
     defaultMaxAbsNmbe: 3,
     defaultMinR2: 0.80,
-    normativeNote: 'Tight process stability tolerance aligned with SPC control charts, CUSUM/EWMA shift detection, and Six Sigma capability checks.',
+    normativeNote: 'Application-defined default gates; the cited ISO/ASTM references are contextual only. This build has not verified a source-to-threshold mapping or interval-specific numeric criteria. Not an SPC compliance claim.',
   },
   awwa_water: {
     id: 'awwa_water',
@@ -150,7 +150,7 @@ export const STANDARD_PROFILES: Record<ThresholdProfileId, StandardProfile> = {
     defaultMaxCvRmse: 18,
     defaultMaxAbsNmbe: 5,
     defaultMinR2: 0.70,
-    normativeNote: 'Criteria aligned with AWWA M36 hydraulic demand & non-revenue water baseline monitoring.',
+    normativeNote: 'Application-defined default gates; the cited AWWA reference is contextual only. This build has not verified a source-to-threshold mapping or interval-specific numeric criteria. Not an AWWA compliance claim.',
   },
   healthcare_kpi: {
     id: 'healthcare_kpi',
@@ -161,7 +161,7 @@ export const STANDARD_PROFILES: Record<ThresholdProfileId, StandardProfile> = {
     defaultMaxCvRmse: 22,
     defaultMaxAbsNmbe: 6,
     defaultMinR2: 0.65,
-    normativeNote: 'Criteria aligned with healthcare census/throughput baseline forecasting under local-only privacy controls.',
+    normativeNote: 'Application-defined default gates; the cited AHRQ/IHI reference is contextual only. This build has not verified a source-to-threshold mapping or interval-specific numeric criteria. Not a clinical-standard compliance claim.',
   },
   iso14064: {
     id: 'iso14064',
@@ -172,7 +172,7 @@ export const STANDARD_PROFILES: Record<ThresholdProfileId, StandardProfile> = {
     defaultMaxCvRmse: 20,
     defaultMaxAbsNmbe: 5,
     defaultMinR2: 0.70,
-    normativeNote: 'Criteria aligned with ISO 14064-2 baseline emissions counterfactuals and uncertainty reporting.',
+    normativeNote: 'Application-defined default gates; the cited ISO reference is contextual only. This build has not verified a source-to-threshold mapping or interval-specific numeric criteria. Not an ISO compliance claim.',
   },
   basel_sr11_7: {
     id: 'basel_sr11_7',
@@ -183,7 +183,7 @@ export const STANDARD_PROFILES: Record<ThresholdProfileId, StandardProfile> = {
     defaultMaxCvRmse: 15,
     defaultMaxAbsNmbe: 4,
     defaultMinR2: 0.75,
-    normativeNote: 'Criteria aligned with SR 11-7 independent OOF validation, holdout backtesting, conceptual soundness, and drift PSI bounds.',
+    normativeNote: 'Application-defined default gates; the cited SR 11-7/OCC references are contextual only. This build has not verified a source-to-threshold mapping or interval-specific numeric criteria. Not a regulatory compliance claim.',
   },
   custom: {
     id: 'custom',
@@ -202,45 +202,67 @@ export function resolveStandardForDomain(domain: DomainType): ThresholdProfileId
   return DOMAIN_PROFILES[domain]?.defaultStandard ?? 'custom';
 }
 
+/** Use Custom rather than applying the hourly ASHRAE gate to unverified 15-minute data. */
+export function resolveThresholdProfileForDataset(
+  domain: DomainType,
+  granularity: SamplingGranularity
+): ThresholdProfileId {
+  const profile = resolveStandardForDomain(domain);
+  return profile === 'ashrae14' && granularity === '15min' ? 'custom' : profile;
+}
+
 export function resolveThresholdLimits(
   profile: ThresholdProfileId,
   granularity: SamplingGranularity,
   custom?: CustomThresholds
-): { maxCvRmse: number; maxAbsNmbe: number; minR2: number; citation: string; normativeNote: string } {
+): { maxCvRmse: number; maxAbsNmbe: number; minR2: number; citation: string; version: string; normativeNote: string } {
   if (profile === 'custom' && custom) {
+    const maxCvRmse = Math.max(0.5, custom.maxCvRmse);
+    const maxAbsNmbe = Math.max(0.1, custom.maxAbsNmbe);
+    const minR2 = Math.min(0.99, Math.max(-1, custom.minR2));
     return {
-      maxCvRmse: Math.max(0.5, custom.maxCvRmse),
-      maxAbsNmbe: Math.max(0.1, custom.maxAbsNmbe),
-      minR2: Math.min(0.99, Math.max(-1, custom.minR2)),
+      maxCvRmse,
+      maxAbsNmbe,
+      minR2,
       citation: custom.label.trim() ? `${custom.label.trim()} (Custom User Bounds)` : 'Custom User-Defined Baseline Criteria',
-      normativeNote: `User-defined tolerance: CV(RMSE) ≤ ${custom.maxCvRmse}%, |NMBE| ≤ ${custom.maxAbsNmbe}%, R² ≥ ${custom.minR2}.`,
+      version: STANDARD_PROFILES.custom.version,
+      normativeNote: `User-defined ${granularity} tolerance: CV(RMSE) ≤ ${maxCvRmse}%, |NMBE| ≤ ${maxAbsNmbe}%, R² ≥ ${minR2}.`,
     };
   }
+  if (profile === 'custom') {
+    throw new Error('Custom threshold values are required when the Custom profile is selected.');
+  }
   if (profile === 'ashrae14') {
+    if (granularity === '15min') {
+      throw new Error('ASHRAE Guideline 14-2014 interval-specific thresholds for 15-minute data are not verified in this build; select a Custom threshold profile.');
+    }
     if (granularity === 'monthly') {
       return {
         maxCvRmse: 15,
         maxAbsNmbe: 5,
         minR2: 0.70,
         citation: 'ASHRAE Guideline 14-2014 (Monthly criteria)',
-        normativeNote: 'Criteria aligned with ASHRAE 14 monthly thresholds (CV(RMSE) ≤ 15%, |NMBE| ≤ 5%).',
+        version: STANDARD_PROFILES.ashrae14.version,
+        normativeNote: 'ASHRAE 14-2014 monthly values are encoded as an app gate (CV(RMSE) ≤ 15%, |NMBE| ≤ 5%); source text has not been independently verified in this build. Not a certification claim.',
       };
     }
-    if (granularity === 'hourly' || granularity === '15min') {
+    if (granularity === 'hourly') {
       return {
         maxCvRmse: 30,
         maxAbsNmbe: 10,
         minR2: 0.65,
         citation: 'ASHRAE Guideline 14-2014 (Hourly criteria)',
-        normativeNote: 'Criteria aligned with ASHRAE 14 hourly thresholds (CV(RMSE) ≤ 30%, |NMBE| ≤ 10%).',
+        version: STANDARD_PROFILES.ashrae14.version,
+        normativeNote: 'ASHRAE 14-2014 hourly values are encoded as an app gate (CV(RMSE) ≤ 30%, |NMBE| ≤ 10%); source text has not been independently verified in this build. Not a certification claim.',
       };
     }
     return {
       maxCvRmse: 20,
       maxAbsNmbe: 5,
       minR2: 0.70,
-      citation: 'ASHRAE Guideline 14 (Daily interpolated — non-normative)',
-      normativeNote: 'Daily granularity is user/AUTO-defined and labeled non-normative per DOM-2.',
+      citation: 'ASHRAE Guideline 14-2014 (daily app default — non-normative)',
+      version: STANDARD_PROFILES.ashrae14.version,
+      normativeNote: 'The daily CV(RMSE), |NMBE|, and R² gate is an application-defined fallback, not a verified ASHRAE daily threshold. It is non-normative and does not imply certification.'
     };
   }
   const std = STANDARD_PROFILES[profile] ?? STANDARD_PROFILES.custom;
@@ -249,6 +271,7 @@ export function resolveThresholdLimits(
     maxAbsNmbe: std.defaultMaxAbsNmbe,
     minR2: std.defaultMinR2,
     citation: std.citation,
+    version: std.version,
     normativeNote: std.normativeNote,
   };
 }
