@@ -23,7 +23,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          encoded="$(gzip -c src-tauri/Cargo.lock | base64 -w0)"
+          encoded="$(xz -9e -c src-tauri/Cargo.lock | base64 -w0)"
           part=1
           while IFS= read -r chunk; do
             printf '::notice title=CARGOLOCK_PART_%03d::%s\n' "$part" "$chunk"
