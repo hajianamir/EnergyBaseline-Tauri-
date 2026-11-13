@@ -9,6 +9,7 @@ import { createMonitoringSnapshot, predictFromLockedBaseline } from '../engine/m
 import { executeGuardedLocalSql } from '../engine/sqlGuard';
 import { getReportingRows, mean } from '../engine/stats';
 import { parseCsvToDataset } from '../engine/synthetic';
+import { DOMAIN_PROFILES } from '../engine/domains';
 import { EChartBox } from '../components/EChartBox';
 import { DataTable, SimpleColumnDef } from '../components/DataTable';
 import { AlertTriangle, Database, FileUp, Lock, Play, ShieldAlert } from 'lucide-react';
@@ -436,8 +437,8 @@ export const MonitoringView: React.FC<MonitoringViewProps> = ({
               darkMode={darkMode}
             />
             <EChartBox
-              title="Period Deviation (Actual − Baseline)"
-              subtitle="Negative bars indicate lower usage than counterfactual baseline"
+              title={`Period ${DOMAIN_PROFILES[dataset.domain]?.deviationNoun ?? 'Deviation'} (Actual − Baseline)`}
+              subtitle={DOMAIN_PROFILES[dataset.domain]?.deviationHintNegative ?? 'Negative values indicate observations below counterfactual baseline.'}
               option={devChartOption}
               height={300}
               darkMode={darkMode}

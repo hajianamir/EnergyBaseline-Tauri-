@@ -13,8 +13,10 @@ import {
   aggregateRowsToTargetGranularity,
   defaultAggregationForQuantity,
   parseCsvToDataset,
+  SyntheticPresetId,
   validateGranularityTransition,
 } from '../engine/synthetic';
+import { DOMAIN_PROFILES } from '../engine/domains';
 import { DataTable, SimpleColumnDef } from '../components/DataTable';
 import { EChartBox } from '../components/EChartBox';
 import { AlertTriangle, ArrowRight, FileUp, Plus, Sparkles, Trash2 } from 'lucide-react';
@@ -22,7 +24,7 @@ import { AlertTriangle, ArrowRight, FileUp, Plus, Sparkles, Trash2 } from 'lucid
 interface DataSetupViewProps {
   dataset: DatasetState;
   darkMode: boolean;
-  onLoadPreset: (preset: 'energy_mv' | 'manufacturing_spc' | 'healthcare_kpi') => void;
+  onLoadPreset: (preset: SyntheticPresetId) => void;
   onReplaceDataset: (next: DatasetState, reason: string) => void;
   onProceedToVsg: () => void;
 }
@@ -227,45 +229,35 @@ export const DataSetupView: React.FC<DataSetupViewProps> = ({
             </p>
           </div>
           <div className="flex flex-wrap items-center gap-2">
-            <button
-              type="button"
-              onClick={() => onLoadPreset('energy_mv')}
-              className={`px-3 py-1.5 text-xs font-medium rounded border transition-colors whitespace-nowrap ${
-                dataset.id === 'synth-energy-mv'
-                  ? 'bg-sky-700 text-white border-sky-700'
-                  : 'border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800'
-              }`}
-            >
-              Commercial Campus M&V
-            </button>
-            <button
-              type="button"
-              onClick={() => onLoadPreset('manufacturing_spc')}
-              className={`px-3 py-1.5 text-xs font-medium rounded border transition-colors whitespace-nowrap ${
-                dataset.id === 'synth-mfg-spc'
-                  ? 'bg-sky-700 text-white border-sky-700'
-                  : 'border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800'
-              }`}
-            >
-              Manufacturing Energy & Scrap
-            </button>
-            <button
-              type="button"
-              onClick={() => onLoadPreset('healthcare_kpi')}
-              className={`px-3 py-1.5 text-xs font-medium rounded border transition-colors whitespace-nowrap ${
-                dataset.id === 'synth-health-kpi'
-                  ? 'bg-sky-700 text-white border-sky-700'
-                  : 'border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800'
-              }`}
-            >
-              Hospital KPI
-            </button>
+            {(
+              [
+                ['energy_mv', 'synth-energy-mv', 'Commercial Campus M&V'],
+                ['manufacturing_spc', 'synth-mfg-spc', 'Manufacturing Energy & Scrap'],
+                ['water_utility', 'synth-water-utility', 'Water DMA & Leak (AWWA)'],
+                ['healthcare_kpi', 'synth-health-kpi', 'Hospital KPI (AHRQ)'],
+                ['finance_demand', 'synth-finance-demand', 'Tx & Demand Risk (SR 11-7)'],
+                ['environmental_aqi', 'synth-env-iso14064', 'Emissions / GHG (ISO 14064)'],
+              ] as const
+            ).map(([presetId, dsId, label]) => (
+              <button
+                key={presetId}
+                type="button"
+                onClick={() => onLoadPreset(presetId)}
+                className={`px-3 py-1.5 text-xs font-medium rounded border transition-colors whitespace-nowrap ${
+                  dataset.id === dsId
+                    ? 'bg-sky-700 text-white border-sky-700'
+                    : 'border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800'
+                }`}
+              >
+                {label}
+              </button>
+            ))}
           </div>
         </div>
 
-        {dataset.domain === 'healthcare' && (
+        {DOMAIN_PROFILES[dataset.domain]?.privacyNotice && (
           <div className="p-3 rounded border border-amber-300 dark:border-amber-800 bg-amber-50 dark:bg-amber-950/40 text-xs text-amber-900 dark:text-amber-200">
-            Healthcare Local-Only Data Notice (DOM-3): All patient/occupancy KPI data stays strictly on local SQLite storage with zero external transmission.
+            {DOMAIN_PROFILES[dataset.domain].privacyNotice}
           </div>
         )}
         {uploadError && (
@@ -296,11 +288,11 @@ export const DataSetupView: React.FC<DataSetupViewProps> = ({
               }
               className="w-full px-2.5 py-1.5 rounded border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-950 text-slate-900 dark:text-slate-100"
             >
-              <option value="energy">Energy (M&V EnB / EnPI)</option>
-              <option value="manufacturing">Manufacturing (Process Deviation)</option>
-              <option value="water">Water & Utilities</option>
-              <option value="healthcare">Healthcare (Performance KPI)</option>
-              <option value="custom">Custom</option>
+              {Object.values(DOMAIN_PROFILES).map((dp) => (
+                <option key={dp.id} value={dp.id}>
+                  {dp.label}
+                </option>
+              ))}
             </select>
           </label>
 

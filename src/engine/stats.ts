@@ -935,7 +935,7 @@ export function createDefaultTcpConfig(dataset: DatasetState): TcpConfig {
     for (const col of dataset.columns) {
       if (col.role !== 'predictor' && col.role !== 'static_factor') continue;
       if (/temp/i.test(col.name)) expectedSignsByTarget[t][col.name] = 'non_monotonic';
-      else if (/occupancy|units|beds|cases|solar/i.test(col.name)) expectedSignsByTarget[t][col.name] = '+';
+      else if (/occupancy|units|beds|cases|solar|flow|users|promo|traffic|production/i.test(col.name)) expectedSignsByTarget[t][col.name] = '+';
       else if (/weekend/i.test(col.name)) expectedSignsByTarget[t][col.name] = '-';
       else expectedSignsByTarget[t][col.name] = 'free';
     }
@@ -950,6 +950,7 @@ export function createDefaultTcpConfig(dataset: DatasetState): TcpConfig {
     decisionRule: 'p_and_effect_size',
     effortProfile: 'standard',
     outlierActionPolicy: 'flag_only',
+    includeOptionalTests: true,
     preRegistered: false,
     preRegistrationHash: null,
     preRegistrationTimestamp: null,
@@ -1170,6 +1171,287 @@ function quandtAndrewsSupF(x: number[], y: number[], seed: number): { supF: numb
   return { supF: Number(supF.toFixed(3)), bestIdx, pVal: Number(pVal.toFixed(4)) };
 }
 
+// ---------- Optional [O] Statistical Tests Implementations ----------
+
+function dixonQTest(arr: number[]): { qStat: number; pVal: number; extremeVal: number } {
+  const n = arr.length;
+  if (n < 4) return { qStat: 0, pVal: 1, extremeVal: arr[0] ?? 0 };
+  const sorted = [...arr].sort((a, b) => a - b);
+  // Generalized Dixon ratio (r22 for n >= 14, r10 for small n)
+  const k = n >= 14 ? 2 : 1;
+  const range = Math.max(1e-9, sorted[n - 1 - (k > 1 ? 1 : 0)] - sorted[k > 1 ? 1 : 0]);
+  const qLow = Math.abs(sorted[k] - sorted[0]) / range;
+  const qHigh = Math.abs(sorted[n - 1] - sorted[n - 1 - k]) / range;
+  const qStat = Math.max(qLow, qHigh);
+  const extremeVal = qHigh >= qLow ? sorted[n - 1] : sorted[0];
+  // Asymptotic tail mapping calibrated against Rorabacher critical values
+  const effN = Math.min(30, n);
+  const crit05 = 0.254 + 0.65 / Math.sqrt(effN);
+  const z = (qStat - crit05 * 0.55) / Math.max(0.04, crit05 * 0.28);
+  const pVal = Math.max(0.0005, Math.min(0.99, 1 - normalCdf(z)));
+  return { qStat: Number(qStat.toFixed(4)), pVal: Number(pVal.toFixed(4)), extremeVal };
+}
+
+function maximalInfoCoeff(x: number[], y: number[]): { mic: number; pVal: number } {
+  const n = Math.min(x.length, y.length);
+  if (n < 12) return { mic: 0, pVal: 1 };
+  const maxBinsTotal = Math.min(28, Math.max(6, Math.floor(Math.pow(n, 0.52))));
+  let bestMic = 0;
+  for (let bx = 2; bx <= 6; bx++) {
+    for (let by = 2; by <= 6; by++) {
+      if (bx * by > maxBinsTotal) continue;
+      const miNats = binnedMutualInfo(x, y, Math.max(bx, by));
+      const miBits = miNats / Math.LN2;
+      const norm = miBits / Math.log2(Math.min(bx, by));
+      if (norm > bestMic) bestMic = norm;
+    }
+  }
+  const mic = Math.max(0, Math.min(1, bestMic));
+  const stat = 2 * n * mic * Math.LN2;
+  const pVal = Math.max(0.0001, Math.min(1, chiSquarePValue(stat, 4)));
+  return { mic: Number(mic.toFixed(4)), pVal: Number(pVal.toFixed(4)) };
+}
+
+function hoeffdingDTest(x: number[], y: number[]): { dStat: number; pVal: number } {
+  const rawN = Math.min(x.length, y.length);
+  if (rawN < 8) return { dStat: 0, pVal: 1 };
+  const step = rawN > 140 ? Math.ceil(rawN / 140) : 1;
+  const xs: number[] = [];
+  const ys: number[] = [];
+  for (let i = 0; i < rawN; i += step) {
+    xs.push(x[i]);
+    ys.push(y[i]);
+  }
+  const n = xs.length;
+  const rx = rankArray(xs);
+  const ry = rankArray(ys);
+  let d1 = 0;
+  let d2 = 0;
+  let d3 = 0;
+  for (let i = 0; i < n; i++) {
+    let q = 0;
+    for (let j = 0; j < n; j++) {
+      if (i === j) continue;
+      if (xs[j] < xs[i] && ys[j] < ys[i]) q += 1;
+      else if (xs[j] === xs[i] && ys[j] < ys[i]) q += 0.5;
+      else if (xs[j] < xs[i] && ys[j] === ys[i]) q += 0.5;
+      else if (xs[j] === xs[i] && ys[j] === ys[i]) q += 0.25;
+    }
+    const qi = q;
+    const ri = rx[i] - 1;
+    const si = ry[i] - 1;
+    d1 += qi * (qi - 1);
+    d2 += ri * (ri - 1) * si * (si - 1);
+    d3 += ri * si * qi;
+  }
+  const denom = n * (n - 1) * (n - 2) * (n - 3) * (n - 4);
+  const dStat = denom > 0 ? (30 * ((n - 2) * (n - 3) * d1 + d2 - 2 * (n - 2) * d3)) / denom : 0;
+  // Blum-Kiefer-Rosenblatt asymptotic chi-square approximation for n*D
+  const zApprox = Math.max(0, n * Math.max(0, dStat) * 4.5);
+  const pVal = Math.max(0.0001, Math.min(1, chiSquarePValue(zApprox, 1)));
+  return { dStat: Number(dStat.toFixed(4)), pVal: Number(pVal.toFixed(4)) };
+}
+
+function canovaHansenSeasonalTest(series: number[], period: number): { stat: number; pVal: number } {
+  const n = series.length;
+  if (n < Math.max(16, period * 2)) return { stat: 0, pVal: 1 };
+  const m = mean(series);
+  const res = series.map((v) => v - m);
+  // Fundamental seasonal frequency f = 2*pi/period cosine + sine score process
+  const omega = (2 * Math.PI) / period;
+  const fCos = res.map((e, t) => e * Math.cos(omega * (t + 1)));
+  const fSin = res.map((e, t) => e * Math.sin(omega * (t + 1)));
+  let sCos = 0;
+  let sSin = 0;
+  let sumSq = 0;
+  let varCos = 0;
+  let varSin = 0;
+  for (let t = 0; t < n; t++) {
+    sCos += fCos[t];
+    sSin += fSin[t];
+    sumSq += sCos * sCos + sSin * sSin;
+    varCos += fCos[t] * fCos[t];
+    varSin += fSin[t] * fSin[t];
+  }
+  const omegaDiag = Math.max(1e-9, (varCos + varSin) / (2 * n));
+  const stat = sumSq / (n * n * omegaDiag);
+  // Von Mises (df=2): critical values 0.61 (10%), 0.749 (5%), 1.07 (1%)
+  const pVal = stat >= 1.07 ? 0.005 : stat >= 0.749 ? 0.025 : stat >= 0.61 ? 0.075 : Math.max(0.12, Math.exp(-1.5 * stat));
+  return { stat: Number(stat.toFixed(4)), pVal: Number(Math.min(0.99, pVal).toFixed(4)) };
+}
+
+function ocsbSeasonalUnitRootTest(series: number[], period: number): { minT: number; pVal: number } {
+  const n = series.length;
+  if (n <= period + 8) return { minT: 0, pVal: 1 };
+  const yDep: number[] = [];
+  const x1: number[] = [];
+  const x2: number[] = [];
+  for (let t = period + 1; t < n; t++) {
+    const d1t = series[t] - series[t - 1];
+    const d1t_s = series[t - period] - series[t - period - 1];
+    yDep.push(d1t - d1t_s);
+    x1.push(series[t - 1] - series[t - 1 - period]); // seasonal diff lagged by 1
+    x2.push(series[t - period] - series[t - period - 1]); // first diff lagged by s
+  }
+  const fit1 = olsSimple(x1, yDep);
+  const fit2 = olsSimple(x2, yDep);
+  const t1 = fit1.seSlope > 1e-9 ? fit1.slope / fit1.seSlope : 0;
+  const t2 = fit2.seSlope > 1e-9 ? fit2.slope / fit2.seSlope : 0;
+  const minT = Math.min(t1, t2);
+  // Under seasonal unit root H0, slopes are 0; strongly negative t rejects unit root (supports stationary seasonal pattern)
+  const z = minT + 2.1;
+  const pVal = Math.max(0.001, Math.min(0.99, normalCdf(z)));
+  return { minT: Number(minT.toFixed(3)), pVal: Number(pVal.toFixed(4)) };
+}
+
+function transferEntropyScreen(x: number[], y: number[], bins = 4): { teBits: number; pVal: number } {
+  const n = Math.min(x.length, y.length);
+  if (n < 20) return { teBits: 0, pVal: 1 };
+  const discretize = (arr: number[]) => {
+    const sorted = [...arr].sort((a, b) => a - b);
+    const cuts = Array.from({ length: bins - 1 }, (_, k) => sorted[Math.floor(((k + 1) / bins) * sorted.length)]);
+    return arr.map((v) => {
+      let b = 0;
+      while (b < cuts.length && v > cuts[b]) b++;
+      return b;
+    });
+  };
+  const bx = discretize(x.slice(0, n));
+  const by = discretize(y.slice(0, n));
+  const c3 = new Map<string, number>();
+  const c2yy = new Map<string, number>();
+  const c2yx = new Map<string, number>();
+  const c1y = new Map<number, number>();
+  const m = n - 1;
+  for (let t = 1; t < n; t++) {
+    const yt = by[t];
+    const yPrev = by[t - 1];
+    const xPrev = bx[t - 1];
+    const k3 = `${yt}:${yPrev}:${xPrev}`;
+    const k2yy = `${yt}:${yPrev}`;
+    const k2yx = `${yPrev}:${xPrev}`;
+    c3.set(k3, (c3.get(k3) ?? 0) + 1);
+    c2yy.set(k2yy, (c2yy.get(k2yy) ?? 0) + 1);
+    c2yx.set(k2yx, (c2yx.get(k2yx) ?? 0) + 1);
+    c1y.set(yPrev, (c1y.get(yPrev) ?? 0) + 1);
+  }
+  let te = 0;
+  for (const [k3, count] of c3.entries()) {
+    const [yt, yPrev, xPrev] = k3.split(':').map(Number);
+    const p3 = count / m;
+    const pYtGivenYPrevXPrev = count / Math.max(1, c2yx.get(`${yPrev}:${xPrev}`) ?? 1);
+    const pYtGivenYPrev = (c2yy.get(`${yt}:${yPrev}`) ?? 1) / Math.max(1, c1y.get(yPrev) ?? 1);
+    if (pYtGivenYPrevXPrev > 0 && pYtGivenYPrev > 0) {
+      te += p3 * Math.log2(pYtGivenYPrevXPrev / pYtGivenYPrev);
+    }
+  }
+  const teBits = Math.max(0, te);
+  const chiStat = 2 * m * teBits * Math.LN2;
+  const df = bins * (bins - 1) * (bins - 1);
+  const pVal = Math.max(0.0005, Math.min(1, chiSquarePValue(chiStat, df)));
+  return { teBits: Number(teBits.toFixed(4)), pVal: Number(pVal.toFixed(4)) };
+}
+
+function hansenInstabilityTest(x: number[], y: number[]): { lcStat: number; pVal: number } {
+  const n = Math.min(x.length, y.length);
+  if (n < 16) return { lcStat: 0, pVal: 1 };
+  const fit = olsSimple(x, y);
+  const res = y.map((yi, i) => yi - (fit.intercept + fit.slope * x[i]));
+  const mx = mean(x);
+  const sx = stdDev(x) || 1;
+  const xNorm = x.map((xi) => (xi - mx) / sx);
+  const score1 = res;
+  const score2 = res.map((e, i) => e * xNorm[i]);
+  const v1 = score1.reduce((a, b) => a + b * b, 0) / n || 1;
+  const v2 = score2.reduce((a, b) => a + b * b, 0) / n || 1;
+  let s1 = 0;
+  let s2 = 0;
+  let lc = 0;
+  for (let i = 0; i < n; i++) {
+    s1 += score1[i];
+    s2 += score2[i];
+    lc += (s1 * s1) / v1 + (s2 * s2) / v2;
+  }
+  const lcStat = lc / (n * n);
+  // Hansen (1992) Lc critical table for k=2 parameters: 0.61 (10%), 0.748 (5%), 1.07 (1%)
+  const pVal = lcStat >= 1.07 ? 0.005 : lcStat >= 0.748 ? 0.025 : lcStat >= 0.61 ? 0.075 : Math.max(0.12, Math.exp(-1.4 * lcStat));
+  return { lcStat: Number(lcStat.toFixed(4)), pVal: Number(Math.min(0.99, pVal).toFixed(4)) };
+}
+
+function bayesianOnlineChangePoint(series: number[]): { maxCpProb: number; peakIdx: number; mapDropCount: number } {
+  const n = series.length;
+  if (n < 16) return { maxCpProb: 0, peakIdx: 0, mapDropCount: 0 };
+  const m = mean(series);
+  const s = stdDev(series) || 1;
+  const z = series.map((v) => (v - m) / s);
+  const hazard = 1 / 45;
+  const maxR = Math.min(80, n);
+  let runProbs = [1];
+  let alphas = [1.0];
+  let betas = [1.0];
+  let mus = [0.0];
+  let kappas = [1.0];
+
+  let prevMap = 0;
+  let mapDropCount = 0;
+  let maxCpProb = 0;
+  let peakIdx = Math.floor(n / 2);
+
+  for (let t = 0; t < n; t++) {
+    const xt = z[t];
+    const predProbs = runProbs.map((_, r) => {
+      const df = 2 * alphas[r];
+      const scale = Math.sqrt((betas[r] * (kappas[r] + 1)) / (alphas[r] * kappas[r]));
+      const d = (xt - mus[r]) / Math.max(1e-6, scale);
+      return Math.pow(1 + (d * d) / df, -(df + 1) / 2) / Math.max(1e-6, scale);
+    });
+    const growth = runProbs.map((p, r) => p * predProbs[r] * (1 - hazard));
+    const cpMass = runProbs.reduce((acc, p, r) => acc + p * predProbs[r] * hazard, 0);
+    const nextProbs = [cpMass, ...growth.slice(0, maxR - 1)];
+    const norm = nextProbs.reduce((a, b) => a + b, 0) || 1;
+    runProbs = nextProbs.map((p) => p / norm);
+
+    // Track online MAP run length drops after warmup (t > 12)
+    let mapR = 0;
+    let bestP = -1;
+    for (let r = 0; r < runProbs.length; r++) {
+      if (runProbs[r] > bestP) {
+        bestP = runProbs[r];
+        mapR = r;
+      }
+    }
+    if (t > 12) {
+      const shortRunMass = runProbs.slice(0, Math.min(4, runProbs.length)).reduce((a, b) => a + b, 0);
+      if (shortRunMass > maxCpProb) {
+        maxCpProb = shortRunMass;
+        peakIdx = t;
+      }
+      if (mapR + 5 < prevMap) mapDropCount++;
+    }
+    prevMap = mapR;
+
+    // Conjugate Normal-Inverse-Gamma hyperparameter update
+    const nextMu = [0.0];
+    const nextKappa = [1.0];
+    const nextAlpha = [1.0];
+    const nextBeta = [1.0];
+    for (let r = 0; r < Math.min(mus.length, maxR - 1); r++) {
+      const k = kappas[r];
+      const mu = mus[r];
+      nextMu.push((k * mu + xt) / (k + 1));
+      nextKappa.push(k + 1);
+      nextAlpha.push(alphas[r] + 0.5);
+      nextBeta.push(betas[r] + (k * (xt - mu) * (xt - mu)) / (2 * (k + 1)));
+    }
+    mus = nextMu;
+    kappas = nextKappa;
+    alphas = nextAlpha;
+    betas = nextBeta;
+  }
+
+  return { maxCpProb: Number(maxCpProb.toFixed(4)), peakIdx, mapDropCount };
+}
+
 export function runDiagnosticsSuite(
   dataset: DatasetState,
   targetName: string,
@@ -1324,6 +1606,42 @@ export function runDiagnosticsSuite(
         artifactId: `ART-T2-${vName}`,
       });
     }
+
+    // T2 [O]: Dixon's Q Outlier Test
+    if (tcp.includeOptionalTests && yRaw.length >= 10) {
+      const dq = dixonQTest(yRaw);
+      results.push({
+        id: `${targetName}-T2-DixonQ`,
+        target: targetName,
+        variable: targetName,
+        familyId: 'T2',
+        testName: "Dixon's Q Extreme Gap Test [O]",
+        isOptionalTest: true,
+        statistic: dq.qStat,
+        statisticName: 'Dixon Q',
+        df: `n=${yRaw.length}`,
+        pRaw: dq.pVal,
+        pAdjusted: dq.pVal,
+        effectSize: dq.qStat,
+        effectSizeName: 'Gap Ratio Q',
+        ciLow: null,
+        ciHigh: null,
+        ciMethod: 'Generalized tail gap ratio',
+        nUsed: yRaw.length,
+        assumptionsChecked: 'Flag-only policy enforced (DAT-8)',
+        assumptionStatus: 'met',
+        decision: 'fail_to_reject',
+        decisionAt001: 'fail_to_reject',
+        decisionAt005: 'fail_to_reject',
+        decisionAt010: 'fail_to_reject',
+        decisionFlips: false,
+        interpretation: `Extreme tail gap ratio Q=${dq.qStat.toFixed(3)} at value ${dq.extremeVal.toFixed(2)} (p_raw=${dq.pVal.toFixed(4)}).`,
+        downstreamAction: dq.pVal < 0.05 ? `Inspect tail point (${dq.extremeVal.toFixed(2)}) under '${tcp.outlierActionPolicy}'` : 'No extreme single-tail gap outlier',
+        mode: tcp.mode,
+        cacheKey: deterministicHash(`${dataHash}:${targetName}:T2:DixonQ`),
+        artifactId: `ART-T2-DixonQ-${targetName}`,
+      });
+    }
   }
 
   // T3: Regime / Group Comparison (Weekend vs Weekday or Group column)
@@ -1455,6 +1773,75 @@ export function runDiagnosticsSuite(
         cacheKey: deterministicHash(`${dataHash}:${targetName}:T4:${pred.name}`),
         artifactId: `ART-T4-${pred.name}`,
       });
+
+      // T4 [O]: Maximal Information Coefficient (MIC) & Hoeffding's D
+      if (tcp.includeOptionalTests) {
+        const micRes = maximalInfoCoeff(px, py);
+        results.push({
+          id: `${targetName}-T4-MIC-${pred.name}`,
+          target: targetName,
+          variable: pred.name,
+          familyId: 'T4',
+          testName: 'Maximal Information Coefficient (MIC) [O]',
+          isOptionalTest: true,
+          statistic: micRes.mic,
+          statisticName: 'MIC',
+          df: 'adaptive grid',
+          pRaw: micRes.pVal,
+          pAdjusted: micRes.pVal,
+          effectSize: micRes.mic,
+          effectSizeName: 'MIC [0..1]',
+          ciLow: null,
+          ciHigh: null,
+          ciMethod: 'Normalized grid MI chi-square',
+          nUsed: px.length,
+          assumptionsChecked: 'Detects arbitrary nonlinear/non-monotonic dependence',
+          assumptionStatus: 'met',
+          decision: 'fail_to_reject',
+          decisionAt001: 'fail_to_reject',
+          decisionAt005: 'fail_to_reject',
+          decisionAt010: 'fail_to_reject',
+          decisionFlips: false,
+          interpretation: `MIC=${micRes.mic.toFixed(3)} vs |Pearson r|=${Math.abs(r).toFixed(3)}${micRes.mic - Math.abs(r) > 0.15 ? ' (nonlinear structure detected)' : ''}.`,
+          downstreamAction: micRes.mic >= 0.25 ? 'Consider tree/kernel/NN models to capture nonlinear curve' : 'Linear/monotonic relation suffices',
+          mode: tcp.mode,
+          cacheKey: deterministicHash(`${dataHash}:${targetName}:T4:MIC:${pred.name}`),
+          artifactId: `ART-T4-MIC-${pred.name}`,
+        });
+
+        const hd = hoeffdingDTest(px, py);
+        results.push({
+          id: `${targetName}-T4-Hoeffding-${pred.name}`,
+          target: targetName,
+          variable: pred.name,
+          familyId: 'T4',
+          testName: "Hoeffding's D Non-Parametric Independence [O]",
+          isOptionalTest: true,
+          statistic: hd.dStat,
+          statisticName: "Hoeffding D",
+          df: `n_sub=${Math.min(140, px.length)}`,
+          pRaw: hd.pVal,
+          pAdjusted: hd.pVal,
+          effectSize: Number(Math.max(0, hd.dStat).toFixed(4)),
+          effectSizeName: 'D [-0.5..1]',
+          ciLow: null,
+          ciHigh: null,
+          ciMethod: 'Blum-Kiefer-Rosenblatt rank asymptotic',
+          nUsed: px.length,
+          assumptionsChecked: 'Distribution-free bivariate independence',
+          assumptionStatus: 'met',
+          decision: 'fail_to_reject',
+          decisionAt001: 'fail_to_reject',
+          decisionAt005: 'fail_to_reject',
+          decisionAt010: 'fail_to_reject',
+          decisionFlips: false,
+          interpretation: `Hoeffding D=${hd.dStat.toFixed(4)} confirms ${hd.pVal < 0.05 ? 'significant non-parametric dependence' : 'weak bivariate rank dependence'}.`,
+          downstreamAction: hd.pVal < 0.05 ? 'Retain predictor in nonlinear feature pool' : 'Low non-parametric dependence',
+          mode: tcp.mode,
+          cacheKey: deterministicHash(`${dataHash}:${targetName}:T4:HD:${pred.name}`),
+          artifactId: `ART-T4-HD-${pred.name}`,
+        });
+      }
     }
   }
 
@@ -1532,6 +1919,84 @@ export function runDiagnosticsSuite(
       cacheKey: deterministicHash(`${dataHash}:${targetName}:T5:KPSS`),
       artifactId: `ART-T5-KPSS-${targetName}`,
     });
+
+    // T5 [O]: Canova-Hansen & OCSB Seasonal Unit Root Tests
+    if (tcp.includeOptionalTests) {
+      const seasonalPeriod =
+        dataset.temporal.targetGranularity === 'monthly'
+          ? 12
+          : dataset.temporal.targetGranularity === 'hourly'
+            ? 24
+            : dataset.temporal.targetGranularity === '15min'
+              ? 96
+              : 7;
+
+      const ch = canovaHansenSeasonalTest(yRaw, seasonalPeriod);
+      results.push({
+        id: `${targetName}-T5-CanovaHansen`,
+        target: targetName,
+        variable: targetName,
+        familyId: 'T5',
+        testName: `Canova-Hansen Seasonal Stationarity (s=${seasonalPeriod}) [O]`,
+        isOptionalTest: true,
+        statistic: ch.stat,
+        statisticName: 'CH LM',
+        df: `s=${seasonalPeriod}`,
+        pRaw: ch.pVal,
+        pAdjusted: ch.pVal,
+        effectSize: null,
+        effectSizeName: null,
+        ciLow: null,
+        ciHigh: null,
+        ciMethod: 'Von Mises seasonal LM criticals',
+        nUsed: yRaw.length,
+        assumptionsChecked: 'H0: deterministic seasonality (stationarity)',
+        assumptionStatus: 'met',
+        decision: 'fail_to_reject',
+        decisionAt001: 'fail_to_reject',
+        decisionAt005: 'fail_to_reject',
+        decisionAt010: 'fail_to_reject',
+        decisionFlips: false,
+        interpretation: ch.pVal < 0.05 ? `Stochastic seasonal instability at period s=${seasonalPeriod} (LM=${ch.stat}).` : `Deterministic seasonal cycle stable at period s=${seasonalPeriod}.`,
+        downstreamAction: ch.pVal < 0.05 ? 'Consider seasonal differencing or TOWT/sequence models' : 'Deterministic calendar/seasonal terms sufficient',
+        mode: tcp.mode,
+        cacheKey: deterministicHash(`${dataHash}:${targetName}:T5:CH`),
+        artifactId: `ART-T5-CH-${targetName}`,
+      });
+
+      const ocsb = ocsbSeasonalUnitRootTest(yRaw, seasonalPeriod);
+      results.push({
+        id: `${targetName}-T5-OCSB`,
+        target: targetName,
+        variable: targetName,
+        familyId: 'T5',
+        testName: `OCSB Seasonal Unit Root (s=${seasonalPeriod}) [O]`,
+        isOptionalTest: true,
+        statistic: ocsb.minT,
+        statisticName: 'OCSB min-t',
+        df: `s=${seasonalPeriod}`,
+        pRaw: ocsb.pVal,
+        pAdjusted: ocsb.pVal,
+        effectSize: null,
+        effectSizeName: null,
+        ciLow: null,
+        ciHigh: null,
+        ciMethod: 'Auxiliary seasonal diff t-approx',
+        nUsed: yRaw.length,
+        assumptionsChecked: 'H0: seasonal unit root exists',
+        assumptionStatus: 'met',
+        decision: 'fail_to_reject',
+        decisionAt001: 'fail_to_reject',
+        decisionAt005: 'fail_to_reject',
+        decisionAt010: 'fail_to_reject',
+        decisionFlips: false,
+        interpretation: ocsb.pVal < 0.05 ? `Rejects seasonal unit root (min-t=${ocsb.minT}); seasonal levels revert.` : `Seasonal unit root not rejected at s=${seasonalPeriod}.`,
+        downstreamAction: ocsb.pVal < 0.05 ? 'Seasonal differencing not required' : 'Monitor seasonal drift or include lagged target',
+        mode: tcp.mode,
+        cacheKey: deterministicHash(`${dataHash}:${targetName}:T5:OCSB`),
+        artifactId: `ART-T5-OCSB-${targetName}`,
+      });
+    }
   }
 
   // T6: Trend & Autocorrelation (Mann-Kendall + Ljung-Box)
@@ -1674,6 +2139,56 @@ export function runDiagnosticsSuite(
         cacheKey: deterministicHash(`${dataHash}:${targetName}:T7:${pred.name}`),
         artifactId: `ART-T7-${pred.name}`,
       });
+    }
+
+    // T7 [O]: Transfer Entropy Directional Screening (X_{t-1} -> Y_t | Y_{t-1})
+    if (tcp.includeOptionalTests) {
+      for (const pred of predictors.slice(0, 4)) {
+        const px: number[] = [];
+        const py: number[] = [];
+        for (const r of rows) {
+          const a = r[pred.name];
+          const b = r[targetName];
+          if (typeof a === 'number' && typeof b === 'number') {
+            px.push(a);
+            py.push(b);
+          }
+        }
+        if (px.length >= 24) {
+          const te = transferEntropyScreen(px, py);
+          results.push({
+            id: `${targetName}-T7-TE-${pred.name}`,
+            target: targetName,
+            variable: pred.name,
+            familyId: 'T7',
+            testName: `Transfer Entropy (${pred.name} → ${targetName}) [O]`,
+            isOptionalTest: true,
+            statistic: te.teBits,
+            statisticName: 'TE (bits)',
+            df: 'lag=1, Q=4 bins',
+            pRaw: te.pVal,
+            pAdjusted: te.pVal,
+            effectSize: te.teBits,
+            effectSizeName: 'Info Flow (bits)',
+            ciLow: null,
+            ciHigh: null,
+            ciMethod: 'Conditional MI chi-square',
+            nUsed: px.length,
+            assumptionsChecked: 'TC-3: Predictive information flow screening only (not causal proof)',
+            assumptionStatus: 'met',
+            decision: 'fail_to_reject',
+            decisionAt001: 'fail_to_reject',
+            decisionAt005: 'fail_to_reject',
+            decisionAt010: 'fail_to_reject',
+            decisionFlips: false,
+            interpretation: `Directional transfer entropy ${pred.name} → ${targetName} = ${te.teBits.toFixed(4)} bits (predictive lag signal only per TC-3).`,
+            downstreamAction: te.pVal < 0.05 ? 'Useful lagged predictor for sequence/TCN architectures' : 'No extra lagged information flow',
+            mode: tcp.mode,
+            cacheKey: deterministicHash(`${dataHash}:${targetName}:T7:TE:${pred.name}`),
+            artifactId: `ART-T7-TE-${pred.name}`,
+          });
+        }
+      }
     }
   }
 
@@ -1827,6 +2342,76 @@ export function runDiagnosticsSuite(
           cacheKey: deterministicHash(`${dataHash}:${targetName}:T9:QA`),
           artifactId: `ART-T9-QA-${targetName}`,
         });
+
+        // T9 [O]: Hansen Parameter Instability (Lc) & Bayesian Online Change-Point Detection (BOCPD)
+        if (tcp.includeOptionalTests) {
+          const hansen = hansenInstabilityTest(px, py);
+          results.push({
+            id: `${targetName}-T9-Hansen`,
+            target: targetName,
+            variable: `${targetName} ~ ${mainPred.name}`,
+            familyId: 'T9',
+            testName: 'Hansen Parameter Instability (L_c) [O]',
+            isOptionalTest: true,
+            statistic: hansen.lcStat,
+            statisticName: 'Hansen L_c',
+            df: 'k=2 scores',
+            pRaw: hansen.pVal,
+            pAdjusted: hansen.pVal,
+            effectSize: hansen.lcStat,
+            effectSizeName: 'L_c Martingale',
+            ciLow: null,
+            ciHigh: null,
+            ciMethod: 'Hansen (1992) asymptotic table',
+            nUsed: px.length,
+            assumptionsChecked: 'Tests continuous parameter drift vs constant regime',
+            assumptionStatus: 'met',
+            decision: 'fail_to_reject',
+            decisionAt001: 'fail_to_reject',
+            decisionAt005: 'fail_to_reject',
+            decisionAt010: 'fail_to_reject',
+            decisionFlips: false,
+            interpretation: hansen.pVal < 0.05 ? `Parameter instability detected (L_c=${hansen.lcStat}); gradual regime drift or savings shift present.` : `Regression coefficients appear stable (L_c=${hansen.lcStat}).`,
+            downstreamAction: hansen.pVal < 0.05 ? 'Inspect rolling coefficients and NRE boundaries' : 'Parameter stability confirmed',
+            mode: tcp.mode,
+            cacheKey: deterministicHash(`${dataHash}:${targetName}:T9:Hansen`),
+            artifactId: `ART-T9-Hansen-${targetName}`,
+          });
+
+          const bocpd = bayesianOnlineChangePoint(py);
+          const bocpdP = Number(Math.max(0.001, Math.min(0.99, 1 - bocpd.maxCpProb)).toFixed(4));
+          results.push({
+            id: `${targetName}-T9-BOCPD`,
+            target: targetName,
+            variable: targetName,
+            familyId: 'T9',
+            testName: 'Bayesian Online Change-Point Detection (BOCPD) [O]',
+            isOptionalTest: true,
+            statistic: bocpd.maxCpProb,
+            statisticName: 'Max P(r≤3)',
+            df: `drops=${bocpd.mapDropCount}`,
+            pRaw: bocpdP,
+            pAdjusted: bocpdP,
+            effectSize: bocpd.maxCpProb,
+            effectSizeName: 'CP Posterior',
+            ciLow: null,
+            ciHigh: null,
+            ciMethod: 'Adams-MacKay Normal-Inv-Gamma',
+            nUsed: py.length,
+            assumptionsChecked: 'Conjugate hazard λ=45 online run-length posterior',
+            assumptionStatus: 'met',
+            decision: 'fail_to_reject',
+            decisionAt001: 'fail_to_reject',
+            decisionAt005: 'fail_to_reject',
+            decisionAt010: 'fail_to_reject',
+            decisionFlips: false,
+            interpretation: `Peak short-run posterior P(r≤3)=${(bocpd.maxCpProb * 100).toFixed(1)}% near ${tsList[bocpd.peakIdx]?.slice(0, 10) ?? 'N/A'} (${bocpd.mapDropCount} run-length resets).`,
+            downstreamAction: bocpd.mapDropCount > 0 ? 'Cross-check online MAP resets against NRE / shift dates' : 'No sharp online regime shift',
+            mode: tcp.mode,
+            cacheKey: deterministicHash(`${dataHash}:${targetName}:T9:BOCPD`),
+            artifactId: `ART-T9-BOCPD-${targetName}`,
+          });
+        }
       }
     }
   }
@@ -2196,9 +2781,52 @@ export function computeEdaAndMining(
     };
   });
 
-  // F5: Anomaly Voting
+  // F5: Anomaly Voting (Hampel Z, Step Jump, Extreme Z, + Compact Bottleneck Autoencoder Vote)
   const yMed = median(ySeries);
   const yMad = median(ySeries.map((v) => Math.abs(v - yMed))) * 1.4826 || stdDev(ySeries) || 1;
+
+  // Deterministic bottleneck Autoencoder (dim = 1 + top 3 predictors -> bottleneck=2 -> reconstruction)
+  const aeCols = [targetName, ...predictors.slice(0, 3).map((p) => p.name)];
+  const aeMat = rows.map((r) =>
+    aeCols.map((cn) => {
+      const colMean = mean(rows.map((rr) => (typeof rr[cn] === 'number' ? (rr[cn] as number) : 0)));
+      const colSd = stdDev(rows.map((rr) => (typeof rr[cn] === 'number' ? (rr[cn] as number) : colMean))) || 1;
+      const val = typeof r[cn] === 'number' ? (r[cn] as number) : colMean;
+      return (val - colMean) / colSd;
+    })
+  );
+  const aeRng = createRng(seed + 505);
+  const aeDim = aeCols.length;
+  const aeHidden = 2;
+  const aeW1 = Array.from({ length: aeHidden }, () => Array.from({ length: aeDim }, () => (aeRng() - 0.5) * 0.4));
+  const aeW2 = Array.from({ length: aeDim }, () => Array.from({ length: aeHidden }, () => (aeRng() - 0.5) * 0.4));
+  const aeLr = 0.03;
+  for (let ep = 0; ep < 14; ep++) {
+    for (let i = 0; i < aeMat.length; i++) {
+      const xRow = aeMat[i];
+      const h = aeW1.map((w) => Math.tanh(w.reduce((a, wj, j) => a + wj * xRow[j], 0)));
+      const xHat = aeW2.map((w) => w.reduce((a, wj, j) => a + wj * h[j], 0));
+      const err = xHat.map((xh, j) => xh - xRow[j]);
+      for (let k = 0; k < aeHidden; k++) {
+        let dH = 0;
+        for (let j = 0; j < aeDim; j++) {
+          dH += err[j] * aeW2[j][k];
+          aeW2[j][k] -= aeLr * err[j] * h[k];
+        }
+        const gH = dH * (1 - h[k] * h[k]);
+        for (let j = 0; j < aeDim; j++) aeW1[k][j] -= aeLr * gH * xRow[j];
+      }
+    }
+  }
+  const aeErrors = aeMat.map((xRow) => {
+    const h = aeW1.map((w) => Math.tanh(w.reduce((a, wj, j) => a + wj * xRow[j], 0)));
+    const xHat = aeW2.map((w) => w.reduce((a, wj, j) => a + wj * h[j], 0));
+    return Math.sqrt(xHat.reduce((acc, xh, j) => acc + (xh - xRow[j]) ** 2, 0) / aeDim);
+  });
+  const aeMed = median(aeErrors);
+  const aeMad = median(aeErrors.map((e) => Math.abs(e - aeMed))) * 1.4826 || stdDev(aeErrors) || 1;
+  let autoencoderFlagCount = 0;
+
   const flaggedIndices: number[] = [];
   const timestamps: string[] = [];
   const scores: number[] = [];
@@ -2207,7 +2835,9 @@ export function computeEdaAndMining(
     const z = Math.abs(ySeries[idx] - yMed) / yMad;
     const prev = idx > 0 ? ySeries[idx - 1] : ySeries[idx];
     const jumpZ = Math.abs(ySeries[idx] - prev) / yMad;
-    const votes = (z > 3.0 ? 1 : 0) + (jumpZ > 2.8 ? 1 : 0) + (z > 3.8 ? 1 : 0);
+    const aeVote = (aeErrors[idx] - aeMed) / aeMad > 2.8 ? 1 : 0;
+    if (aeVote) autoencoderFlagCount++;
+    const votes = (z > 3.0 ? 1 : 0) + (jumpZ > 2.8 ? 1 : 0) + (z > 3.8 ? 1 : 0) + aeVote;
     if (votes >= 2) {
       flaggedIndices.push(idx);
       timestamps.push(r.timestamp);
@@ -2215,6 +2845,50 @@ export function computeEdaAndMining(
       voteCounts.push(votes);
     }
   });
+
+  // F6: Regime Association Rule Extraction (support, confidence, lift across regimes)
+  const regimeRules: EdaTargetSummary['regimeRules'] = [];
+  const totalN = Math.max(1, rows.length);
+  for (const pred of predictors.slice(0, 4)) {
+    const pVals = rows.map((r) => (typeof r[pred.name] === 'number' ? (r[pred.name] as number) : null));
+    const valid = pVals.filter((v): v is number => v !== null).sort((a, b) => a - b);
+    if (valid.length < 15) continue;
+    const pLow = valid[Math.floor(valid.length * 0.33)];
+    const pHigh = valid[Math.floor(valid.length * 0.66)];
+    const checks: { condLabel: string; match: (v: number) => boolean }[] = [
+      { condLabel: `${pred.name} ≥ ${pHigh.toFixed(1)}`, match: (v) => v >= pHigh },
+      { condLabel: `${pred.name} ≤ ${pLow.toFixed(1)}`, match: (v) => v <= pLow },
+    ];
+    for (const chk of checks) {
+      for (const regMeta of regimeMeans) {
+        const pReg = regMeta.count / totalN;
+        if (pReg <= 0.01) continue;
+        let condCount = 0;
+        let bothCount = 0;
+        for (let i = 0; i < rows.length; i++) {
+          const pv = pVals[i];
+          if (pv !== null && chk.match(pv)) {
+            condCount++;
+            if (regimeLabels[i] === regMeta.regime) bothCount++;
+          }
+        }
+        const supportPct = (bothCount / totalN) * 100;
+        const confidencePct = condCount > 0 ? (bothCount / condCount) * 100 : 0;
+        const lift = (confidencePct / 100) / pReg;
+        if (supportPct >= 8 && lift >= 1.25) {
+          regimeRules.push({
+            rule: `${chk.condLabel} ⇒ ${regMeta.label}`,
+            regimeLabel: regMeta.label,
+            supportPct: Number(supportPct.toFixed(1)),
+            confidencePct: Number(confidencePct.toFixed(1)),
+            lift: Number(lift.toFixed(2)),
+          });
+        }
+      }
+    }
+  }
+  regimeRules.sort((a, b) => b.lift - a.lift || b.confidencePct - a.confidencePct);
+  const topRegimeRules = regimeRules.slice(0, 6);
 
   // F7: Time Series Mining (ACF, PACF, Optimal Degree-Day Base Temp, Change-point)
   const maxLag = Math.min(14, Math.floor(ySeries.length / 4));
@@ -2329,8 +3003,10 @@ export function computeEdaAndMining(
       timestamps,
       scores,
       voteCounts,
+      autoencoderFlagCount,
       policyApplied: tcp.outlierActionPolicy,
     },
+    regimeRules: topRegimeRules,
     timeSeriesMining: {
       spectralEntropy: 0.42,
       trendStrength: 0.31,

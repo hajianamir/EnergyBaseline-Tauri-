@@ -169,11 +169,237 @@ export function aggregateRowsToTargetGranularity(
   return { rows: aggregated, refusalError: null };
 }
 
+export type SyntheticPresetId =
+  | 'energy_mv'
+  | 'manufacturing_spc'
+  | 'healthcare_kpi'
+  | 'water_utility'
+  | 'finance_demand'
+  | 'environmental_aqi';
+
 export function generateSyntheticDataset(
-  preset: 'energy_mv' | 'manufacturing_spc' | 'healthcare_kpi' = 'energy_mv',
+  preset: SyntheticPresetId = 'energy_mv',
   seed = 42
 ): DatasetState {
   const rng = createRng(seed);
+
+  if (preset === 'water_utility') {
+    const rows: DatasetRow[] = [];
+    const startMs = Date.UTC(2025, 0, 1, 0, 0, 0);
+    for (let i = 0; i < 365; i++) {
+      const ts = new Date(startMs + i * 86400_000).toISOString();
+      const dow = new Date(startMs + i * 86400_000).getUTCDay();
+      const isWeekend = dow === 0 || dow === 6 ? 1 : 0;
+      const airTemp = Number((17 + 10 * Math.sin((2 * Math.PI * (i - 90)) / 365) + randomNormal(rng) * 2.2).toFixed(2));
+      const reservoirLevelM = Number((14.2 + 1.1 * Math.cos((2 * Math.PI * i) / 365) + randomNormal(rng) * 0.25).toFixed(2));
+      const activeConnections = Math.round(12400 + i * 3.5 + randomNormal(rng) * 40);
+      const postLeakRepair = i >= 260 ? 1 : 0;
+      const waterFlowM3 = Number(
+        (
+          4200 +
+          0.38 * activeConnections +
+          65 * Math.max(0, airTemp - 16) -
+          (isWeekend ? 290 : 0) -
+          (postLeakRepair ? 460 : 0) +
+          randomNormal(rng) * 105
+        ).toFixed(2)
+      );
+      rows.push({
+        timestamp: ts,
+        water_flow_m3: waterFlowM3,
+        air_temp_c: rng() < 0.01 ? null : airTemp,
+        reservoir_level_m: reservoirLevelM,
+        active_connections: activeConnections,
+        is_weekend: isWeekend,
+        dma_phase: postLeakRepair ? 'post_leak_repair' : 'baseline_network',
+      });
+    }
+    const columns: ColumnConfig[] = [
+      { name: 'timestamp', role: 'time', suggestedRole: 'time', quantityType: 'index', aggregation: 'last', unit: 'UTC', unitFamily: 'time', availability: 'known_in_advance', dtype: 'datetime', roleMode: 'AUTO' },
+      { name: 'water_flow_m3', role: 'target', suggestedRole: 'target', quantityType: 'flow', aggregation: 'sum', unit: 'm³', unitFamily: 'water_volume', availability: 'observed_only', dtype: 'numeric', roleMode: 'AUTO' },
+      { name: 'air_temp_c', role: 'predictor', suggestedRole: 'predictor', quantityType: 'rate', aggregation: 'time_weighted_mean', unit: '°C', unitFamily: 'temperature', availability: 'known_in_advance', dtype: 'numeric', roleMode: 'AUTO' },
+      { name: 'reservoir_level_m', role: 'predictor', suggestedRole: 'predictor', quantityType: 'stock', aggregation: 'last', unit: 'm', unitFamily: 'level', availability: 'known_in_advance', dtype: 'numeric', roleMode: 'AUTO' },
+      { name: 'active_connections', role: 'static_factor', suggestedRole: 'static_factor', quantityType: 'stock', aggregation: 'last', unit: 'conn', unitFamily: 'customers', availability: 'known_in_advance', dtype: 'numeric', roleMode: 'AUTO' },
+      { name: 'is_weekend', role: 'predictor', suggestedRole: 'predictor', quantityType: 'index', aggregation: 'mean', unit: 'flag', unitFamily: 'schedule', availability: 'known_in_advance', dtype: 'numeric', roleMode: 'AUTO' },
+      { name: 'dma_phase', role: 'group', suggestedRole: 'group', quantityType: 'index', aggregation: 'last', unit: 'label', unitFamily: 'cohort', availability: 'known_in_advance', dtype: 'categorical', roleMode: 'AUTO' },
+    ];
+    return {
+      id: 'synth-water-utility',
+      name: 'Municipal Water DMA Flow & Leak Recovery (AWWA M36)',
+      domain: 'water',
+      rows,
+      rawRowCount: rows.length,
+      sha256: deterministicHash(JSON.stringify(rows.slice(0, 20)) + rows.length),
+      columns,
+      temporal: {
+        sourceGranularity: 'daily',
+        targetGranularity: 'daily',
+        timezone: 'UTC',
+        baselineStart: rows[0].timestamp,
+        baselineEnd: rows[259].timestamp,
+        reportingStart: rows[260].timestamp,
+        reportingEnd: rows[rows.length - 1].timestamp,
+        dstPolicy: 'utc_store_flag_dst',
+        completenessThreshold: 0.8,
+      },
+      nonRoutineEvents: [
+        {
+          id: 'nre-water-1',
+          start: rows[260].timestamp,
+          end: rows[rows.length - 1].timestamp,
+          reason: 'District Metered Area Main Leak Repair (-460 m³/day planted reduction)',
+          treatment: 'flag_only',
+        },
+      ],
+      sourceNote: 'Synthetic AWWA M36 hydraulic baseline dataset (planted -460 m³/day non-revenue water recovery).',
+    };
+  }
+
+  if (preset === 'finance_demand') {
+    const rows: DatasetRow[] = [];
+    const startMs = Date.UTC(2025, 0, 1, 0, 0, 0);
+    for (let i = 0; i < 365; i++) {
+      const ts = new Date(startMs + i * 86400_000).toISOString();
+      const dow = new Date(startMs + i * 86400_000).getUTCDay();
+      const isWeekend = dow === 0 || dow === 6 ? 1 : 0;
+      const activeUsersK = Number((85 + 14 * Math.sin((2 * Math.PI * i) / 90) + i * 0.04 + randomNormal(rng) * 2.5).toFixed(2));
+      const promoSpendUsd = Number((1200 + 600 * Math.max(0, Math.sin((2 * Math.PI * i) / 30)) + randomNormal(rng) * 90).toFixed(1));
+      const macroIndex = Number((102 + 3.2 * Math.cos((2 * Math.PI * i) / 180) + randomNormal(rng) * 0.6).toFixed(2));
+      const postPricingShift = i >= 270 ? 1 : 0;
+      const dailyTxVol = Number(
+        (
+          2100 +
+          38.5 * activeUsersK +
+          0.62 * promoSpendUsd +
+          11.2 * macroIndex -
+          (isWeekend ? 420 : 0) +
+          (postPricingShift ? 540 : 0) +
+          randomNormal(rng) * 95
+        ).toFixed(2)
+      );
+      rows.push({
+        timestamp: ts,
+        daily_tx_volume: dailyTxVol,
+        active_users_k: activeUsersK,
+        promo_spend_usd: rng() < 0.01 ? null : promoSpendUsd,
+        macro_demand_idx: macroIndex,
+        is_weekend: isWeekend,
+        policy_regime: postPricingShift ? 'post_tier_change' : 'baseline_pricing',
+      });
+    }
+    const columns: ColumnConfig[] = [
+      { name: 'timestamp', role: 'time', suggestedRole: 'time', quantityType: 'index', aggregation: 'last', unit: 'UTC', unitFamily: 'time', availability: 'known_in_advance', dtype: 'datetime', roleMode: 'AUTO' },
+      { name: 'daily_tx_volume', role: 'target', suggestedRole: 'target', quantityType: 'flow', aggregation: 'sum', unit: 'tx', unitFamily: 'volume', availability: 'observed_only', dtype: 'numeric', roleMode: 'AUTO' },
+      { name: 'active_users_k', role: 'predictor', suggestedRole: 'predictor', quantityType: 'stock', aggregation: 'mean', unit: 'kUsers', unitFamily: 'users', availability: 'known_in_advance', dtype: 'numeric', roleMode: 'AUTO' },
+      { name: 'promo_spend_usd', role: 'predictor', suggestedRole: 'predictor', quantityType: 'flow', aggregation: 'sum', unit: 'USD', unitFamily: 'spend', availability: 'known_in_advance', dtype: 'numeric', roleMode: 'AUTO' },
+      { name: 'macro_demand_idx', role: 'predictor', suggestedRole: 'predictor', quantityType: 'index', aggregation: 'mean', unit: 'idx', unitFamily: 'macro', availability: 'known_in_advance', dtype: 'numeric', roleMode: 'AUTO' },
+      { name: 'is_weekend', role: 'predictor', suggestedRole: 'predictor', quantityType: 'index', aggregation: 'mean', unit: 'flag', unitFamily: 'schedule', availability: 'known_in_advance', dtype: 'numeric', roleMode: 'AUTO' },
+      { name: 'policy_regime', role: 'group', suggestedRole: 'group', quantityType: 'index', aggregation: 'last', unit: 'label', unitFamily: 'cohort', availability: 'known_in_advance', dtype: 'categorical', roleMode: 'AUTO' },
+    ];
+    return {
+      id: 'synth-finance-demand',
+      name: 'Transaction Volume & Demand Benchmark (SR 11-7)',
+      domain: 'finance',
+      rows,
+      rawRowCount: rows.length,
+      sha256: deterministicHash(JSON.stringify(rows.slice(0, 20)) + rows.length),
+      columns,
+      temporal: {
+        sourceGranularity: 'daily',
+        targetGranularity: 'daily',
+        timezone: 'UTC',
+        baselineStart: rows[0].timestamp,
+        baselineEnd: rows[269].timestamp,
+        reportingStart: rows[270].timestamp,
+        reportingEnd: rows[rows.length - 1].timestamp,
+        dstPolicy: 'utc_store_flag_dst',
+        completenessThreshold: 0.85,
+      },
+      nonRoutineEvents: [
+        {
+          id: 'nre-fin-1',
+          start: rows[270].timestamp,
+          end: rows[rows.length - 1].timestamp,
+          reason: 'Fee Tier Launch (+540 tx/day structural lift)',
+          treatment: 'flag_only',
+        },
+      ],
+      sourceNote: 'Synthetic SR 11-7 demand/transaction risk benchmark dataset (planted +540 tx/day regime shift).',
+    };
+  }
+
+  if (preset === 'environmental_aqi') {
+    const rows: DatasetRow[] = [];
+    const startMs = Date.UTC(2025, 0, 1, 0, 0, 0);
+    for (let i = 0; i < 365; i++) {
+      const ts = new Date(startMs + i * 86400_000).toISOString();
+      const dow = new Date(startMs + i * 86400_000).getUTCDay();
+      const isWeekend = dow === 0 || dow === 6 ? 1 : 0;
+      const windSpeedMs = Number(Math.max(0.8, 3.8 + 1.5 * Math.sin(i / 18) + randomNormal(rng) * 0.75).toFixed(2));
+      const trafficIdx = Number((isWeekend ? 62 : 105 + randomNormal(rng) * 6.5).toFixed(1));
+      const inversionTempC = Number((14 + 9 * Math.cos((2 * Math.PI * i) / 365) + randomNormal(rng) * 2.0).toFixed(2));
+      const postScrubber = i >= 265 ? 1 : 0;
+      const co2eqTons = Number(
+        Math.max(
+          15,
+          110 +
+            0.85 * trafficIdx -
+            8.2 * windSpeedMs +
+            2.4 * Math.max(0, 14 - inversionTempC) -
+            (postScrubber ? 28 : 0) +
+            randomNormal(rng) * 4.2
+        ).toFixed(2)
+      );
+      rows.push({
+        timestamp: ts,
+        co2eq_tons: co2eqTons,
+        traffic_idx: trafficIdx,
+        wind_speed_ms: rng() < 0.015 ? null : windSpeedMs,
+        ambient_temp_c: inversionTempC,
+        is_weekend: isWeekend,
+        abatement_phase: postScrubber ? 'post_scrubber' : 'baseline_emissions',
+      });
+    }
+    const columns: ColumnConfig[] = [
+      { name: 'timestamp', role: 'time', suggestedRole: 'time', quantityType: 'index', aggregation: 'last', unit: 'UTC', unitFamily: 'time', availability: 'known_in_advance', dtype: 'datetime', roleMode: 'AUTO' },
+      { name: 'co2eq_tons', role: 'target', suggestedRole: 'target', quantityType: 'flow', aggregation: 'sum', unit: 'tCO2e', unitFamily: 'emissions', availability: 'observed_only', dtype: 'numeric', roleMode: 'AUTO' },
+      { name: 'traffic_idx', role: 'predictor', suggestedRole: 'predictor', quantityType: 'index', aggregation: 'mean', unit: 'idx', unitFamily: 'activity', availability: 'known_in_advance', dtype: 'numeric', roleMode: 'AUTO' },
+      { name: 'wind_speed_ms', role: 'predictor', suggestedRole: 'predictor', quantityType: 'rate', aggregation: 'mean', unit: 'm/s', unitFamily: 'wind', availability: 'known_in_advance', dtype: 'numeric', roleMode: 'AUTO' },
+      { name: 'ambient_temp_c', role: 'predictor', suggestedRole: 'predictor', quantityType: 'rate', aggregation: 'time_weighted_mean', unit: '°C', unitFamily: 'temperature', availability: 'known_in_advance', dtype: 'numeric', roleMode: 'AUTO' },
+      { name: 'is_weekend', role: 'predictor', suggestedRole: 'predictor', quantityType: 'index', aggregation: 'mean', unit: 'flag', unitFamily: 'schedule', availability: 'known_in_advance', dtype: 'numeric', roleMode: 'AUTO' },
+      { name: 'abatement_phase', role: 'group', suggestedRole: 'group', quantityType: 'index', aggregation: 'last', unit: 'label', unitFamily: 'cohort', availability: 'known_in_advance', dtype: 'categorical', roleMode: 'AUTO' },
+    ];
+    return {
+      id: 'synth-env-iso14064',
+      name: 'Industrial Facility GHG & Emissions Baseline (ISO 14064-2)',
+      domain: 'environment',
+      rows,
+      rawRowCount: rows.length,
+      sha256: deterministicHash(JSON.stringify(rows.slice(0, 20)) + rows.length),
+      columns,
+      temporal: {
+        sourceGranularity: 'daily',
+        targetGranularity: 'daily',
+        timezone: 'UTC',
+        baselineStart: rows[0].timestamp,
+        baselineEnd: rows[264].timestamp,
+        reportingStart: rows[265].timestamp,
+        reportingEnd: rows[rows.length - 1].timestamp,
+        dstPolicy: 'utc_store_flag_dst',
+        completenessThreshold: 0.8,
+      },
+      nonRoutineEvents: [
+        {
+          id: 'nre-env-1',
+          start: rows[265].timestamp,
+          end: rows[rows.length - 1].timestamp,
+          reason: 'Stack Scrubber & Heat Recovery Abatement (-28 tCO2e/day planted)',
+          treatment: 'flag_only',
+        },
+      ],
+      sourceNote: 'Synthetic ISO 14064-2 emissions baseline dataset (planted -28 tCO2e/day abatement).',
+    };
+  }
 
   if (preset === 'manufacturing_spc') {
     const rows: DatasetRow[] = [];

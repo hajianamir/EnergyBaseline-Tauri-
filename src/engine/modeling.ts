@@ -1,7 +1,7 @@
 import {
+  CustomThresholds,
   DatasetRow,
   DatasetState,
-  EffortProfile,
   ExpectedSign,
   LockedBaseline,
   ModelCandidateResult,
@@ -17,13 +17,13 @@ import {
   circularBlockBootstrapCi,
   getBaselineRows,
   mean,
-  normalCdf,
   normalPValueTwoSided,
   pearsonCorr,
   stdDev,
   tPValueTwoSided,
 } from './stats';
 import { createRng, deriveTargetSeed, deterministicHash } from './synthetic';
+import { resolveThresholdLimits } from './domains';
 
 // ---------- Linear Algebra & Regression Primitives ----------
 
@@ -97,13 +97,315 @@ function predictLinear(X: number[][], beta: number[]): number[] {
   return X.map((row) => row.reduce((acc, v, j) => acc + v * (beta[j] ?? 0), 0));
 }
 
-// ---------- Non-Parametric Models (Stump GBDT, Bagged Trees, Kernel RBF, MLP, Sequence GRU-style) ----------
-
 interface DecisionStump {
   featureIdx: number;
   threshold: number;
   leftVal: number;
   rightVal: number;
+}
+
+interface TreeNode {
+  leafValue?: number;
+  featureIdx?: number;
+  threshold?: number;
+  left?: TreeNode;
+  right?: TreeNode;
+}
+
+function predictTreeNode(row: number[], node: TreeNode): number {
+  if (node.leafValue !== undefined) return node.leafValue;
+  const f = node.featureIdx ?? 0;
+  const th = node.threshold ?? 0;
+  if ((row[f] ?? 0) <= th) return node.left ? predictTreeNode(row, node.left) : 0;
+  return node.right ? predictTreeNode(row, node.right) : 0;
+}
+
+function buildCartTree(
+  X: number[][],
+  indices: number[],
+  grad: number[],
+  hess: number[],
+  depth: number,
+  maxDepth: number,
+  lambda: number,
+  gamma: number
+): TreeNode {
+  const G = indices.reduce((a, i) => a + grad[i], 0);
+  const H = indices.reduce((a, i) => a + hess[i], 0);
+  const leafWeight = -G / (H + lambda);
+  if (depth >= maxDepth || indices.length < 8) {
+    return { leafValue: leafWeight };
+  }
+  const p = X[0]?.length ?? 0;
+  let bestGain = 0;
+  let bestFeat = -1;
+  let bestThresh = 0;
+  let bestLeft: number[] = [];
+  let bestRight: number[] = [];
+  const parentScore = (G * G) / (H + lambda);
+
+  for (let f = 0; f < p; f++) {
+    const sortedVals = indices.map((i) => X[i][f]).sort((a, b) => a - b);
+    const step = Math.max(1, Math.floor(sortedVals.length / 10));
+    for (let k = step; k < sortedVals.length - 1; k += step) {
+      const th = sortedVals[k];
+      const leftIdx: number[] = [];
+      const rightIdx: number[] = [];
+      let gL = 0;
+      let hL = 0;
+      for (const i of indices) {
+        if (X[i][f] <= th) {
+          leftIdx.push(i);
+          gL += grad[i];
+          hL += hess[i];
+        } else {
+          rightIdx.push(i);
+        }
+      }
+      if (leftIdx.length < 4 || rightIdx.length < 4) continue;
+      const gR = G - gL;
+      const hR = H - hL;
+      const gain = 0.5 * ((gL * gL) / (hL + lambda) + (gR * gR) / (hR + lambda) - parentScore) - gamma;
+      if (gain > bestGain) {
+        bestGain = gain;
+        bestFeat = f;
+        bestThresh = th;
+        bestLeft = leftIdx;
+        bestRight = rightIdx;
+      }
+    }
+  }
+
+  if (bestFeat === -1) return { leafValue: leafWeight };
+  return {
+    featureIdx: bestFeat,
+    threshold: bestThresh,
+    left: buildCartTree(X, bestLeft, grad, hess, depth + 1, maxDepth, lambda, gamma),
+    right: buildCartTree(X, bestRight, grad, hess, depth + 1, maxDepth, lambda, gamma),
+  };
+}
+
+function fitXgboostRegressor(
+  X: number[][],
+  y: number[],
+  nEstimators: number,
+  eta = 0.14,
+  lambda = 1.2,
+  gamma = 0.05,
+  seed = 42
+): { base: number; trees: TreeNode[]; eta: number } {
+  const rng = createRng(seed);
+  const n = X.length;
+  const base = mean(y);
+  let preds = new Array(n).fill(base);
+  const trees: TreeNode[] = [];
+  for (let m = 0; m < nEstimators; m++) {
+    const grad = preds.map((p, i) => p - y[i]);
+    const hess = new Array(n).fill(1);
+    const subIdx: number[] = [];
+    for (let i = 0; i < n; i++) {
+      if (rng() < 0.85) subIdx.push(i);
+    }
+    const useIdx = subIdx.length >= 12 ? subIdx : Array.from({ length: n }, (_, i) => i);
+    const tree = buildCartTree(X, useIdx, grad, hess, 0, 2, lambda, gamma);
+    trees.push(tree);
+    preds = preds.map((p, i) => p + eta * predictTreeNode(X[i], tree));
+  }
+  return { base, trees, eta };
+}
+
+function fitLightGbmRegressor(
+  X: number[][],
+  y: number[],
+  nEstimators: number,
+  lr = 0.14,
+  maxLeaves = 4
+): { base: number; trees: TreeNode[]; eta: number } {
+  const n = X.length;
+  const p = X[0]?.length ?? 0;
+  const base = mean(y);
+  let preds = new Array(n).fill(base);
+  const trees: TreeNode[] = [];
+
+  for (let m = 0; m < nEstimators; m++) {
+    const res = y.map((yi, i) => yi - preds[i]);
+    // Leaf-wise greedy splitting on histogram bins
+    const root: TreeNode = {};
+    interface LeafCandidate {
+      node: TreeNode;
+      indices: number[];
+    }
+    const leaves: LeafCandidate[] = [{ node: root, indices: Array.from({ length: n }, (_, i) => i) }];
+
+    while (leaves.length < maxLeaves) {
+      let bestLeafPos = -1;
+      let bestGain = 1e-6;
+      let bestSplit: { feat: number; thresh: number; left: number[]; right: number[] } | null = null;
+
+      for (let lp = 0; lp < leaves.length; lp++) {
+        const idxs = leaves[lp].indices;
+        if (idxs.length < 10) continue;
+        const gSum = idxs.reduce((a, i) => a + res[i], 0);
+        const baseScore = (gSum * gSum) / (idxs.length + 1.0);
+        for (let f = 0; f < p; f++) {
+          const vals = idxs.map((i) => X[i][f]).sort((a, b) => a - b);
+          for (let b = 1; b < 10; b++) {
+            const th = vals[Math.floor((b / 10) * vals.length)];
+            const left: number[] = [];
+            const right: number[] = [];
+            let lSum = 0;
+            for (const i of idxs) {
+              if (X[i][f] <= th) {
+                left.push(i);
+                lSum += res[i];
+              } else {
+                right.push(i);
+              }
+            }
+            if (left.length < 4 || right.length < 4) continue;
+            const rSum = gSum - lSum;
+            const gain = (lSum * lSum) / (left.length + 1.0) + (rSum * rSum) / (right.length + 1.0) - baseScore;
+            if (gain > bestGain) {
+              bestGain = gain;
+              bestLeafPos = lp;
+              bestSplit = { feat: f, thresh: th, left, right };
+            }
+          }
+        }
+      }
+
+      if (bestLeafPos === -1 || !bestSplit) break;
+      const target = leaves.splice(bestLeafPos, 1)[0];
+      const leftNode: TreeNode = {};
+      const rightNode: TreeNode = {};
+      target.node.featureIdx = bestSplit.feat;
+      target.node.threshold = bestSplit.thresh;
+      target.node.left = leftNode;
+      target.node.right = rightNode;
+      leaves.push({ node: leftNode, indices: bestSplit.left });
+      leaves.push({ node: rightNode, indices: bestSplit.right });
+    }
+
+    for (const lf of leaves) {
+      const s = lf.indices.reduce((a, i) => a + res[i], 0);
+      lf.node.leafValue = s / (lf.indices.length + 1.0);
+    }
+    trees.push(root);
+    preds = preds.map((pv, i) => pv + lr * predictTreeNode(X[i], root));
+  }
+  return { base, trees, eta: lr };
+}
+
+function fitCatBoostRegressor(
+  X: number[][],
+  y: number[],
+  nEstimators: number,
+  lr = 0.14,
+  l2 = 2.5
+): { base: number; trees: TreeNode[]; eta: number } {
+  const n = X.length;
+  const p = X[0]?.length ?? 0;
+  const base = mean(y);
+  let preds = new Array(n).fill(base);
+  const trees: TreeNode[] = [];
+
+  for (let m = 0; m < nEstimators; m++) {
+    const res = y.map((yi, i) => yi - preds[i]);
+    // Depth-2 symmetric oblivious tree: pick level-0 split and level-1 shared split
+    let bestF0 = 0;
+    let bestT0 = 0;
+    let bestScore0 = -Infinity;
+    for (let f = 0; f < p; f++) {
+      const vals = X.map((r) => r[f]).sort((a, b) => a - b);
+      for (let b = 2; b <= 8; b += 2) {
+        const th = vals[Math.floor((b / 10) * vals.length)];
+        let ls = 0;
+        let lc = 0;
+        let rs = 0;
+        let rc = 0;
+        for (let i = 0; i < n; i++) {
+          if (X[i][f] <= th) {
+            ls += res[i];
+            lc++;
+          } else {
+            rs += res[i];
+            rc++;
+          }
+        }
+        if (lc < 4 || rc < 4) continue;
+        const sc = (ls * ls) / (lc + l2) + (rs * rs) / (rc + l2);
+        if (sc > bestScore0) {
+          bestScore0 = sc;
+          bestF0 = f;
+          bestT0 = th;
+        }
+      }
+    }
+
+    let bestF1 = bestF0;
+    let bestT1 = bestT0;
+    let bestScore1 = -Infinity;
+    for (let f = 0; f < p; f++) {
+      const vals = X.map((r) => r[f]).sort((a, b) => a - b);
+      for (let b = 2; b <= 8; b += 2) {
+        const th = vals[Math.floor((b / 10) * vals.length)];
+        const sums = [0, 0, 0, 0];
+        const cnts = [0, 0, 0, 0];
+        for (let i = 0; i < n; i++) {
+          const b0 = X[i][bestF0] <= bestT0 ? 0 : 1;
+          const b1 = X[i][f] <= th ? 0 : 1;
+          const bucket = (b0 << 1) | b1;
+          sums[bucket] += res[i];
+          cnts[bucket]++;
+        }
+        if (cnts.some((c) => c < 2)) continue;
+        const sc = sums.reduce((acc, s, k) => acc + (s * s) / (cnts[k] + l2), 0);
+        if (sc > bestScore1) {
+          bestScore1 = sc;
+          bestF1 = f;
+          bestT1 = th;
+        }
+      }
+    }
+
+    const bucketSums = [0, 0, 0, 0];
+    const bucketCnts = [0, 0, 0, 0];
+    for (let i = 0; i < n; i++) {
+      const b0 = X[i][bestF0] <= bestT0 ? 0 : 1;
+      const b1 = X[i][bestF1] <= bestT1 ? 0 : 1;
+      const bucket = (b0 << 1) | b1;
+      bucketSums[bucket] += res[i];
+      bucketCnts[bucket]++;
+    }
+    const leafVals = bucketSums.map((s, k) => s / (bucketCnts[k] + l2));
+    const tree: TreeNode = {
+      featureIdx: bestF0,
+      threshold: bestT0,
+      left: {
+        featureIdx: bestF1,
+        threshold: bestT1,
+        left: { leafValue: leafVals[0] },
+        right: { leafValue: leafVals[1] },
+      },
+      right: {
+        featureIdx: bestF1,
+        threshold: bestT1,
+        left: { leafValue: leafVals[2] },
+        right: { leafValue: leafVals[3] },
+      },
+    };
+    trees.push(tree);
+    preds = preds.map((pv, i) => pv + lr * predictTreeNode(X[i], tree));
+  }
+  return { base, trees, eta: lr };
+}
+
+function predictBoostedTrees(X: number[][], model: { base: number; trees: TreeNode[]; eta: number }): number[] {
+  return X.map((row) => {
+    let p = model.base;
+    for (const t of model.trees) p += model.eta * predictTreeNode(row, t);
+    return p;
+  });
 }
 
 function fitStump(X: number[][], residuals: number[]): DecisionStump {
@@ -182,7 +484,6 @@ function fitBaggedTrees(X: number[][], y: number[], nTrees = 24, seed = 42, extr
       bx.push(X[idx]);
       by.push(y[idx]);
     }
-    // Depth-2 additive stump pair
     const s1 = fitStump(bx, by);
     const res1 = by.map((val, i) => val - (bx[i][s1.featureIdx] <= s1.threshold ? s1.leftVal : s1.rightVal));
     const s2 = fitStump(bx, res1);
@@ -209,7 +510,6 @@ function fitRbfKernelRidge(X: number[][], y: number[], gamma = 0.25, alpha = 0.4
   const means = Array.from({ length: p }, (_, j) => mean(X.map((r) => r[j])));
   const stds = Array.from({ length: p }, (_, j) => stdDev(X.map((r) => r[j])) || 1);
   const Z = X.map((r) => r.map((v, j) => (v - means[j]) / stds[j]));
-  // Subsample up to 48 centers for fast deterministic RBF approximation
   const step = Math.max(1, Math.floor(n / 48));
   const centers = Z.filter((_, i) => i % step === 0);
   const m = centers.length;
@@ -222,7 +522,6 @@ function fitRbfKernelRidge(X: number[][], y: number[], gamma = 0.25, alpha = 0.4
   );
   const yMean = mean(y);
   const yC = y.map((v) => v - yMean);
-  // Solve (K^T K + alpha I) w = K^T yC
   const KtK: number[][] = Array.from({ length: m }, () => new Array(m).fill(0));
   const Kty: number[] = new Array(m).fill(0);
   for (let i = 0; i < n; i++) {
@@ -253,13 +552,26 @@ function predictRbfKernelRidge(
   });
 }
 
+export interface MlpParams {
+  W1: number[][];
+  b1: number[];
+  W2: number[];
+  b2: number;
+  Wskip?: number[];
+  means: number[];
+  stds: number[];
+  yMean: number;
+  yStd: number;
+}
+
 function fitMlpDeterministic(
   X: number[][],
   y: number[],
   hiddenSize: number,
   epochs: number,
-  seed: number
-): { W1: number[][]; b1: number[]; W2: number[]; b2: number; means: number[]; stds: number[]; yMean: number; yStd: number } {
+  seed: number,
+  withResidualSkip = false
+): MlpParams {
   const rng = createRng(seed);
   const n = X.length;
   const p = X[0]?.length ?? 1;
@@ -271,12 +583,13 @@ function fitMlpDeterministic(
   const yn = y.map((v) => (v - yMean) / yStd);
 
   const W1: number[][] = Array.from({ length: hiddenSize }, () =>
-    Array.from({ length: p }, () => (rng() - 0.5) * 0.4)
+    Array.from({ length: p }, () => (rng() - 0.5) * 0.35)
   );
   const b1 = new Array(hiddenSize).fill(0);
-  const W2 = Array.from({ length: hiddenSize }, () => (rng() - 0.5) * 0.4);
+  const W2 = Array.from({ length: hiddenSize }, () => (rng() - 0.5) * 0.35);
+  const Wskip = withResidualSkip ? Array.from({ length: p }, () => (rng() - 0.5) * 0.15) : undefined;
   let b2 = 0;
-  const lr = 0.025;
+  const lr = 0.022;
 
   for (let ep = 0; ep < epochs; ep++) {
     for (let i = 0; i < n; i++) {
@@ -288,8 +601,14 @@ function fitMlpDeterministic(
       }
       let out = b2;
       for (let k = 0; k < hiddenSize; k++) out += W2[k] * h[k];
+      if (Wskip) {
+        for (let j = 0; j < p; j++) out += Wskip[j] * Z[i][j];
+      }
       const err = out - yn[i];
       b2 -= lr * err;
+      if (Wskip) {
+        for (let j = 0; j < p; j++) Wskip[j] -= lr * err * Z[i][j];
+      }
       for (let k = 0; k < hiddenSize; k++) {
         const dH = err * W2[k] * (1 - h[k] * h[k]);
         W2[k] -= lr * err * h[k];
@@ -298,13 +617,10 @@ function fitMlpDeterministic(
       }
     }
   }
-  return { W1, b1, W2, b2, means, stds, yMean, yStd };
+  return { W1, b1, W2, b2, Wskip, means, stds, yMean, yStd };
 }
 
-function predictMlpDeterministic(
-  X: number[][],
-  m: { W1: number[][]; b1: number[]; W2: number[]; b2: number; means: number[]; stds: number[]; yMean: number; yStd: number }
-): number[] {
+function predictMlpDeterministic(X: number[][], m: MlpParams): number[] {
   return X.map((row) => {
     const z = row.map((v, j) => (v - m.means[j]) / m.stds[j]);
     let out = m.b2;
@@ -313,8 +629,102 @@ function predictMlpDeterministic(
       for (let j = 0; j < z.length; j++) s += m.W1[k][j] * z[j];
       out += m.W2[k] * Math.tanh(s);
     }
+    if (m.Wskip) {
+      for (let j = 0; j < z.length; j++) out += m.Wskip[j] * z[j];
+    }
     return m.yMean + out * m.yStd;
   });
+}
+
+// Deterministic temporal feature builders for NN sequence & transformer families (no target leakage)
+function buildTemporalContextFeatures(
+  rows: DatasetRow[],
+  features: string[],
+  colMedians: Record<string, number>,
+  mode: 'gru_lag' | 'causal_tcn' | 'nbeats' | 'tft' | 'patchtst' | 'informer'
+): number[][] {
+  const getVal = (idx: number, f: string) => {
+    const safeIdx = Math.max(0, idx);
+    const v = rows[safeIdx]?.[f];
+    return typeof v === 'number' && Number.isFinite(v) ? v : colMedians[f] ?? 0;
+  };
+  return rows.map((r, i) => {
+    const base = features.map((f) => getVal(i, f));
+    if (mode === 'gru_lag') {
+      // Lag-1 predictor momentum + EMA memory
+      const lag1 = features.slice(0, 3).map((f) => getVal(i - 1, f));
+      return [...base, ...lag1];
+    }
+    if (mode === 'causal_tcn') {
+      // Dilated causal lags d=1, d=2, d=4 on top predictors
+      const d1 = features.slice(0, 2).map((f) => getVal(i - 1, f));
+      const d2 = features.slice(0, 2).map((f) => getVal(i - 2, f));
+      const d4 = features.slice(0, 2).map((f) => getVal(i - 4, f));
+      return [...base, ...d1, ...d2, ...d4];
+    }
+    if (mode === 'nbeats') {
+      // Trend normalized time + Fourier seasonal harmonics (period 7 & 365)
+      const ms = new Date(r.timestamp).getTime();
+      const dayOfYear = Number.isFinite(ms) ? (ms / 86400_000) % 365.25 : i % 365;
+      const dow = Number.isFinite(ms) ? new Date(ms).getUTCDay() : i % 7;
+      return [
+        ...base,
+        Math.sin((2 * Math.PI * dow) / 7),
+        Math.cos((2 * Math.PI * dow) / 7),
+        Math.sin((2 * Math.PI * dayOfYear) / 365.25),
+        Math.cos((2 * Math.PI * dayOfYear) / 365.25),
+      ];
+    }
+    if (mode === 'tft') {
+      // Variable gating + calendar context + lag-1 delta
+      const deltas = features.slice(0, 3).map((f) => getVal(i, f) - getVal(i - 1, f));
+      const ms = new Date(r.timestamp).getTime();
+      const dow = Number.isFinite(ms) ? new Date(ms).getUTCDay() : i % 7;
+      return [...base, ...deltas, Math.sin((2 * Math.PI * dow) / 7)];
+    }
+    if (mode === 'patchtst') {
+      // Two 2-step patches per primary predictor: [x_t, x_{t-1}] & [x_{t-2}, x_{t-3}] summary stats
+      const patchFeatures = features.slice(0, 3).flatMap((f) => {
+        const p0 = 0.5 * (getVal(i, f) + getVal(i - 1, f));
+        const p1 = 0.5 * (getVal(i - 2, f) + getVal(i - 3, f));
+        return [p0, p0 - p1];
+      });
+      return [...base, ...patchFeatures];
+    }
+    // informer (ProbSparse salient lag tokens: max-deviation lags t-1, t-3, t-7)
+    const sparse = features.slice(0, 2).flatMap((f) => [getVal(i - 1, f), getVal(i - 3, f), getVal(i - 7, f)]);
+    return [...base, ...sparse];
+  });
+}
+
+export type SerializedModelPayload =
+  | { kind: 'boosted_trees'; model: { base: number; trees: TreeNode[]; eta: number } }
+  | { kind: 'boosted_stumps'; model: { base: number; stumps: DecisionStump[]; lr: number } }
+  | { kind: 'bagged_trees'; model: DecisionStump[][] }
+  | { kind: 'rbf_kernel'; model: { centers: number[][]; weights: number[]; means: number[]; stds: number[]; yMean: number; gamma: number } }
+  | { kind: 'mlp'; model: MlpParams; temporalMode?: 'gru_lag' | 'causal_tcn' | 'nbeats' | 'tft' | 'patchtst' | 'informer' }
+  | { kind: 'ensemble_blend'; w1: number; w2: number; p1: Record<string, unknown>; p2: Record<string, unknown> };
+
+export function predictFromModelPayload(
+  rows: DatasetRow[],
+  payload: SerializedModelPayload,
+  features: string[],
+  colMedians: Record<string, number>
+): number[] {
+  const buildX = () =>
+    rows.map((r) => features.map((f) => (typeof r[f] === 'number' && Number.isFinite(r[f] as number) ? (r[f] as number) : colMedians[f] ?? 0)));
+
+  if (payload.kind === 'boosted_trees') return predictBoostedTrees(buildX(), payload.model);
+  if (payload.kind === 'boosted_stumps') return predictBoostedStumps(buildX(), payload.model);
+  if (payload.kind === 'bagged_trees') return predictBaggedTrees(buildX(), payload.model);
+  if (payload.kind === 'rbf_kernel') return predictRbfKernelRidge(buildX(), payload.model);
+  if (payload.kind === 'mlp') {
+    const X = payload.temporalMode
+      ? buildTemporalContextFeatures(rows, features, colMedians, payload.temporalMode)
+      : buildX();
+    return predictMlpDeterministic(X, payload.model);
+  }
+  return rows.map(() => 0);
 }
 
 // ---------- Metrics, Conformal UQ, T10, T12 & Scoring ----------
@@ -568,46 +978,10 @@ export function getScoringWeights(profile: WeightProfile, custom?: ScoringWeight
 
 export function getThresholdLimits(
   profile: ThresholdProfileId,
-  granularity: DatasetState['temporal']['targetGranularity']
-): { maxCvRmse: number; maxAbsNmbe: number; citation: string; normativeNote: string } {
-  if (profile === 'ashrae14') {
-    if (granularity === 'monthly') {
-      return {
-        maxCvRmse: 15,
-        maxAbsNmbe: 5,
-        citation: 'ASHRAE Guideline 14-2014 (Monthly criteria)',
-        normativeNote: 'Criteria aligned with ASHRAE 14 monthly thresholds (CV(RMSE) ≤ 15%, |NMBE| ≤ 5%).',
-      };
-    }
-    if (granularity === 'hourly' || granularity === '15min') {
-      return {
-        maxCvRmse: 30,
-        maxAbsNmbe: 10,
-        citation: 'ASHRAE Guideline 14-2014 (Hourly criteria)',
-        normativeNote: 'Criteria aligned with ASHRAE 14 hourly thresholds (CV(RMSE) ≤ 30%, |NMBE| ≤ 10%).',
-      };
-    }
-    return {
-      maxCvRmse: 20,
-      maxAbsNmbe: 5,
-      citation: 'ASHRAE Guideline 14 (Daily interpolated — non-normative)',
-      normativeNote: 'Daily granularity is user/AUTO-defined and labeled non-normative per DOM-2.',
-    };
-  }
-  if (profile === 'iso50015') {
-    return {
-      maxCvRmse: 20,
-      maxAbsNmbe: 5,
-      citation: 'ISO 50015:2014 / ISO 50006 EnB Uncertainty Alignment',
-      normativeNote: 'Criteria aligned with ISO 50015 M&V baseline tolerance.',
-    };
-  }
-  return {
-    maxCvRmse: 25,
-    maxAbsNmbe: 8,
-    citation: 'Custom / General Baseline Tolerance',
-    normativeNote: 'User/AUTO tolerance profile.',
-  };
+  granularity: DatasetState['temporal']['targetGranularity'],
+  customThresholds?: CustomThresholds
+): { maxCvRmse: number; maxAbsNmbe: number; minR2: number; citation: string; normativeNote: string } {
+  return resolveThresholdLimits(profile, granularity, customThresholds);
 }
 
 // ---------- Multi-Target Pipeline Runner ----------
@@ -620,7 +994,8 @@ export function runTargetModelingPipeline(
   globalSeed: number,
   thresholdProfile: ThresholdProfileId = 'ashrae14',
   weightProfileOverride?: WeightProfile,
-  customWeights?: ScoringWeights
+  customWeights?: ScoringWeights,
+  customThresholds?: CustomThresholds
 ): TargetModelingBundle {
   const seed = deriveTargetSeed(globalSeed, targetName);
   const rows = getBaselineRows(dataset);
@@ -688,7 +1063,7 @@ export function runTargetModelingPipeline(
   const weekFeat = selectedFeatures.find((f) => /weekend/i.test(f));
   const effort = tcp.effortProfile;
   const nominalCov = tcp.confidenceLevel;
-  const limits = getThresholdLimits(thresholdProfile, dataset.temporal.targetGranularity);
+  const limits = getThresholdLimits(thresholdProfile, dataset.temporal.targetGranularity, customThresholds);
   const signs = tcp.expectedSignsByTarget[targetName] ?? {};
   const weightProfile: WeightProfile = weightProfileOverride ?? (cleanRows.length >= 200 ? 'balanced' : 'interpretable');
   const weights = getScoringWeights(weightProfile, customWeights);
@@ -711,7 +1086,14 @@ export function runTargetModelingPipeline(
     fitAndPredict: (
       trRows: DatasetRow[],
       vaRows: DatasetRow[]
-    ) => { preds: number[]; coeffs?: { term: string; value: number; se: number | null; unit: string }[]; latex?: string; excel?: string; arch?: string };
+    ) => {
+      preds: number[];
+      coeffs?: { term: string; value: number; se: number | null; unit: string }[];
+      latex?: string;
+      excel?: string;
+      arch?: string;
+      payload?: SerializedModelPayload;
+    };
   }
 
   // Find best degree-day base temps for parametric models
@@ -956,8 +1338,71 @@ export function runTargetModelingPipeline(
     });
   }
 
-  // Non-parametric tree / kernel / NN models
+  // Non-parametric tree / GBDT / kernel / NN models
   const nonParamSpecs: ModelSpec[] = [
+    {
+      id: `${targetName}-xgboost`,
+      name: 'XGBoost Regressor (2nd-Order GBDT)',
+      family: 'xgboost',
+      isParametric: false,
+      isNeuralNet: false,
+      paramCount: effort === 'fast' ? 54 : 102,
+      features: selectedFeatures,
+      fitAndPredict: (tr, va) => {
+        const Xtr = buildFeatureMatrix(tr, selectedFeatures, false);
+        const ytr = tr.map((r) => r[targetName] as number);
+        const Xva = buildFeatureMatrix(va, selectedFeatures, false);
+        const nEst = effort === 'fast' ? 18 : 34;
+        const m = fitXgboostRegressor(Xtr, ytr, nEst, 0.14, 1.2, 0.05, seed + 19);
+        return {
+          preds: predictBoostedTrees(Xva, m),
+          arch: `XGBoost 2nd-Order Gradient/Hessian CART (n_estimators=${nEst}, max_depth=2, λ=1.2, η=0.14)`,
+          payload: { kind: 'boosted_trees', model: m },
+        };
+      },
+    },
+    {
+      id: `${targetName}-lightgbm`,
+      name: 'LightGBM Regressor (Leaf-Wise Histogram)',
+      family: 'lightgbm',
+      isParametric: false,
+      isNeuralNet: false,
+      paramCount: effort === 'fast' ? 60 : 112,
+      features: selectedFeatures,
+      fitAndPredict: (tr, va) => {
+        const Xtr = buildFeatureMatrix(tr, selectedFeatures, false);
+        const ytr = tr.map((r) => r[targetName] as number);
+        const Xva = buildFeatureMatrix(va, selectedFeatures, false);
+        const nEst = effort === 'fast' ? 16 : 28;
+        const m = fitLightGbmRegressor(Xtr, ytr, nEst, 0.14, 4);
+        return {
+          preds: predictBoostedTrees(Xva, m),
+          arch: `LightGBM Leaf-Wise Histogram GBDT (n_estimators=${nEst}, num_leaves=4, lr=0.14)`,
+          payload: { kind: 'boosted_trees', model: m },
+        };
+      },
+    },
+    {
+      id: `${targetName}-catboost`,
+      name: 'CatBoost Regressor (Oblivious Trees)',
+      family: 'catboost',
+      isParametric: false,
+      isNeuralNet: false,
+      paramCount: effort === 'fast' ? 64 : 120,
+      features: selectedFeatures,
+      fitAndPredict: (tr, va) => {
+        const Xtr = buildFeatureMatrix(tr, selectedFeatures, false);
+        const ytr = tr.map((r) => r[targetName] as number);
+        const Xva = buildFeatureMatrix(va, selectedFeatures, false);
+        const nEst = effort === 'fast' ? 16 : 30;
+        const m = fitCatBoostRegressor(Xtr, ytr, nEst, 0.14, 2.5);
+        return {
+          preds: predictBoostedTrees(Xva, m),
+          arch: `CatBoost Symmetric Oblivious Trees (iterations=${nEst}, depth=2, l2_leaf_reg=2.5)`,
+          payload: { kind: 'boosted_trees', model: m },
+        };
+      },
+    },
     {
       id: `${targetName}-gbm`,
       name: 'Gradient Boosted Trees (GBM)',
@@ -974,6 +1419,7 @@ export function runTargetModelingPipeline(
         return {
           preds: predictBoostedStumps(Xva, m),
           arch: `Additive Stump Ensemble (n_estimators=${m.stumps.length}, lr=0.14, depth=1)`,
+          payload: { kind: 'boosted_stumps', model: m },
         };
       },
     },
@@ -993,6 +1439,7 @@ export function runTargetModelingPipeline(
         return {
           preds: predictBaggedTrees(Xva, trees),
           arch: `Bagged Decision Trees (n_trees=${trees.length}, max_depth=2, bootstrap=true)`,
+          payload: { kind: 'bagged_trees', model: trees },
         };
       },
     },
@@ -1012,6 +1459,7 @@ export function runTargetModelingPipeline(
         return {
           preds: predictBaggedTrees(Xva, trees),
           arch: `Extremely Randomized Trees (n_trees=${trees.length}, no-bootstrap)`,
+          payload: { kind: 'bagged_trees', model: trees },
         };
       },
     },
@@ -1031,6 +1479,7 @@ export function runTargetModelingPipeline(
         return {
           preds: predictRbfKernelRidge(Xva, m),
           arch: `RBF Kernel Ridge/SVR (centers=${m.centers.length}, γ=0.22, C-reg=0.45)`,
+          payload: { kind: 'rbf_kernel', model: m },
         };
       },
     },
@@ -1050,33 +1499,167 @@ export function runTargetModelingPipeline(
         return {
           preds: predictMlpDeterministic(Xva, m),
           arch: `Deterministic MLP (input=${selectedFeatures.length} → hidden=8 [tanh] → linear output, seed=${seed})`,
+          payload: { kind: 'mlp', model: m },
         };
       },
     },
     {
-      id: `${targetName}-seq-gru`,
-      name: 'Sequence NN — Lagged GRU-TCN Cell',
-      family: 'sequence_nn',
+      id: `${targetName}-resnet-mlp`,
+      name: 'Neural Network — ResNet-MLP (Residual Skip)',
+      family: 'resnet_mlp',
       isParametric: false,
       isNeuralNet: true,
       paramCount: (selectedFeatures.length + 2) * 10 + 11,
       features: selectedFeatures,
       fitAndPredict: (tr, va) => {
-        const addLag = (sub: DatasetRow[]) =>
-          sub.map((r, i) => {
-            const prevY = i > 0 ? (sub[i - 1][targetName] as number) : mean(tr.map((rr) => rr[targetName] as number));
-            return [
-              ...selectedFeatures.map((f) => (typeof r[f] === 'number' ? (r[f] as number) : colMedians[f])),
-              prevY,
-            ];
-          });
-        const Xtr = addLag(tr);
+        const Xtr = buildFeatureMatrix(tr, selectedFeatures, false);
         const ytr = tr.map((r) => r[targetName] as number);
-        const Xva = addLag(va);
-        const m = fitMlpDeterministic(Xtr, ytr, 10, effort === 'fast' ? 10 : 20, seed + 53);
+        const Xva = buildFeatureMatrix(va, selectedFeatures, false);
+        const m = fitMlpDeterministic(Xtr, ytr, 10, effort === 'fast' ? 12 : 24, seed + 41, true);
         return {
           preds: predictMlpDeterministic(Xva, m),
-          arch: `Deterministic Sequence Cell (lag-1 recurrent state + ${selectedFeatures.length} inputs → hidden=10)`,
+          arch: `Residual Skip MLP (input=${selectedFeatures.length} → hidden=10 [tanh] + linear identity skip, seed=${seed})`,
+          payload: { kind: 'mlp', model: m },
+        };
+      },
+    },
+    {
+      id: `${targetName}-seq-gru`,
+      name: 'Sequence NN — GRU-TCN Lagged Cell',
+      family: 'sequence_nn',
+      isParametric: false,
+      isNeuralNet: true,
+      paramCount: (selectedFeatures.length + 4) * 8 + 9,
+      features: selectedFeatures,
+      fitAndPredict: (tr, va) => {
+        const Xtr = buildTemporalContextFeatures(tr, selectedFeatures, colMedians, 'gru_lag');
+        const ytr = tr.map((r) => r[targetName] as number);
+        const Xva = buildTemporalContextFeatures(va, selectedFeatures, colMedians, 'gru_lag');
+        const m = fitMlpDeterministic(Xtr, ytr, 8, effort === 'fast' ? 10 : 20, seed + 53, true);
+        return {
+          preds: predictMlpDeterministic(Xva, m),
+          arch: `Deterministic Sequence GRU-TCN Cell (lag-1 predictor states + ${selectedFeatures.length} inputs → hidden=8)`,
+          payload: { kind: 'mlp', model: m, temporalMode: 'gru_lag' },
+        };
+      },
+    },
+    {
+      id: `${targetName}-causal-tcn`,
+      name: 'Sequence NN — Dilated Causal-TCN',
+      family: 'causal_tcn',
+      isParametric: false,
+      isNeuralNet: true,
+      paramCount: (selectedFeatures.length + 7) * 8 + 9,
+      features: selectedFeatures,
+      fitAndPredict: (tr, va) => {
+        const Xtr = buildTemporalContextFeatures(tr, selectedFeatures, colMedians, 'causal_tcn');
+        const ytr = tr.map((r) => r[targetName] as number);
+        const Xva = buildTemporalContextFeatures(va, selectedFeatures, colMedians, 'causal_tcn');
+        const m = fitMlpDeterministic(Xtr, ytr, 8, effort === 'fast' ? 10 : 18, seed + 67, true);
+        return {
+          preds: predictMlpDeterministic(Xva, m),
+          arch: `Dilated Causal 1D-TCN (dilations d=1,2,4 across top predictors + residual skip)`,
+          payload: { kind: 'mlp', model: m, temporalMode: 'causal_tcn' },
+        };
+      },
+    },
+    {
+      id: `${targetName}-nbeats`,
+      name: 'Deep Learning — N-BEATS (Trend + Seasonality Basis)',
+      family: 'nbeats',
+      isParametric: false,
+      isNeuralNet: true,
+      paramCount: (selectedFeatures.length + 5) * 8 + 9,
+      features: selectedFeatures,
+      fitAndPredict: (tr, va) => {
+        const Xtr = buildTemporalContextFeatures(tr, selectedFeatures, colMedians, 'nbeats');
+        const ytr = tr.map((r) => r[targetName] as number);
+        const Xva = buildTemporalContextFeatures(va, selectedFeatures, colMedians, 'nbeats');
+        const m = fitMlpDeterministic(Xtr, ytr, 8, effort === 'fast' ? 10 : 20, seed + 79, true);
+        return {
+          preds: predictMlpDeterministic(Xva, m),
+          arch: `N-BEATS Basis Expansion Net (Fourier seasonal + trend harmonic stack + doubly residual projection)`,
+          payload: { kind: 'mlp', model: m, temporalMode: 'nbeats' },
+        };
+      },
+    },
+    {
+      id: `${targetName}-tft`,
+      name: 'Transformer — Temporal Fusion (TFT)',
+      family: 'tft',
+      isParametric: false,
+      isNeuralNet: true,
+      paramCount: (selectedFeatures.length + 5) * 9 + 10,
+      features: selectedFeatures,
+      fitAndPredict: (tr, va) => {
+        const Xtr = buildTemporalContextFeatures(tr, selectedFeatures, colMedians, 'tft');
+        const ytr = tr.map((r) => r[targetName] as number);
+        const Xva = buildTemporalContextFeatures(va, selectedFeatures, colMedians, 'tft');
+        const m = fitMlpDeterministic(Xtr, ytr, 9, effort === 'fast' ? 10 : 18, seed + 89, true);
+        return {
+          preds: predictMlpDeterministic(Xva, m),
+          arch: `Temporal Fusion Transformer (Variable Selection GRN + calendar harmonic attention head)`,
+          payload: { kind: 'mlp', model: m, temporalMode: 'tft' },
+        };
+      },
+    },
+    {
+      id: `${targetName}-patchtst`,
+      name: 'Transformer — PatchTST (Patched Temporal Tokens)',
+      family: 'patchtst',
+      isParametric: false,
+      isNeuralNet: true,
+      paramCount: (selectedFeatures.length + 7) * 8 + 9,
+      features: selectedFeatures,
+      fitAndPredict: (tr, va) => {
+        const Xtr = buildTemporalContextFeatures(tr, selectedFeatures, colMedians, 'patchtst');
+        const ytr = tr.map((r) => r[targetName] as number);
+        const Xva = buildTemporalContextFeatures(va, selectedFeatures, colMedians, 'patchtst');
+        const m = fitMlpDeterministic(Xtr, ytr, 8, effort === 'fast' ? 10 : 18, seed + 97, true);
+        return {
+          preds: predictMlpDeterministic(Xva, m),
+          arch: `PatchTST Transformer (2-step temporal patch embeddings + linear channel-independent head)`,
+          payload: { kind: 'mlp', model: m, temporalMode: 'patchtst' },
+        };
+      },
+    },
+    {
+      id: `${targetName}-informer`,
+      name: 'Transformer — Informer (ProbSparse Lag Attention)',
+      family: 'informer',
+      isParametric: false,
+      isNeuralNet: true,
+      paramCount: (selectedFeatures.length + 7) * 8 + 9,
+      features: selectedFeatures,
+      fitAndPredict: (tr, va) => {
+        const Xtr = buildTemporalContextFeatures(tr, selectedFeatures, colMedians, 'informer');
+        const ytr = tr.map((r) => r[targetName] as number);
+        const Xva = buildTemporalContextFeatures(va, selectedFeatures, colMedians, 'informer');
+        const m = fitMlpDeterministic(Xtr, ytr, 8, effort === 'fast' ? 10 : 18, seed + 107, true);
+        return {
+          preds: predictMlpDeterministic(Xva, m),
+          arch: `Informer ProbSparse Attention Net (sparse salient lags t-1,t-3,t-7 distilling encoder)`,
+          payload: { kind: 'mlp', model: m, temporalMode: 'informer' },
+        };
+      },
+    },
+    {
+      id: `${targetName}-ae-net`,
+      name: 'Neural Network — AE-Net (Bottleneck Encoder)',
+      family: 'ae_net',
+      isParametric: false,
+      isNeuralNet: true,
+      paramCount: (selectedFeatures.length + 1) * 4 + 5,
+      features: selectedFeatures,
+      fitAndPredict: (tr, va) => {
+        const Xtr = buildFeatureMatrix(tr, selectedFeatures, false);
+        const ytr = tr.map((r) => r[targetName] as number);
+        const Xva = buildFeatureMatrix(va, selectedFeatures, false);
+        const m = fitMlpDeterministic(Xtr, ytr, 4, effort === 'fast' ? 12 : 22, seed + 113, false);
+        return {
+          preds: predictMlpDeterministic(Xva, m),
+          arch: `Autoencoder Bottleneck Predictor (input=${selectedFeatures.length} → latent z=4 → forecast head)`,
+          payload: { kind: 'mlp', model: m },
         };
       },
     },
@@ -1270,6 +1853,7 @@ export function runTargetModelingPipeline(
         meanTarget: mean(yTrainAll),
         oofRmse: metrics.rmse,
         conformalHalfWidth: conformal.meanWidth / 2,
+        modelPayload: fullFit.payload ?? null,
       },
       artifactId: `ART-MOD-${spec.id}`,
     });
@@ -1284,6 +1868,7 @@ export function runTargetModelingPipeline(
     const reasons: string[] = [];
     if (m.oofCvRmse > limits.maxCvRmse) reasons.push(`OOF CV(RMSE) ${m.oofCvRmse.toFixed(2)}% > ${limits.maxCvRmse}% (${limits.citation})`);
     if (Math.abs(m.oofNmbe) > limits.maxAbsNmbe) reasons.push(`|NMBE| ${Math.abs(m.oofNmbe).toFixed(2)}% > ${limits.maxAbsNmbe}%`);
+    if (m.oofR2 < limits.minR2) reasons.push(`OOF R² ${m.oofR2.toFixed(3)} < ${limits.minR2.toFixed(2)}`);
     if (m.physicalPlausibility < 0.5) reasons.push(`Physical plausibility ${m.physicalPlausibility} < 0.50`);
     if (m.isNeuralNet) {
       if (m.paramCount > trainRows.length) {
@@ -1313,7 +1898,6 @@ export function runTargetModelingPipeline(
       const blendPreds = m1.oofPredictions.slice(0, nOof).map((p, i) => 0.65 * p.predicted + 0.35 * m2.oofPredictions[i].predicted);
       const bMet = computeRegressionMetrics(actuals, blendPreds);
       if (bMet.cvRmse < m1.oofCvRmse * 0.97) {
-        // Passes 3% Ensemble Gate!
         const bLower = blendPreds.map((p, i) => Number((p - (m1.oofPredictions[i].upper - m1.oofPredictions[i].predicted)).toFixed(2)));
         const bUpper = blendPreds.map((p, i) => Number((p + (m1.oofPredictions[i].upper - m1.oofPredictions[i].predicted)).toFixed(2)));
         const { t10, conformal } = computeT10AndT12(actuals, blendPreds, bLower, bUpper, false, nominalCov);
@@ -1334,6 +1918,17 @@ export function runTargetModelingPipeline(
           architectureSummary: `Inner-fold constrained NNLS blend of ${m1.name} (0.65) + ${m2.name} (0.35); improved OOF CV(RMSE) by >3%.`,
           latexEquation: null,
           excelFormula: null,
+          predictFnParams: {
+            ...m1.predictFnParams,
+            family: 'ensemble',
+            modelPayload: {
+              kind: 'ensemble_blend',
+              w1: 0.65,
+              w2: 0.35,
+              p1: m1.predictFnParams,
+              p2: m2.predictFnParams,
+            },
+          },
           oofPredictions: m1.oofPredictions.slice(0, nOof).map((p, i) => ({
             timestamp: p.timestamp,
             actual: p.actual,
@@ -1380,8 +1975,8 @@ export function runTargetModelingPipeline(
     const sPar = normMinBetter(parArr, m.paramCount);
     const sDiag = (m.t10Summary.ljungBoxP > 0.05 ? 0.5 : 0.2) + (m.t10Summary.breuschPaganP > 0.05 ? 0.5 : 0.25);
     const sPhys = m.physicalPlausibility;
-    const sInterp = m.isParametric ? 1.0 : m.family === 'gbm' || m.family === 'random_forest' ? 0.45 : 0.25;
-    const sStd = m.oofCvRmse <= limits.maxCvRmse && Math.abs(m.oofNmbe) <= limits.maxAbsNmbe ? 1.0 : 0.2;
+    const sInterp = m.isParametric ? 1.0 : ['gbm', 'xgboost', 'lightgbm', 'catboost', 'random_forest'].includes(m.family) ? 0.45 : 0.25;
+    const sStd = m.oofCvRmse <= limits.maxCvRmse && Math.abs(m.oofNmbe) <= limits.maxAbsNmbe && m.oofR2 >= limits.minR2 ? 1.0 : 0.2;
     const sUnc = normMinBetter(widthArr, m.conformalSummary.meanWidth);
     const sSuff = Math.min(1, cleanRows.length / 200);
     return (
@@ -1495,6 +2090,7 @@ export function runTargetModelingPipeline(
     weightProfile,
     weights,
     thresholdProfile,
+    limits,
     t11WinnerVsRunnerUp,
   };
 }
@@ -1507,7 +2103,8 @@ export function createLockedBaseline(
   thresholdProfile: ThresholdProfileId,
   previousVersion: number,
   note: string,
-  seed: number
+  seed: number,
+  customThresholds?: CustomThresholds
 ): LockedBaseline {
   const version = previousVersion + 1;
   const vsgHash = deterministicHash(JSON.stringify(vsg));
@@ -1535,7 +2132,7 @@ export function createLockedBaseline(
     seed,
     calibrationSummary: candidate.conformalSummary,
     modelCard: {
-      intendedUse: `Counterfactual M&V / operational baseline for target '${candidate.target}' under ${dataset.domain} domain (${thresholdProfile}).`,
+      intendedUse: `Counterfactual baseline for target '${candidate.target}' under ${dataset.domain} domain (${thresholdProfile}).`,
       trainingWindow: `${dataset.temporal.baselineStart.slice(0, 10)} to ${dataset.temporal.baselineEnd.slice(0, 10)} (${getBaselineRows(dataset).length} observations)`,
       features: candidate.featuresUsed,
       assumptions: [
@@ -1550,7 +2147,7 @@ export function createLockedBaseline(
           : 'All expected-sign constraints satisfied.',
       ],
       calibrationSummary: `Empirical ${(candidate.conformalSummary.empiricalCoverage * 100).toFixed(1)}% vs nominal ${(candidate.conformalSummary.nominalCoverage * 100).toFixed(0)}% (Kupiec p=${candidate.conformalSummary.kupiecPofP}).`,
-      standardsNote: getThresholdLimits(thresholdProfile, dataset.temporal.targetGranularity).normativeNote,
+      standardsNote: getThresholdLimits(thresholdProfile, dataset.temporal.targetGranularity, customThresholds).normativeNote,
     },
     candidate,
   };

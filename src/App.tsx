@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   AuditEvent,
   AutoDecisionEntry,
+  CustomThresholds,
   DatasetState,
   EdaTargetSummary,
   InclusionState,
@@ -9,6 +10,7 @@ import {
   ModelCandidateResult,
   MonitoringSnapshot,
   RunArchiveEntry,
+  ScoringWeights,
   StatisticalTestResult,
   TargetModelingBundle,
   TcpConfig,
@@ -21,7 +23,9 @@ import {
 import {
   deterministicHash,
   generateSyntheticDataset,
+  SyntheticPresetId,
 } from './engine/synthetic';
+import { resolveStandardForDomain } from './engine/domains';
 import {
   buildDefaultVsgForTarget,
   computeEdaAndMining,
@@ -31,6 +35,7 @@ import {
 } from './engine/stats';
 import {
   createLockedBaseline,
+  getScoringWeights,
   runTargetModelingPipeline,
 } from './engine/modeling';
 import { importEbprojZipFile } from './engine/report';
@@ -161,10 +166,17 @@ export default function App() {
   const [testsByTarget, setTestsByTarget] = useState<Record<string, StatisticalTestResult[]>>({});
   const [edaByTarget, setEdaByTarget] = useState<Record<string, EdaTargetSummary>>({});
   const [modelingByTarget, setModelingByTarget] = useState<Record<string, TargetModelingBundle>>({});
-  const [thresholdProfile, setThresholdProfile] = useState<ThresholdProfileId>(
-    initialBoot.ds.domain === 'manufacturing' ? 'spc' : 'ashrae14'
+  const [thresholdProfile, setThresholdProfile] = useState<ThresholdProfileId>(() =>
+    resolveStandardForDomain(initialBoot.ds.domain)
   );
+  const [customThresholds, setCustomThresholds] = useState<CustomThresholds>({
+    maxCvRmse: 20,
+    maxAbsNmbe: 5,
+    minR2: 0.70,
+    label: 'Custom User Standard',
+  });
   const [weightProfile, setWeightProfile] = useState<WeightProfile>('balanced');
+  const [customWeights, setCustomWeights] = useState<ScoringWeights>(() => getScoringWeights('balanced'));
 
   const [lockedBaselines, setLockedBaselines] = useState<Record<string, LockedBaseline>>({});
   const [snapshots, setSnapshots] = useState<MonitoringSnapshot[]>([]);
@@ -283,13 +295,16 @@ export default function App() {
   const handleReplaceDataset = useCallback(
     (nextDs: DatasetState, reason: string, preserveGates = false) => {
       const init = initializeWorkspaceFromDataset(nextDs);
+      const shouldSwitchStd = nextDs.domain !== dataset.domain || nextDs.id !== dataset.id;
       setDataset(nextDs);
       setVsgByTarget(init.vsgByTarget);
       setProfilesByTarget(init.profilesByTarget);
       setScopeMatrixByTarget(init.scopeMatrixByTarget);
       setTcp(init.tcp);
       setAutoLogs((prev) => [...init.autoLogs, ...prev.slice(0, 80)]);
-      setThresholdProfile(nextDs.domain === 'manufacturing' ? 'spc' : 'ashrae14');
+      if (shouldSwitchStd) {
+        setThresholdProfile(resolveStandardForDomain(nextDs.domain));
+      }
       if (init.targetNames.length > 0) {
         setActiveTarget((cur) => (init.targetNames.includes(cur) ? cur : init.targetNames[0]));
       }
@@ -304,11 +319,11 @@ export default function App() {
       }
       appendAudit('Data & Columns', 'Dataset Updated', 'USER', reason);
     },
-    [appendAudit]
+    [dataset.domain, dataset.id, appendAudit]
   );
 
   const handleLoadPreset = useCallback(
-    (preset: 'energy_mv' | 'manufacturing_spc' | 'healthcare_kpi') => {
+    (preset: SyntheticPresetId) => {
       const ds = generateSyntheticDataset(preset, seed);
       handleReplaceDataset(ds, `Loaded synthetic benchmark '${ds.name}' (seed=${seed})`, false);
     },
@@ -537,7 +552,9 @@ export default function App() {
         lockedTcp,
         seed,
         thresholdProfile,
-        weightProfile
+        weightProfile,
+        customWeights,
+        customThresholds
       );
       nextTests[t] = testRes;
       nextEda[t] = edaRes;
@@ -580,12 +597,22 @@ export default function App() {
       `Targets=[${targets.join(', ')}], alpha=${lockedTcp.alpha}, correction=${lockedTcp.correctionMethod}, effort=${lockedTcp.effortProfile}`
     );
     setStage('diagnostics');
-  }, [tcp, targets, vsgByTarget, dataset, seed, thresholdProfile, weightProfile, appendAudit]);
+  }, [tcp, targets, vsgByTarget, dataset, seed, thresholdProfile, weightProfile, customWeights, customThresholds, appendAudit]);
 
   const handleReRunTargetModeling = useCallback(
-    (target: string, profile: ThresholdProfileId, wProf: WeightProfile) => {
+    (
+      target: string,
+      profile: ThresholdProfileId,
+      wProf: WeightProfile,
+      nextCustomThresholds?: CustomThresholds,
+      nextCustomWeights?: ScoringWeights
+    ) => {
+      const effectiveThresh = nextCustomThresholds ?? customThresholds;
+      const effectiveWeights = nextCustomWeights ?? customWeights;
       setThresholdProfile(profile);
       setWeightProfile(wProf);
+      if (nextCustomThresholds) setCustomThresholds(nextCustomThresholds);
+      if (nextCustomWeights) setCustomWeights(nextCustomWeights);
       const targetVsg = vsgByTarget[target] ?? {};
       const updated = runTargetModelingPipeline(
         dataset,
@@ -594,17 +621,19 @@ export default function App() {
         tcp,
         seed,
         profile,
-        wProf
+        wProf,
+        effectiveWeights,
+        effectiveThresh
       );
       setModelingByTarget((prev) => ({ ...prev, [target]: updated }));
       appendAudit(
         'Modeling & Top-5',
         `Re-scored ${target}`,
         'USER',
-        `Threshold=${profile}, WeightProfile=${wProf}`
+        `Threshold=${profile}${profile === 'custom' ? ` (CV<=${effectiveThresh.maxCvRmse}%, |NMBE|<=${effectiveThresh.maxAbsNmbe}%, R2>=${effectiveThresh.minR2})` : ''}, WeightProfile=${wProf}`
       );
     },
-    [vsgByTarget, dataset, tcp, seed, appendAudit]
+    [vsgByTarget, dataset, tcp, seed, customThresholds, customWeights, appendAudit]
   );
 
   const handleLockBaseline = useCallback(
@@ -619,7 +648,8 @@ export default function App() {
         thresholdProfile,
         prevVersion,
         note,
-        seed
+        seed,
+        customThresholds
       );
       setLockedBaselines((prev) => ({ ...prev, [target]: locked }));
       appendAudit(
@@ -629,7 +659,7 @@ export default function App() {
         `${target}: ${locked.modelName} (CV-RMSE=${candidate.oofCvRmse.toFixed(2)}%, sha=${locked.artifactSha256.slice(0, 10)})`
       );
     },
-    [lockedBaselines, vsgByTarget, dataset, tcp, thresholdProfile, seed, appendAudit]
+    [lockedBaselines, vsgByTarget, dataset, tcp, thresholdProfile, seed, customThresholds, appendAudit]
   );
 
   const handleSaveSnapshot = useCallback(
@@ -648,7 +678,9 @@ export default function App() {
   const handleRestoreEbproj = useCallback(
     (restored: Awaited<ReturnType<typeof importEbprojZipFile>>) => {
       const init = initializeWorkspaceFromDataset(restored.dataset);
+      const nextStd = resolveStandardForDomain(restored.dataset.domain);
       setDataset(restored.dataset);
+      setThresholdProfile(nextStd);
       setVsgByTarget(restored.vsgByTarget ?? init.vsgByTarget);
       setProfilesByTarget(init.profilesByTarget);
       setScopeMatrixByTarget(init.scopeMatrixByTarget);
@@ -672,8 +704,10 @@ export default function App() {
             targetVsg,
             restored.tcp,
             restored.seed,
-            thresholdProfile,
-            weightProfile
+            nextStd,
+            weightProfile,
+            customWeights,
+            customThresholds
           );
         }
         setTestsByTarget(nextTests);
@@ -682,7 +716,7 @@ export default function App() {
       }
       appendAudit('System & Storage', 'Restored .ebproj Archive', 'USER', restored.dataset.name);
     },
-    [thresholdProfile, weightProfile, appendAudit]
+    [weightProfile, customWeights, customThresholds, appendAudit]
   );
 
   const paletteActions: PaletteAction[] = useMemo(() => {
@@ -1009,13 +1043,16 @@ export default function App() {
 
             {stage === 'modeling' && (
               <ModelingView
+                dataset={dataset}
                 targets={targets}
                 activeTarget={activeTarget}
                 onSelectTarget={setActiveTarget}
                 modelingByTarget={modelingByTarget}
                 lockedBaselines={lockedBaselines}
                 thresholdProfile={thresholdProfile}
+                customThresholds={customThresholds}
                 weightProfile={weightProfile}
+                customWeights={customWeights}
                 darkMode={darkMode}
                 onReRunTargetModeling={handleReRunTargetModeling}
                 onLockBaseline={handleLockBaseline}

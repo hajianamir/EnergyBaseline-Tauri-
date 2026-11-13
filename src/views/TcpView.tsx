@@ -318,6 +318,27 @@ export const TcpView: React.FC<TcpViewProps> = ({
               <option value="auto_apply">auto_apply (Logged robust winsorize)</option>
             </select>
           </label>
+
+          <div className="flex items-start gap-2.5 pt-5">
+            <input
+              id="tcp-include-optional-tests"
+              type="checkbox"
+              checked={tcp.includeOptionalTests}
+              onChange={(e) =>
+                onUpdateTcp(
+                  { ...tcp, includeOptionalTests: e.target.checked, mode: 'USER_OVERRIDE' },
+                  `${e.target.checked ? 'Enabled' : 'Disabled'} optional [O] statistical tests`
+                )
+              }
+              className="mt-0.5"
+            />
+            <label htmlFor="tcp-include-optional-tests" className="text-xs text-slate-700 dark:text-slate-300 cursor-pointer leading-snug">
+              <span className="font-medium block">Include Optional [O] Diagnostics</span>
+              <span className="text-[11px] text-slate-500 dark:text-slate-400">
+                Dixon Q, MIC, Hoeffding D, Canova-Hansen, OCSB, Transfer Entropy, Hansen L_c, BOCPD
+              </span>
+            </label>
+          </div>
         </div>
       </section>
 
@@ -326,7 +347,7 @@ export const TcpView: React.FC<TcpViewProps> = ({
         <section className="xl:col-span-7 border border-slate-200 dark:border-slate-800 rounded-lg bg-white dark:bg-slate-900 overflow-hidden">
           <div className="px-4 py-3 border-b border-slate-200 dark:border-slate-800">
             <h2 className="text-sm font-semibold text-slate-900 dark:text-slate-100 font-display">
-              Test Catalog Selection Tree (T1–T14)
+              Test Catalog Selection Tree (T1–T14 + [O] Extensions)
             </h2>
           </div>
           <div className="divide-y divide-slate-100 dark:divide-slate-800/70 max-h-[380px] overflow-y-auto">

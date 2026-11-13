@@ -41,7 +41,19 @@ export const DiagnosticsEdaView: React.FC<DiagnosticsEdaViewProps> = ({
   const testColumns: SimpleColumnDef<StatisticalTestResult & Record<string, unknown>>[] = useMemo(
     () => [
       { key: 'familyId', header: 'Fam', width: 76 },
-      { key: 'testName', header: 'Test', width: 225 },
+      {
+        key: 'testName',
+        header: 'Test',
+        width: 245,
+        render: (v, r) => (
+          <span>
+            {r.isOptionalTest && (
+              <span className="font-mono text-[11px] font-semibold text-amber-700 dark:text-amber-400 mr-1.5">[O]</span>
+            )}
+            {String(v)}
+          </span>
+        ),
+      },
       { key: 'variable', header: 'Variable', width: 155 },
       {
         key: 'statistic',
@@ -225,7 +237,7 @@ export const DiagnosticsEdaView: React.FC<DiagnosticsEdaViewProps> = ({
             Diagnostics Suite, EDA Atlas & Data Mining
           </h1>
           <p className="text-sm text-slate-600 dark:text-slate-400 mt-1">
-            Pre-model tests (T1–T9, T13, T14), F1–F9 EDA profiling, Data Quality Score, and Causal M&V balance.
+            Pre-model core [M] &amp; extended [O] tests (T1–T14), F1–F9 EDA &amp; mining (autoencoder + regime rules), Data Quality Score, and Causal balance.
           </p>
         </div>
 
@@ -261,7 +273,7 @@ export const DiagnosticsEdaView: React.FC<DiagnosticsEdaViewProps> = ({
         <div className="flex items-center gap-1 p-1 bg-slate-100 dark:bg-slate-800 rounded-lg">
           {(
             [
-              ['tests', `Tests T1–T14 (${tests.length})`],
+              ['tests', `Tests T1–T14 + [O] (${tests.length})`],
               ['eda', 'Correlation & PCA (F2–F3)'],
               ['mining', 'Regimes & TS Mining (F4–F9)'],
               ['causal', 'Causal M&V (T14)'],
@@ -435,7 +447,8 @@ export const DiagnosticsEdaView: React.FC<DiagnosticsEdaViewProps> = ({
                 ))}
               </div>
               <div className="text-xs text-slate-600 dark:text-slate-400 pt-2">
-                Anomaly Ensemble Voting (F5): {eda.anomalies.flaggedIndices.length} points flagged under Action Policy <span className="font-mono">{eda.anomalies.policyApplied}</span>.
+                Anomaly Ensemble Voting (F5): {eda.anomalies.flaggedIndices.length} points flagged (incl. {eda.anomalies.autoencoderFlagCount} bottleneck autoencoder votes) under Action Policy{' '}
+                <span className="font-mono">{eda.anomalies.policyApplied}</span>.
                 {eda.timeSeriesMining.changePointTimestamp && (
                   <span className="block mt-1">
                     Structural Change-Point (F7/T9): {eda.timeSeriesMining.changePointTimestamp.slice(0, 10)} (CI: {eda.timeSeriesMining.changePointCiLow?.slice(0, 10)} to {eda.timeSeriesMining.changePointCiHigh?.slice(0, 10)})
@@ -444,6 +457,36 @@ export const DiagnosticsEdaView: React.FC<DiagnosticsEdaViewProps> = ({
               </div>
             </section>
           </div>
+
+          {eda.regimeRules.length > 0 && (
+            <section className="border border-slate-200 dark:border-slate-800 rounded-lg bg-white dark:bg-slate-900 overflow-hidden">
+              <div className="px-4 py-3 border-b border-slate-200 dark:border-slate-800 text-sm font-semibold font-display">
+                Regime Association Rules (F6 Data Mining)
+              </div>
+              <div className="overflow-x-auto">
+                <table className="w-full text-xs text-left tabular-nums">
+                  <thead className="bg-slate-50 dark:bg-slate-950 text-slate-600 dark:text-slate-300 border-b border-slate-200 dark:border-slate-800">
+                    <tr>
+                      <th className="px-3 py-2">Association Rule</th>
+                      <th className="px-3 py-2 text-right">Support %</th>
+                      <th className="px-3 py-2 text-right">Confidence %</th>
+                      <th className="px-3 py-2 text-right">Lift</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100 dark:divide-slate-800/70">
+                    {eda.regimeRules.map((rr, idx) => (
+                      <tr key={idx}>
+                        <td className="px-3 py-2 font-mono">{rr.rule}</td>
+                        <td className="px-3 py-2 text-right font-mono">{rr.supportPct.toFixed(1)}%</td>
+                        <td className="px-3 py-2 text-right font-mono">{rr.confidencePct.toFixed(1)}%</td>
+                        <td className="px-3 py-2 text-right font-mono">{rr.lift.toFixed(2)}×</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </section>
+          )}
         </div>
       )}
 

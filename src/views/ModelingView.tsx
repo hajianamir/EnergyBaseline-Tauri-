@@ -1,37 +1,69 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
+  CustomThresholds,
+  DatasetState,
   LockedBaseline,
   ModelCandidateResult,
+  ScoringWeights,
   TargetModelingBundle,
   ThresholdProfileId,
   WeightProfile,
 } from '../engine/types';
+import { STANDARD_PROFILES } from '../engine/domains';
 import { KatexFormula } from '../components/KatexFormula';
 import { EChartBox } from '../components/EChartBox';
 import { AlertTriangle, CheckCircle2, Copy, Lock, ShieldCheck } from 'lucide-react';
 
 interface ModelingViewProps {
+  dataset: DatasetState;
   targets: string[];
   activeTarget: string;
   onSelectTarget: (target: string) => void;
   modelingByTarget: Record<string, TargetModelingBundle>;
   lockedBaselines: Record<string, LockedBaseline>;
   thresholdProfile: ThresholdProfileId;
+  customThresholds: CustomThresholds;
   weightProfile: WeightProfile;
+  customWeights: ScoringWeights;
   darkMode: boolean;
-  onReRunTargetModeling: (target: string, profile: ThresholdProfileId, wProf: WeightProfile) => void;
+  onReRunTargetModeling: (
+    target: string,
+    profile: ThresholdProfileId,
+    wProf: WeightProfile,
+    nextCustomThresholds?: CustomThresholds,
+    nextCustomWeights?: ScoringWeights
+  ) => void;
   onLockBaseline: (target: string, candidate: ModelCandidateResult, note: string) => void;
   onProceedToMonitoring: () => void;
 }
 
+const WEIGHT_LABELS: { key: keyof ScoringWeights; label: string }[] = [
+  { key: 'cvRmse', label: 'CV(RMSE) %' },
+  { key: 'r2', label: 'OOF R²' },
+  { key: 'nmbe', label: '|NMBE| %' },
+  { key: 'mae', label: 'MAE' },
+  { key: 'smape', label: 'sMAPE %' },
+  { key: 'foldRobustness', label: 'Fold Robustness' },
+  { key: 'parsimony', label: 'Parsimony' },
+  { key: 'residualDiagnostics', label: 'T10 Diagnostics' },
+  { key: 'physicalPlausibility', label: 'Sign Plausibility' },
+  { key: 'interpretability', label: 'Interpretability' },
+  { key: 'standardsAlignment', label: 'Standard Fit' },
+  { key: 'uncertaintyWidth', label: 'Conformal Width' },
+  { key: 'dataSufficiency', label: 'Data Sufficiency' },
+];
+
 export const ModelingView: React.FC<ModelingViewProps> = ({
+  dataset,
   targets,
   activeTarget,
   onSelectTarget,
   modelingByTarget,
   lockedBaselines,
   thresholdProfile,
+  customThresholds,
   weightProfile,
+  customWeights,
   darkMode,
   onReRunTargetModeling,
   onLockBaseline,
@@ -43,6 +75,16 @@ export const ModelingView: React.FC<ModelingViewProps> = ({
   const [ackWarning, setAckWarning] = useState(false);
   const [copiedFormulaId, setCopiedFormulaId] = useState<string | null>(null);
   const [registerTab, setRegisterTab] = useState<'top5' | 'not_shortlisted' | 'rejected' | 'calibration'>('top5');
+  const [draftThresholds, setDraftThresholds] = useState<CustomThresholds>(customThresholds);
+  const [draftWeights, setDraftWeights] = useState<ScoringWeights>(customWeights);
+
+  useEffect(() => {
+    setDraftThresholds(customThresholds);
+  }, [customThresholds]);
+
+  useEffect(() => {
+    setDraftWeights(customWeights);
+  }, [customWeights]);
 
   const topModels = bundle?.top5 ?? [];
   const effectiveSelectedId =
@@ -127,60 +169,219 @@ export const ModelingView: React.FC<ModelingViewProps> = ({
       </div>
 
       {/* Multi-Target Selector & Scoring Controls */}
-      <div className="flex flex-wrap items-center justify-between gap-4 border border-slate-200 dark:border-slate-800 rounded-lg bg-white dark:bg-slate-900 p-3">
-        <div className="flex flex-wrap items-center gap-1.5">
-          {targets.map((t) => {
-            const isLocked = Boolean(lockedBaselines[t]);
-            return (
-              <button
-                key={t}
-                type="button"
-                onClick={() => onSelectTarget(t)}
-                className={`px-3 py-1.5 text-xs font-mono rounded-md transition-colors inline-flex items-center gap-1.5 ${
-                  t === activeTarget
-                    ? 'bg-sky-700 text-white font-semibold'
-                    : 'bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300'
-                }`}
+      <div className="border border-slate-200 dark:border-slate-800 rounded-lg bg-white dark:bg-slate-900 p-3 space-y-3">
+        <div className="flex flex-wrap items-center justify-between gap-4">
+          <div className="flex flex-wrap items-center gap-1.5">
+            {targets.map((t) => {
+              const isLocked = Boolean(lockedBaselines[t]);
+              return (
+                <button
+                  key={t}
+                  type="button"
+                  onClick={() => onSelectTarget(t)}
+                  className={`px-3 py-1.5 text-xs font-mono rounded-md transition-colors inline-flex items-center gap-1.5 ${
+                    t === activeTarget
+                      ? 'bg-sky-700 text-white font-semibold'
+                      : 'bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300'
+                  }`}
+                >
+                  {t}
+                  {isLocked && <Lock className="w-3 h-3" aria-hidden="true" />}
+                </button>
+              );
+            })}
+          </div>
+
+          <div className="flex flex-wrap items-center gap-3 text-xs">
+            <label className="inline-flex items-center gap-1.5">
+              <span className="text-slate-500">Standard / Thresholds:</span>
+              <select
+                aria-label="Threshold Profile"
+                value={thresholdProfile}
+                onChange={(e) => {
+                  const nextProf = e.target.value as ThresholdProfileId;
+                  onReRunTargetModeling(
+                    activeTarget,
+                    nextProf,
+                    weightProfile,
+                    nextProf === 'custom' ? draftThresholds : undefined,
+                    weightProfile === 'custom' ? draftWeights : undefined
+                  );
+                }}
+                className="px-2 py-1 rounded border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-950"
               >
-                {t}
-                {isLocked && <Lock className="w-3 h-3" aria-hidden="true" />}
-              </button>
-            );
-          })}
+                {Object.values(STANDARD_PROFILES).map((std) => (
+                  <option key={std.id} value={std.id}>
+                    {std.name}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="inline-flex items-center gap-1.5">
+              <span className="text-slate-500">Scoring Weights:</span>
+              <select
+                aria-label="Weight Profile"
+                value={weightProfile}
+                onChange={(e) => {
+                  const nextW = e.target.value as WeightProfile;
+                  onReRunTargetModeling(
+                    activeTarget,
+                    thresholdProfile,
+                    nextW,
+                    thresholdProfile === 'custom' ? draftThresholds : undefined,
+                    nextW === 'custom' ? draftWeights : undefined
+                  );
+                }}
+                className="px-2 py-1 rounded border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-950"
+              >
+                <option value="balanced">balanced</option>
+                <option value="interpretable">interpretable</option>
+                <option value="accuracy_first">accuracy_first</option>
+                <option value="custom">custom (13 criteria)</option>
+              </select>
+            </label>
+          </div>
         </div>
 
-        <div className="flex flex-wrap items-center gap-3 text-xs">
-          <label className="inline-flex items-center gap-1.5">
-            <span className="text-slate-500">Thresholds:</span>
-            <select
-              aria-label="Threshold Profile"
-              value={thresholdProfile}
-              onChange={(e) =>
-                onReRunTargetModeling(activeTarget, e.target.value as ThresholdProfileId, weightProfile)
-              }
-              className="px-2 py-1 rounded border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-950"
-            >
-              <option value="ashrae14">ASHRAE 14 Aligned</option>
-              <option value="iso50015">ISO 50015 Aligned</option>
-              <option value="custom">Custom / General</option>
-            </select>
-          </label>
-          <label className="inline-flex items-center gap-1.5">
-            <span className="text-slate-500">Scoring Weights:</span>
-            <select
-              aria-label="Weight Profile"
-              value={weightProfile}
-              onChange={(e) =>
-                onReRunTargetModeling(activeTarget, thresholdProfile, e.target.value as WeightProfile)
-              }
-              className="px-2 py-1 rounded border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-950"
-            >
-              <option value="balanced">balanced</option>
-              <option value="interpretable">interpretable</option>
-              <option value="accuracy_first">accuracy_first</option>
-            </select>
-          </label>
+        <div className="text-[11px] font-mono text-slate-600 dark:text-slate-400 border-t border-slate-100 dark:border-slate-800 pt-2 flex flex-wrap items-center justify-between gap-2 tabular-nums">
+          <span>
+            Active Gate ({dataset.domain}): {bundle.limits.citation} · Max CV(RMSE) ≤ {bundle.limits.maxCvRmse}% · Max |NMBE| ≤ {bundle.limits.maxAbsNmbe}% · Min R² ≥ {bundle.limits.minR2}
+          </span>
+          <span className="text-slate-500 font-sans">{bundle.limits.normativeNote}</span>
         </div>
+
+        {thresholdProfile === 'custom' && (
+          <div className="border-t border-slate-200 dark:border-slate-800 pt-3 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3 text-xs items-end">
+            <label className="block">
+              <span className="text-slate-600 dark:text-slate-400 block mb-1">Max CV(RMSE) (%)</span>
+              <input
+                type="number"
+                step={0.5}
+                min={0.5}
+                max={200}
+                value={draftThresholds.maxCvRmse}
+                onChange={(e) => setDraftThresholds({ ...draftThresholds, maxCvRmse: Math.max(0.5, Number(e.target.value) || 0.5) })}
+                className="w-full px-2.5 py-1.5 rounded border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-950 font-mono tabular-nums"
+              />
+            </label>
+            <label className="block">
+              <span className="text-slate-600 dark:text-slate-400 block mb-1">Max |NMBE| (%)</span>
+              <input
+                type="number"
+                step={0.5}
+                min={0.1}
+                max={100}
+                value={draftThresholds.maxAbsNmbe}
+                onChange={(e) => setDraftThresholds({ ...draftThresholds, maxAbsNmbe: Math.max(0.1, Number(e.target.value) || 0.1) })}
+                className="w-full px-2.5 py-1.5 rounded border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-950 font-mono tabular-nums"
+              />
+            </label>
+            <label className="block">
+              <span className="text-slate-600 dark:text-slate-400 block mb-1">Min OOF R²</span>
+              <input
+                type="number"
+                step={0.05}
+                min={-1}
+                max={0.99}
+                value={draftThresholds.minR2}
+                onChange={(e) => setDraftThresholds({ ...draftThresholds, minR2: Math.min(0.99, Math.max(-1, Number(e.target.value) || 0)) })}
+                className="w-full px-2.5 py-1.5 rounded border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-950 font-mono tabular-nums"
+              />
+            </label>
+            <label className="block">
+              <span className="text-slate-600 dark:text-slate-400 block mb-1">Custom Standard Label</span>
+              <input
+                type="text"
+                value={draftThresholds.label}
+                onChange={(e) => setDraftThresholds({ ...draftThresholds, label: e.target.value })}
+                className="w-full px-2.5 py-1.5 rounded border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-950"
+              />
+            </label>
+            <button
+              type="button"
+              onClick={() =>
+                onReRunTargetModeling(
+                  activeTarget,
+                  'custom',
+                  weightProfile,
+                  draftThresholds,
+                  weightProfile === 'custom' ? draftWeights : undefined
+                )
+              }
+              className="px-3 py-1.5 text-xs font-semibold bg-sky-700 hover:bg-sky-800 text-white rounded transition-colors whitespace-nowrap"
+            >
+              Apply Custom Thresholds
+            </button>
+          </div>
+        )}
+
+        {weightProfile === 'custom' && (
+          <div className="border-t border-slate-200 dark:border-slate-800 pt-3 space-y-2.5 text-xs">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <span className="font-semibold text-slate-800 dark:text-slate-200">
+                Custom 13-Criteria Scoring Weights (Sum ={' '}
+                <span className="font-mono tabular-nums">
+                  {Object.values(draftWeights).reduce((a, b) => a + b, 0).toFixed(3)}
+                </span>
+                )
+              </span>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    const sum = Object.values(draftWeights).reduce((a, b) => a + b, 0) || 1;
+                    const norm = { ...draftWeights };
+                    (Object.keys(norm) as (keyof ScoringWeights)[]).forEach((k) => {
+                      norm[k] = Number((norm[k] / sum).toFixed(4));
+                    });
+                    setDraftWeights(norm);
+                  }}
+                  className="px-2.5 py-1 border border-slate-300 dark:border-slate-700 rounded hover:bg-slate-50 dark:hover:bg-slate-800"
+                >
+                  Normalize (Sum = 1.00)
+                </button>
+                <button
+                  type="button"
+                  onClick={() =>
+                    onReRunTargetModeling(
+                      activeTarget,
+                      thresholdProfile,
+                      'custom',
+                      thresholdProfile === 'custom' ? draftThresholds : undefined,
+                      draftWeights
+                    )
+                  }
+                  className="px-3 py-1 font-semibold bg-sky-700 hover:bg-sky-800 text-white rounded"
+                >
+                  Apply Custom Weights
+                </button>
+              </div>
+            </div>
+            <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-7 gap-2">
+              {WEIGHT_LABELS.map((wl) => (
+                <label key={wl.key} className="block">
+                  <span className="text-[11px] text-slate-500 block mb-0.5 truncate" title={wl.label}>
+                    {wl.label}
+                  </span>
+                  <input
+                    type="number"
+                    step={0.01}
+                    min={0}
+                    max={1}
+                    value={draftWeights[wl.key]}
+                    onChange={(e) =>
+                      setDraftWeights({
+                        ...draftWeights,
+                        [wl.key]: Math.max(0, Number(e.target.value) || 0),
+                      })
+                    }
+                    className="w-full px-2 py-1 rounded border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-950 font-mono tabular-nums"
+                  />
+                </label>
+              ))}
+            </div>
+          </div>
+        )}
       </div>
 
       {/* Pipeline Summary Strip */}
@@ -262,7 +463,7 @@ export const ModelingView: React.FC<ModelingViewProps> = ({
       {registerTab === 'top5' && (
         <div className="grid grid-cols-1 xl:grid-cols-12 gap-6">
           {/* Top-5 Cards with Radio Selection */}
-          <div className="xl:col-span-7 space-y-3">
+          <div className="xl:col-span-7 min-w-0 space-y-3">
             {bundle.top5.map((m) => {
               const isSelected = m.id === effectiveSelectedId;
               return (
@@ -373,7 +574,7 @@ export const ModelingView: React.FC<ModelingViewProps> = ({
           </div>
 
           {/* Right Column: Lock Baseline Panel + OOF Fit Chart */}
-          <div className="xl:col-span-5 space-y-4">
+          <div className="xl:col-span-5 min-w-0 space-y-4">
             {activeModel && (
               <section className="border border-slate-200 dark:border-slate-800 rounded-lg bg-white dark:bg-slate-900 p-4 space-y-3">
                 <h2 className="text-sm font-semibold font-display text-slate-900 dark:text-slate-100">

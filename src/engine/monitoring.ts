@@ -8,7 +8,81 @@ import {
 } from './types';
 import { getBaselineRows, mean, normalPValueTwoSided, stdDev } from './stats';
 import { deterministicHash } from './synthetic';
-import { computeRegressionMetrics } from './modeling';
+import { computeRegressionMetrics, predictFromModelPayload, SerializedModelPayload } from './modeling';
+import { DOMAIN_PROFILES } from './domains';
+
+interface PredictParamsShape {
+  family: string;
+  features: string[];
+  coeffs: { term: string; value: number }[];
+  bestTh: number;
+  bestTc: number;
+  colMedians: Record<string, number>;
+  meanTarget: number;
+  oofRmse: number;
+  conformalHalfWidth: number;
+  modelPayload?: SerializedModelPayload | null;
+}
+
+function evaluatePredictParamsOverRows(
+  rows: DatasetRow[],
+  pObj: PredictParamsShape,
+  fallbackFeatures: string[],
+  isParametricHint?: boolean
+): number[] {
+  const feats = pObj.features && pObj.features.length > 0 ? pObj.features : fallbackFeatures;
+  const colMedians = pObj.colMedians ?? {};
+  const payload = pObj.modelPayload;
+
+  if (payload && payload.kind === 'ensemble_blend') {
+    const preds1 = evaluatePredictParamsOverRows(rows, payload.p1 as unknown as PredictParamsShape, feats);
+    const preds2 = evaluatePredictParamsOverRows(rows, payload.p2 as unknown as PredictParamsShape, feats);
+    return rows.map((_, i) => payload.w1 * (preds1[i] ?? pObj.meanTarget) + payload.w2 * (preds2[i] ?? pObj.meanTarget));
+  }
+
+  if (payload && isParametricHint !== true) {
+    return predictFromModelPayload(rows, payload, feats, colMedians);
+  }
+
+  const coeffs = pObj.coeffs ?? [];
+  return rows.map((r) => {
+    let pred = pObj.meanTarget;
+    if (pObj.family === 'changepoint' && coeffs.length >= 3) {
+      const tempFeat = feats[0];
+      const tVal = typeof r[tempFeat] === 'number' ? (r[tempFeat] as number) : colMedians[tempFeat] ?? 16;
+      pred =
+        coeffs[0].value +
+        coeffs[1].value * Math.max(0, tVal - pObj.bestTc) +
+        coeffs[2].value * Math.max(0, pObj.bestTh - tVal);
+      feats.slice(1).forEach((f, idx) => {
+        const fv = typeof r[f] === 'number' ? (r[f] as number) : colMedians[f] ?? 0;
+        pred += (coeffs[idx + 3]?.value ?? 0) * fv;
+      });
+    } else if (pObj.family === 'degree_day' && coeffs.length >= 3) {
+      const tempFeat = feats[0];
+      const tVal = typeof r[tempFeat] === 'number' ? (r[tempFeat] as number) : colMedians[tempFeat] ?? 16;
+      pred =
+        coeffs[0].value +
+        coeffs[1].value * Math.max(0, tVal - pObj.bestTc) +
+        coeffs[2].value * Math.max(0, pObj.bestTh - tVal);
+    } else if (pObj.family === 'towt' && coeffs.length >= 5) {
+      const tempFeat = feats[0];
+      const tVal = typeof r[tempFeat] === 'number' ? (r[tempFeat] as number) : colMedians[tempFeat] ?? 16;
+      const dow = new Date(r.timestamp).getUTCDay();
+      const wknd = dow === 0 || dow === 6 ? 1 : 0;
+      const cdd = Math.max(0, tVal - pObj.bestTc);
+      const hdd = Math.max(0, pObj.bestTh - tVal);
+      pred = coeffs[0].value + coeffs[1].value * wknd + coeffs[2].value * cdd + coeffs[3].value * hdd + coeffs[4].value * wknd * cdd;
+    } else if (coeffs.length >= 1) {
+      pred = coeffs[0].value;
+      feats.forEach((f, idx) => {
+        const fv = typeof r[f] === 'number' ? (r[f] as number) : colMedians[f] ?? 0;
+        pred += (coeffs[idx + 1]?.value ?? 0) * fv;
+      });
+    }
+    return pred;
+  });
+}
 
 export function predictFromLockedBaseline(
   baseline: LockedBaseline,
@@ -21,17 +95,8 @@ export function predictFromLockedBaseline(
   extrapolationSharePct: number;
   alertRuleDescription: string;
 } {
-  const params = baseline.candidate.predictFnParams as {
-    family: string;
-    features: string[];
-    coeffs: { term: string; value: number }[];
-    bestTh: number;
-    bestTc: number;
-    colMedians: Record<string, number>;
-    meanTarget: number;
-    oofRmse: number;
-    conformalHalfWidth: number;
-  };
+  const params = baseline.candidate.predictFnParams as unknown as PredictParamsShape;
+  const domainProf = DOMAIN_PROFILES[trainingDataset.domain] ?? DOMAIN_PROFILES.custom;
 
   const trainRows = getBaselineRows(trainingDataset);
   const featureRanges: Record<string, { min: number; max: number }> = {};
@@ -52,57 +117,21 @@ export function predictFromLockedBaseline(
   else if (alertRule === 'k_rmse_2') alertRuleDescription = `2 × OOF RMSE (±${rmseThresh.toFixed(1)}) threshold`;
   else if (alertRule === 'outside_interval') alertRuleDescription = 'Outside conformal prediction interval';
 
+  const forwardPreds = evaluatePredictParamsOverRows(
+    rows,
+    params,
+    baseline.features,
+    baseline.candidate.isParametric && !params.modelPayload
+  );
+
   const points: PredictionMonitoringPoint[] = [];
   let cumDev = 0;
   let extrapCount = 0;
   let consecutiveExceed = 0;
 
-  for (const r of rows) {
-    let pred = params.meanTarget;
-    const coeffs = params.coeffs ?? [];
-    if (params.family === 'changepoint' && coeffs.length >= 3) {
-      const tempFeat = baseline.features[0];
-      const tVal = typeof r[tempFeat] === 'number' ? (r[tempFeat] as number) : params.colMedians[tempFeat] ?? 16;
-      pred =
-        coeffs[0].value +
-        coeffs[1].value * Math.max(0, tVal - params.bestTc) +
-        coeffs[2].value * Math.max(0, params.bestTh - tVal);
-      baseline.features.slice(1).forEach((f, idx) => {
-        const fv = typeof r[f] === 'number' ? (r[f] as number) : params.colMedians[f] ?? 0;
-        pred += (coeffs[idx + 3]?.value ?? 0) * fv;
-      });
-    } else if (params.family === 'degree_day' && coeffs.length >= 3) {
-      const tempFeat = baseline.features[0];
-      const tVal = typeof r[tempFeat] === 'number' ? (r[tempFeat] as number) : params.colMedians[tempFeat] ?? 16;
-      pred =
-        coeffs[0].value +
-        coeffs[1].value * Math.max(0, tVal - params.bestTc) +
-        coeffs[2].value * Math.max(0, params.bestTh - tVal);
-    } else if (params.family === 'towt' && coeffs.length >= 5) {
-      const tempFeat = baseline.features[0];
-      const tVal = typeof r[tempFeat] === 'number' ? (r[tempFeat] as number) : params.colMedians[tempFeat] ?? 16;
-      const dow = new Date(r.timestamp).getUTCDay();
-      const wknd = dow === 0 || dow === 6 ? 1 : 0;
-      const cdd = Math.max(0, tVal - params.bestTc);
-      const hdd = Math.max(0, params.bestTh - tVal);
-      pred = coeffs[0].value + coeffs[1].value * wknd + coeffs[2].value * cdd + coeffs[3].value * hdd + coeffs[4].value * wknd * cdd;
-    } else if (coeffs.length >= 1 && baseline.candidate.isParametric) {
-      pred = coeffs[0].value;
-      baseline.features.forEach((f, idx) => {
-        const fv = typeof r[f] === 'number' ? (r[f] as number) : params.colMedians[f] ?? 0;
-        pred += (coeffs[idx + 1]?.value ?? 0) * fv;
-      });
-    } else {
-      // Non-parametric deterministic linear surrogate fallback for forward rows
-      const oofSample = baseline.candidate.oofPredictions;
-      const tempFeat = baseline.features[0];
-      if (tempFeat && oofSample.length > 0) {
-        const tVal = typeof r[tempFeat] === 'number' ? (r[tempFeat] as number) : params.colMedians[tempFeat] ?? 16;
-        const cdd = Math.max(0, tVal - params.bestTc);
-        const hdd = Math.max(0, params.bestTh - tVal);
-        pred = params.meanTarget + 32 * (cdd - 2) + 20 * (hdd - 1);
-      }
-    }
+  for (let rowIdx = 0; rowIdx < rows.length; rowIdx++) {
+    const r = rows[rowIdx];
+    const pred = Number.isFinite(forwardPreds[rowIdx]) ? forwardPreds[rowIdx] : params.meanTarget;
 
     let outOfRange = false;
     for (const f of baseline.features) {
@@ -233,10 +262,10 @@ export function predictFromLockedBaseline(
 
   const recommendation =
     trafficLight === 'red'
-      ? 'Baseline re-validation recommended (persistent residual shift detected; may indicate ECM savings or non-routine drift; locked baseline is never auto-replaced).'
+      ? `Baseline re-validation recommended for ${domainProf.baselineNoun} (persistent residual shift detected; may indicate intervention impact or non-routine drift; locked baseline is never auto-replaced).`
       : trafficLight === 'amber'
         ? 'Monitor closely: moderate covariate shift or early EWMA signal detected.'
-        : 'Baseline remains stable within expected operating envelope.';
+        : `${domainProf.baselineNoun} remains stable within expected operating envelope.`;
 
   return {
     points,
@@ -257,7 +286,7 @@ export function predictFromLockedBaseline(
         structuralBreakP: breakP !== null ? Number(breakP.toFixed(4)) : null,
         interpretation:
           trafficLight === 'red'
-            ? `Rolling NMBE=${rollMet.nmbe.toFixed(2)}% vs baseline OOF NMBE=${baseline.candidate.oofNmbe.toFixed(2)}%. In M&V reporting windows, systematic negative deviation represents potential energy savings (or NRE).`
+            ? `Rolling NMBE=${rollMet.nmbe.toFixed(2)}% vs baseline OOF NMBE=${baseline.candidate.oofNmbe.toFixed(2)}%. ${domainProf.deviationHintNegative}`
             : `Rolling CV(RMSE)=${rollMet.cvRmse.toFixed(2)}% vs baseline OOF=${baseline.candidate.oofCvRmse.toFixed(2)}%.`,
       },
       checkedAt: new Date().toISOString(),

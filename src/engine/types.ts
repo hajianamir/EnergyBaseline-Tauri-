@@ -15,9 +15,32 @@ export type AvailabilityFlag = 'known_in_advance' | 'observed_only';
 
 export type InclusionState = 'force_include' | 'candidate' | 'analysis_only' | 'exclude';
 
-export type DomainType = 'energy' | 'manufacturing' | 'water' | 'healthcare' | 'custom';
+export type DomainType =
+  | 'energy'
+  | 'manufacturing'
+  | 'water'
+  | 'healthcare'
+  | 'finance'
+  | 'environment'
+  | 'custom';
 
-export type ThresholdProfileId = 'ashrae14' | 'iso50015' | 'spc' | 'custom';
+export type ThresholdProfileId =
+  | 'ashrae14'
+  | 'ipmvp'
+  | 'iso50015'
+  | 'spc'
+  | 'awwa_water'
+  | 'healthcare_kpi'
+  | 'iso14064'
+  | 'basel_sr11_7'
+  | 'custom';
+
+export interface CustomThresholds {
+  maxCvRmse: number;
+  maxAbsNmbe: number;
+  minR2: number;
+  label: string;
+}
 
 export type SamplingGranularity = '15min' | 'hourly' | 'daily' | 'monthly';
 
@@ -189,6 +212,7 @@ export interface TcpConfig {
   decisionRule: DecisionRule;
   effortProfile: EffortProfile;
   outlierActionPolicy: ActionPolicy;
+  includeOptionalTests: boolean;
   preRegistered: boolean;
   preRegistrationHash: string | null;
   preRegistrationTimestamp: string | null;
@@ -204,6 +228,7 @@ export interface StatisticalTestResult {
   variable: string;
   familyId: TestFamilyId;
   testName: string;
+  isOptionalTest?: boolean;
   statistic: number | null;
   statisticName: string;
   df: string | null;
@@ -290,8 +315,16 @@ export interface EdaTargetSummary {
     timestamps: string[];
     scores: number[];
     voteCounts: number[];
+    autoencoderFlagCount: number;
     policyApplied: ActionPolicy;
   };
+  regimeRules: {
+    rule: string;
+    regimeLabel: string;
+    supportPct: number;
+    confidencePct: number;
+    lift: number;
+  }[];
   timeSeriesMining: {
     spectralEntropy: number;
     trendStrength: number;
@@ -365,9 +398,19 @@ export interface ModelCandidateResult {
     | 'random_forest'
     | 'extra_trees'
     | 'gbm'
+    | 'xgboost'
+    | 'lightgbm'
+    | 'catboost'
     | 'svr'
     | 'mlp'
+    | 'resnet_mlp'
     | 'sequence_nn'
+    | 'causal_tcn'
+    | 'nbeats'
+    | 'tft'
+    | 'patchtst'
+    | 'informer'
+    | 'ae_net'
     | 'ensemble';
   isParametric: boolean;
   isNeuralNet: boolean;
@@ -478,6 +521,7 @@ export interface TargetModelingBundle {
   weightProfile: WeightProfile;
   weights: ScoringWeights;
   thresholdProfile: ThresholdProfileId;
+  limits: { maxCvRmse: number; maxAbsNmbe: number; minR2: number; citation: string; normativeNote: string };
   t11WinnerVsRunnerUp: {
     dmStat: number;
     dmPValue: number;

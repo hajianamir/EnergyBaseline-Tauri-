@@ -14,9 +14,10 @@ import {
   runDiagnosticsSuite,
   validateVsgConflict,
 } from './stats';
-import { createLockedBaseline, runTargetModelingPipeline } from './modeling';
+import { createLockedBaseline, getScoringWeights, runTargetModelingPipeline } from './modeling';
 import { predictFromLockedBaseline } from './monitoring';
 import { buildDeterministicReportModel, verifyReportNarrativeConsistency } from './report';
+import { resolveStandardForDomain } from './domains';
 
 test('Synthetic ground-truth generator is deterministic for a fixed seed', () => {
   const ds1 = generateSyntheticDataset('energy_mv', 42);
@@ -84,6 +85,21 @@ test('VSG enforces MT-2 leakage exclusion and TCP what-if flips decisions withou
   const tests = runDiagnosticsSuite(ds, 'kwh_total', vsgRes.entries, tcp, 42);
   assert.ok(tests.length >= 6);
 
+  // Verify all 8 [O] optional tests are included when includeOptionalTests=true and omitted when false
+  const optTests = tests.filter((t) => t.isOptionalTest);
+  const optNames = optTests.map((t) => t.testName).join(' | ');
+  assert.match(optNames, /Dixon/);
+  assert.match(optNames, /MIC/);
+  assert.match(optNames, /Hoeffding/);
+  assert.match(optNames, /Canova-Hansen/);
+  assert.match(optNames, /OCSB/);
+  assert.match(optNames, /Transfer Entropy/);
+  assert.match(optNames, /Hansen/);
+  assert.match(optNames, /BOCPD/);
+
+  const noOptTests = runDiagnosticsSuite(ds, 'kwh_total', vsgRes.entries, { ...tcp, includeOptionalTests: false }, 42);
+  assert.equal(noOptTests.filter((t) => t.isOptionalTest).length, 0);
+
   // What-if re-evaluation: change alpha from 0.05 to 0.001 without recomputing test statistics
   const stricterTcp = { ...tcp, alpha: 0.001, correctionMethod: 'bonferroni' as const };
   const reeval = reevaluateTestResults(tests, stricterTcp);
@@ -94,7 +110,7 @@ test('VSG enforces MT-2 leakage exclusion and TCP what-if flips decisions withou
   }
 });
 
-test('Multi-target modeling, Top-5, Lock, Monitoring deviation, Drift & Report consistency pass', () => {
+test('Multi-target modeling, XGBoost/NN portfolio, Non-Parametric inference, Custom bounds & Report consistency pass', () => {
   const ds = generateSyntheticDataset('energy_mv', 42);
   const tcp = createDefaultTcpConfig(ds);
   const vsg1 = buildDefaultVsgForTarget(ds, 'kwh_total', '2026-01-01T00:00:00Z');
@@ -108,6 +124,32 @@ test('Multi-target modeling, Top-5, Lock, Monitoring deviation, Drift & Report c
   assert.ok(bundle1.top5[0].oofCvRmse < 12, `Expected accurate Top-1 fit, got ${bundle1.top5[0].oofCvRmse}%`);
   assert.ok(bundle1.rejected.some((r) => r.isNeuralNet), 'NN Gate should explicitly evaluate/reject NN if not >5% better');
 
+  // Verify expanded Boosted Trees & Neural Networks exist
+  const families = new Set(bundle1.allModels.map((m) => m.family));
+  for (const fam of ['xgboost', 'lightgbm', 'catboost', 'sequence_nn', 'causal_tcn', 'nbeats', 'tft', 'patchtst', 'informer'] as const) {
+    assert.ok(families.has(fam), `Expected model family '${fam}' in portfolio`);
+  }
+
+  // Genuine forward inference for non-parametric model (XGBoost)
+  const xgbModel = bundle1.allModels.find((m) => m.family === 'xgboost')!;
+  const lockedXgb = createLockedBaseline(ds, xgbModel, vsg1.entries, tcp, 'ashrae14', 0, 'XGBoost test lock', bundle1.seed);
+  const reportingRows = ds.rows.filter((r) => r.timestamp >= ds.temporal.reportingStart);
+  const monXgb = predictFromLockedBaseline(lockedXgb, reportingRows, ds, 'auto');
+  assert.equal(monXgb.points.length, reportingRows.length);
+  const distinctBaselineVals = new Set(monXgb.points.map((p) => p.baseline)).size;
+  assert.ok(distinctBaselineVals > 10, 'XGBoost forward inference must vary meaningfully with features');
+  const avgDevXgb = monXgb.points.reduce((a, p) => a + (p.deviation ?? 0), 0) / monXgb.points.length;
+  assert.ok(avgDevXgb < -80, `Expected negative deviation from planted -215 savings under XGBoost, got ${avgDevXgb}`);
+
+  // Custom thresholds & custom 13-criteria weights test
+  const tightCustom = { maxCvRmse: 4.5, maxAbsNmbe: 2, minR2: 0.90, label: 'Strict Custom Test' };
+  const customWeights = { ...getScoringWeights('balanced'), cvRmse: 0.5, r2: 0.2 };
+  const customBundle = runTargetModelingPipeline(ds, 'kwh_total', vsg1.entries, tcp, 42, 'custom', 'custom', customWeights, tightCustom);
+  assert.equal(customBundle.limits.maxCvRmse, 4.5);
+  assert.equal(customBundle.limits.maxAbsNmbe, 2);
+  assert.equal(customBundle.limits.minR2, 0.90);
+  assert.ok(customBundle.rejected.some((r) => r.rejectionReason?.includes('Strict Custom Test')));
+
   const locked = createLockedBaseline(
     ds,
     bundle1.top5[0],
@@ -118,18 +160,16 @@ test('Multi-target modeling, Top-5, Lock, Monitoring deviation, Drift & Report c
     'Unit test lock',
     bundle1.seed
   );
-
-  // Predict on reporting window (contains planted -215 kWh/day ECM savings!)
-  const reportingRows = ds.rows.filter((r) => r.timestamp >= ds.temporal.reportingStart);
   const mon = predictFromLockedBaseline(locked, reportingRows, ds, 'auto');
-  assert.equal(mon.points.length, reportingRows.length);
-  // Deviation = Actual - Baseline should be predominantly negative during planted savings
   const avgDev = mon.points.reduce((a, p) => a + (p.deviation ?? 0), 0) / mon.points.length;
   assert.ok(avgDev < -100, `Expected negative deviation from planted -215 savings, got ${avgDev}`);
   assert.ok(['amber', 'red'].includes(mon.drift.trafficLight));
 
-  // Report consistency check (RPT-4 / G-9)
+  // EDA & F5 autoencoder + F6 regime rules + Report consistency check (RPT-4 / G-9)
   const eda1 = computeEdaAndMining(ds, 'kwh_total', vsg1.entries, tcp, 42);
+  assert.ok(typeof eda1.anomalies.autoencoderFlagCount === 'number' && eda1.anomalies.autoencoderFlagCount >= 0);
+  assert.ok(eda1.regimeRules.length > 0, 'Expected F6 regime association rules');
+
   const tests1 = runDiagnosticsSuite(ds, 'kwh_total', vsg1.entries, tcp, 42);
   const report = buildDeterministicReportModel({
     dataset: ds,
@@ -146,4 +186,38 @@ test('Multi-target modeling, Top-5, Lock, Monitoring deviation, Drift & Report c
   });
   const consistency = verifyReportNarrativeConsistency(report);
   assert.equal(consistency.ok, true, consistency.mismatches.join('; '));
+});
+
+test('Multi-domain presets & standards resolve cleanly across Water, Finance & Environment', () => {
+  for (const [preset, expectedStd] of [
+    ['water_utility', 'awwa_water'],
+    ['finance_demand', 'basel_sr11_7'],
+    ['environmental_aqi', 'iso14064'],
+  ] as const) {
+    const ds = generateSyntheticDataset(preset, 42);
+    assert.equal(resolveStandardForDomain(ds.domain), expectedStd);
+    const targetCol = ds.columns.find((c) => c.role === 'target')!.name;
+    const tcp = createDefaultTcpConfig(ds);
+    const vsg = buildDefaultVsgForTarget(ds, targetCol, '2026-01-01T00:00:00Z');
+    const eda = computeEdaAndMining(ds, targetCol, vsg.entries, tcp, 42);
+    const tests = runDiagnosticsSuite(ds, targetCol, vsg.entries, tcp, 42);
+    const bundle = runTargetModelingPipeline(ds, targetCol, vsg.entries, tcp, 42, expectedStd);
+    assert.ok(bundle.top5.length >= 1, `${preset} should qualify models under ${expectedStd}`);
+    const locked = createLockedBaseline(ds, bundle.top5[0], vsg.entries, tcp, expectedStd, 0, 'Multi-domain lock', bundle.seed);
+    const report = buildDeterministicReportModel({
+      dataset: ds,
+      vsgByTarget: { [targetCol]: vsg.entries },
+      tcp,
+      testsByTarget: { [targetCol]: tests },
+      edaByTarget: { [targetCol]: eda },
+      modelingByTarget: { [targetCol]: bundle },
+      lockedBaselines: { [targetCol]: locked },
+      snapshots: [],
+      autoLogs: vsg.autoLogs,
+      auditLog: [],
+      seed: 42,
+    });
+    const consistency = verifyReportNarrativeConsistency(report);
+    assert.equal(consistency.ok, true, `${preset}: ${consistency.mismatches.join('; ')}`);
+  }
 });

@@ -181,23 +181,23 @@ export const SystemStatusView: React.FC<SystemStatusViewProps> = ({
       {/* Traceability & SBOM Summary */}
       <section className="border border-slate-200 dark:border-slate-800 rounded-lg bg-white dark:bg-slate-900 p-4 space-y-3 text-xs">
         <h2 className="text-sm font-semibold font-display">
-          Deliverable Registers, Verification Suites & SBOM
+          Deliverable Registers, Air-Gapped Offline Runtime &amp; Windows NSIS Packaging
         </h2>
         <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
           <div className="border border-slate-200 dark:border-slate-800 rounded p-3 space-y-1">
-            <div className="font-semibold">Tauri 2 + Python Sidecar</div>
+            <div className="font-semibold">Tauri 2 + Windows NSIS + Sidecar Lock</div>
             <div className="text-slate-500">
-              Verified via <span className="font-mono">python3 -m unittest</span> (9/9 passing): DB fallback ladder, online SQLite backup, IPC stdout isolation, stdin-EOF shutdown, PM-3 SQL guard.
+              Bundled via <span className="font-mono">scripts/build-windows-nsis.ps1</span> &amp; <span className="font-mono">.github/workflows/build-windows.yml</span>. Sidecar dependencies pinned in <span className="font-mono">sidecar/requirements-lock.txt</span> (XGBoost, LightGBM, CatBoost, PyTorch, MAPIE, PyInstaller).
             </div>
           </div>
           <div className="border border-slate-200 dark:border-slate-800 rounded p-3 space-y-1">
-            <div className="font-semibold">Analytics & Statistical Engine</div>
+            <div className="font-semibold">100% Air-Gapped Assets &amp; Diagnostics</div>
             <div className="text-slate-500">
-              Verified via <span className="font-mono">node:test</span> (5/5 passing): determinism, DAT-3 refusal, VSG leakage rules, TCP what-if flips, multi-target Top-5, Conformal UQ, Drift, Report consistency.
+              All typography bundled locally via <span className="font-mono">@fontsource</span> (zero Google Fonts network requests). Full T1–T14 + [O] tests, boosted trees, and NNs verified via <span className="font-mono">node:test</span> &amp; <span className="font-mono">unittest</span>.
             </div>
           </div>
           <div className="border border-slate-200 dark:border-slate-800 rounded p-3 space-y-1">
-            <div className="font-semibold">Docs & Registers</div>
+            <div className="font-semibold">Docs &amp; Registers</div>
             <div className="text-slate-500 font-mono">
               docs/requirements_matrix.md · docs/deviations.md · docs/assumptions.md · docs/not_implemented.md · SECURITY.md · USER_GUIDE.md
             </div>

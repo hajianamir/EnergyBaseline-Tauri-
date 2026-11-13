@@ -1,4 +1,5 @@
 import JSZip from 'jszip';
+import { DOMAIN_PROFILES } from './domains';
 import {
   AuditEvent,
   AutoDecisionEntry,
@@ -75,7 +76,9 @@ export function buildDeterministicReportModel(params: {
   const sigCount = firstTests.filter(
     (t) => t.decision === 'reject_h0' || t.decision === 'practical_significant'
   ).length;
+  const optionalTestsCount = firstTests.filter((t) => t.isOptionalTest).length;
   const flipCount = firstTests.filter((t) => t.decisionFlips).length;
+  const domainProf = DOMAIN_PROFILES[dataset.domain] ?? DOMAIN_PROFILES.custom;
 
   const sections: ReportSection[] = [
     {
@@ -180,17 +183,17 @@ export function buildDeterministicReportModel(params: {
       id: 'eda-correlation-mining',
       title: 'EDA Atlas, Correlation & Dependence Atlas & Data Mining',
       depthMin: 'Standard',
-      purpose: 'Present univariate profiling, Pearson/Spearman/Kendall/Distance-Corr/MI with CIs, PCA, regimes, and anomalies (F1–F9).',
-      method: 'Circular block-bootstrap CIs (CI-2), PCA correlation eigen-decomposition, K=3 regime clustering, ensemble anomaly voting.',
-      settingsUsed: `Confidence=${(tcp.confidenceLevel * 100).toFixed(0)}%, Block-bootstrap CI`,
+      purpose: 'Present univariate profiling, Pearson/Spearman/Kendall/Distance-Corr/MI with CIs, PCA, regimes, anomalies (autoencoder), and association rules (F1–F9).',
+      method: 'Circular block-bootstrap CIs (CI-2), PCA eigen-decomposition, K=3 regime clustering, ensemble + bottleneck autoencoder anomaly voting, regime association rules.',
+      settingsUsed: `Confidence=${(tcp.confidenceLevel * 100).toFixed(0)}%, Domain=${domainProf.label}`,
       resultsSummary: firstEda
-        ? `Optimal degree-day bases: Heating=${firstEda.timeSeriesMining.optimalBaseTempHeating}°C, Cooling=${firstEda.timeSeriesMining.optimalBaseTempCooling}°C · Clustering Silhouette=${firstEda.clustering.silhouette}, Bootstrap ARI=${firstEda.clustering.bootstrapAri} · Feature Consensus Kendall W=${firstEda.kendallW}.`
+        ? `Optimal change bases: Low=${firstEda.timeSeriesMining.optimalBaseTempHeating}°C, High=${firstEda.timeSeriesMining.optimalBaseTempCooling}°C · Clustering Silhouette=${firstEda.clustering.silhouette}, Bootstrap ARI=${firstEda.clustering.bootstrapAri} · Anomalies=${firstEda.anomalies.flaggedIndices.length} (autoencoder votes=${firstEda.anomalies.autoencoderFlagCount}) · Regime Rules=${firstEda.regimeRules.length} · Feature Consensus Kendall W=${firstEda.kendallW}.`
         : 'Pending.',
       interpretation: firstEda?.causalMv.available
-        ? `Causal M&V (${firstEda.causalMv.groupColumn}): ${firstEda.causalMv.interpretation}`
-        : 'Regime clustering and feature relevance consensus guide engineering intuition without target leakage.',
-      decisionImpact: 'Informs change-point base temperature initialization and regime-conditional UQ calibration.',
-      caveats: 'Granger/correlation findings are screening signals only and do not establish causation (TC-3).',
+        ? `Causal Attribution (${firstEda.causalMv.groupColumn}): ${firstEda.causalMv.interpretation}`
+        : 'Regime clustering, association rules, and feature relevance consensus guide engineering intuition without target leakage.',
+      decisionImpact: 'Informs change-point initialization, regime rules, and regime-conditional UQ calibration.',
+      caveats: 'Granger/Transfer-Entropy/correlation findings are screening signals only and do not establish causation (TC-3).',
       citedArtifacts: [],
       tableRows: firstEda?.correlations.map((c) => ({
         Pair: `${c.varA} ↔ ${c.varB}`,
@@ -207,16 +210,17 @@ export function buildDeterministicReportModel(params: {
       id: 'diagnostics-sensitivity',
       title: 'Statistical Diagnostics & Decision-Sensitivity Summary',
       depthMin: 'Standard',
-      purpose: 'Report T1–T14 test outcomes with raw/adjusted p-values, effect sizes, assumptions, and α-sensitivity flips.',
-      method: `Multiple-testing correction (${tcp.correctionMethod.toUpperCase()}) scoped ${tcp.correctionScope}; sensitivity evaluated at α ∈ {0.01, 0.05, 0.10} (TCP-7).`,
+      purpose: 'Report T1–T14 core [M] and extended [O] test outcomes with raw/adjusted p-values, effect sizes, assumptions, and α-sensitivity flips.',
+      method: `Multiple-testing correction (${tcp.correctionMethod.toUpperCase()}) scoped ${tcp.correctionScope}; sensitivity evaluated at α ∈ {0.01, 0.05, 0.10} (TCP-7); optional [O] suite=${tcp.includeOptionalTests ? 'Enabled' : 'Disabled'}.`,
       settingsUsed: `α=${tcp.alpha}, DecisionRule=${tcp.decisionRule}`,
-      resultsSummary: `${firstTests.length} tests executed for ${firstTarget ?? 'target'}; ${sigCount} significant; ${flipCount} threshold-sensitive decisions flip across α ∈ {0.01, 0.05, 0.10}.`,
+      resultsSummary: `${firstTests.length} tests executed for ${firstTarget ?? 'target'} (${optionalTestsCount} optional [O] tests); ${sigCount} significant; ${flipCount} threshold-sensitive decisions flip across α ∈ {0.01, 0.05, 0.10}.`,
       interpretation: 'Both statistical significance (p_adj) and practical effect sizes are separated to prevent large-n p-value inflation (TC-8).',
-      decisionImpact: 'T5 stationarity matrix and T9 structural breaks inform model selection and monitoring expectations (TC-4, TC-5).',
+      decisionImpact: 'T5 stationarity matrix (incl. Canova-Hansen/OCSB) and T9 structural breaks (incl. Hansen L_c/BOCPD) inform model selection and monitoring expectations (TC-4, TC-5).',
       caveats: 'Custom Chow and Quandt-Andrews tests are validated against R strucchange reference scripts.',
       citedArtifacts: [],
       tableRows: firstTests.map((t) => ({
         Family: t.familyId,
+        Priority: t.isOptionalTest ? '[O]' : '[M]',
         Test: t.testName,
         Variable: t.variable,
         Statistic: t.statistic ?? 'N/A',
@@ -232,9 +236,9 @@ export function buildDeterministicReportModel(params: {
       title: 'Model Portfolio, Top-5 Shortlist, Decision Rationale & Model Cards',
       depthMin: 'Executive',
       purpose: 'Detail validation design, Top-5 leaderboard, why Top-1 won, why alternatives were rejected, and locked Model Card.',
-      method: 'Blocked K-Fold / Forward-Chaining with Purge Gap, 13-criteria min-max scoring, T11 DM test, NN Gate & Ensemble Gate.',
+      method: 'Blocked K-Fold / Forward-Chaining with Purge Gap, 13-criteria min-max scoring, T11 DM test, NN Gate & Ensemble Gate across Classical, Boosted Trees (XGBoost/LightGBM/CatBoost/GBM), and Neural Networks.',
       settingsUsed: firstBundle
-        ? `CV=${firstBundle.top5[0]?.cvScheme}, PurgeGap=${firstBundle.top5[0]?.purgeGapSteps} steps, Profile=${firstBundle.weightProfile}, Thresholds=${firstBundle.thresholdProfile}`
+        ? `CV=${firstBundle.top5[0]?.cvScheme}, PurgeGap=${firstBundle.top5[0]?.purgeGapSteps} steps, Profile=${firstBundle.weightProfile}, Standard=${firstBundle.limits.citation} (CV≤${firstBundle.limits.maxCvRmse}%, |NMBE|≤${firstBundle.limits.maxAbsNmbe}%, R²≥${firstBundle.limits.minR2})`
         : 'Pending',
       resultsSummary: firstBundle
         ? `Qualified=${firstBundle.top5.length + firstBundle.qualifiedNotShortlisted.length}, Rejected=${firstBundle.rejected.length}. Top-1 Rank Stability (±20% weights)=${firstBundle.top5[0]?.rankStabilityPct ?? 0}%.`
@@ -320,9 +324,10 @@ export function buildDeterministicReportModel(params: {
     sections,
     howToRead: [
       'Sections follow a uniform 8-part template: Purpose → Method → Settings → Results → Interpretation → Decision Impact → Caveats.',
-      'Primary modeling metrics (CV(RMSE), NMBE, R²) are out-of-fold (OOF) without DoF adjustment; Guideline-14 DoF-adjusted in-sample values are reported separately.',
+      `Domain & Deviation Context (${domainProf.label}): ${domainProf.deviationHintNegative}`,
+      'Primary modeling metrics (CV(RMSE), NMBE, R²) are out-of-fold (OOF) without DoF adjustment; DoF-adjusted in-sample values are reported separately.',
       'Deviation in Monitoring is strictly defined as Actual − Baseline.',
-      'Criteria are stated as "aligned with ASHRAE Guideline 14 / ISO 50015", never claiming formal certification.',
+      `Criteria are stated as "aligned with ${firstBundle?.limits.citation ?? 'selected tolerance standard'}", never claiming formal certification.`,
     ],
     glossary: [
       { term: 'CV(RMSE)', definition: 'Coefficient of Variation of Root Mean Squared Error: RMSE / mean(y) × 100 (%).' },
