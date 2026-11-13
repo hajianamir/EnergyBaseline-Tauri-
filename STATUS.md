@@ -45,7 +45,7 @@ The F-01–F-13 identifiers and their detailed acceptance criteria remain those 
 | F-06 | Not started | — | — | Pending its specified phase and acceptance criteria. |
 | F-07 | Not started | — | — | Pending its specified phase and acceptance criteria. |
 | F-08 | Not started | — | — | Pending its specified phase and acceptance criteria. |
-| F-09 | In progress — local regression passing; CI pending | — | HTML export test verifies company, dataset, and section text is escaped in inert HTML text nodes; engine 21/21, lint/build pass locally. | Physical acceptance remains pending; do not claim Phase 5 Passed from automation alone. |
+| F-09 | Fixed — regression-test-only | `4af5d65` | HTML export test verifies company, dataset, and section text is escaped in inert HTML text nodes; engine 21/21, lint/build passed locally; CI run `43477894324` passed on Windows/Ubuntu and packaged the Windows installer. | Physical Windows acceptance remains pending; Phase 5 is not Passed. |
 | F-10 | Not started | — | — | Pending its specified phase and acceptance criteria. |
 | F-11 | Not started | — | — | Pending its specified phase and acceptance criteria. |
 | F-12 | Not started | — | — | Pending its specified phase and acceptance criteria. |
