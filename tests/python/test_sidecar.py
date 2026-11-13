@@ -308,6 +308,10 @@ class TestSidecarIpc(unittest.TestCase):
 
 
 class TestSecurityConfig(unittest.TestCase):
+    def test_vite_dev_server_uses_requested_loopback_bind_and_port(self) -> None:
+        package = json.loads((REPO_ROOT / "package.json").read_text(encoding="utf-8"))
+        self.assertEqual(package["scripts"]["dev"], "vite --port=3000 --host=127.0.0.1")
+
     def test_csp_scopes_inline_styles_to_documented_attribute_exception(self) -> None:
         config = json.loads((REPO_ROOT / "src-tauri" / "tauri.conf.json").read_text(encoding="utf-8"))
         csp = config["app"]["security"]["csp"]
