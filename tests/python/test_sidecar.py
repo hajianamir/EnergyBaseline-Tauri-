@@ -32,8 +32,9 @@ class TestDbResolver(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             res = resolve_database(tmp)
             self.assertFalse(res.fallback)
-            self.assertIn(tmp, res.url)
-            self.assertTrue((Path(tmp) / "data" / "app.db").exists())
+            expected_db_path = (Path(tmp).resolve() / "data" / "app.db").resolve()
+            self.assertEqual(res.sqlite_path, expected_db_path)
+            self.assertTrue(expected_db_path.exists())
 
     def test_whitespace_env_ignored(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
