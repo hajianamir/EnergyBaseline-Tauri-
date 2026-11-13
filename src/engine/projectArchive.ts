@@ -50,6 +50,8 @@ const ALLOWED_ZIP_NAMES = new Set(['manifest.json', 'data/', 'data/dataset_rows.
 interface ZipEntryStat {
   compressedSize: number;
   uncompressedSize: number;
+  compressionMethod: number;
+  dataOffset: number;
 }
 
 interface ZipMetadata {
@@ -262,10 +264,20 @@ function inspectZipArchive(bytes: Uint8Array): ZipMetadata {
     }
     const localFlags = view.getUint16(localHeaderOffset + 6, true);
     const localCompressionMethod = view.getUint16(localHeaderOffset + 8, true);
+    const localCrc32 = view.getUint32(localHeaderOffset + 14, true);
+    const localCompressedSize = view.getUint32(localHeaderOffset + 18, true);
+    const localUncompressedSize = view.getUint32(localHeaderOffset + 22, true);
     const localNameLength = view.getUint16(localHeaderOffset + 26, true);
     const localExtraLength = view.getUint16(localHeaderOffset + 28, true);
-    if ((localFlags & 0x0001) !== 0 || localCompressionMethod !== compressionMethod) {
+    if (localFlags !== flags || localCompressionMethod !== compressionMethod) {
       invalidArchive(`ZIP entry '${name}' local and central metadata disagree.`);
+    }
+    if ((flags & 0x0008) === 0 && (
+      localCrc32 !== view.getUint32(cursor + 16, true)
+      || localCompressedSize !== compressedSize
+      || localUncompressedSize !== uncompressedSize
+    )) {
+      invalidArchive(`ZIP entry '${name}' local and central size/checksum metadata disagree.`);
     }
     const localNameEnd = localHeaderOffset + 30 + localNameLength;
     const dataOffset = localNameEnd + localExtraLength;
@@ -280,7 +292,7 @@ function inspectZipArchive(bytes: Uint8Array): ZipMetadata {
     }
     if (localName !== name) invalidArchive(`ZIP entry '${name}' local and central names disagree.`);
 
-    entryStats.set(name, { compressedSize, uncompressedSize });
+    entryStats.set(name, { compressedSize, uncompressedSize, compressionMethod, dataOffset });
     cursor = recordEnd;
   }
 
@@ -291,6 +303,63 @@ function inspectZipArchive(bytes: Uint8Array): ZipMetadata {
     invalidArchive('Required manifest.json or data/dataset_rows.json entry is missing.');
   }
   return { entryStats };
+}
+
+/**
+ * The ZIP central directory is attacker-controlled. Verify the actual streamed
+ * output size before asking JSZip to materialize an entry in memory; otherwise
+ * a forged small uncompressed-size field can bypass metadata-only bomb checks.
+ */
+async function verifyActualZipUncompressedSizes(bytes: Uint8Array, metadata: ZipMetadata): Promise<void> {
+  if (typeof globalThis.DecompressionStream !== 'function') {
+    invalidArchive('streaming ZIP decompression is unavailable in this runtime.');
+  }
+  let totalUncompressedBytes = 0;
+
+  for (const [name, stats] of metadata.entryStats) {
+    const maxEntryBytes = name === 'manifest.json' ? EBPROJ_LIMITS.maxManifestBytes : EBPROJ_LIMITS.maxEntryBytes;
+    const compressedData = bytes.subarray(stats.dataOffset, stats.dataOffset + stats.compressedSize);
+    let actualUncompressedSize = 0;
+
+    if (stats.compressionMethod === 0) {
+      actualUncompressedSize = compressedData.byteLength;
+    } else {
+      const compressedBuffer = new Uint8Array(compressedData.byteLength);
+      compressedBuffer.set(compressedData);
+      let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+      try {
+        reader = new Blob([compressedBuffer.buffer]).stream()
+          .pipeThrough(new DecompressionStream('deflate-raw'))
+          .getReader();
+        while (true) {
+          const chunk = await reader.read();
+          if (chunk.done) break;
+          actualUncompressedSize += chunk.value.byteLength;
+          if (actualUncompressedSize > stats.uncompressedSize) {
+            await reader.cancel().catch(() => undefined);
+            invalidArchive(`ZIP entry '${name}' inflates beyond its declared uncompressed size.`);
+          }
+          if (actualUncompressedSize > maxEntryBytes || totalUncompressedBytes + actualUncompressedSize > EBPROJ_LIMITS.maxTotalUncompressedBytes) {
+            await reader.cancel().catch(() => undefined);
+            invalidArchive(`ZIP entry '${name}' exceeds the actual uncompressed size limit.`);
+          }
+        }
+      } catch (error) {
+        if (error instanceof Error && error.message.startsWith('Invalid .ebproj archive:')) throw error;
+        invalidArchive(`ZIP entry '${name}' could not be safely decompressed.`);
+      } finally {
+        reader?.releaseLock();
+      }
+    }
+
+    if (actualUncompressedSize !== stats.uncompressedSize) {
+      invalidArchive(`ZIP entry '${name}' actual uncompressed size does not match ZIP metadata.`);
+    }
+    if (actualUncompressedSize > maxEntryBytes || totalUncompressedBytes + actualUncompressedSize > EBPROJ_LIMITS.maxTotalUncompressedBytes) {
+      invalidArchive(`ZIP entry '${name}' exceeds the actual uncompressed size limit.`);
+    }
+    totalUncompressedBytes += actualUncompressedSize;
+  }
 }
 
 function validateStringArrayField(value: unknown, label: string, columnNames: Set<string>, maxLength = MAX_DATASET_COLUMNS): string[] {
@@ -807,6 +876,7 @@ export async function importEbprojZipFile(file: File): Promise<{
   }
 
   const metadata = inspectZipArchive(archiveBytes);
+  await verifyActualZipUncompressedSizes(archiveBytes, metadata);
   let zip: JSZip;
   try {
     zip = await JSZip.loadAsync(archiveBytes, { checkCRC32: false, createFolders: false });

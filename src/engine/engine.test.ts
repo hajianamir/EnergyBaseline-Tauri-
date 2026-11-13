@@ -511,6 +511,40 @@ test('F-11: .ebproj ZIP-bomb metadata is rejected before entry decompression', a
   );
 });
 
+test('F-11: .ebproj streaming preflight catches forged undersized ZIP metadata before JSZip buffers the entry', async () => {
+  const blob = await exportEbprojZipBlob(makeEbprojFixture());
+  const bytes = new Uint8Array(await blob.arrayBuffer());
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const decoder = new TextDecoder();
+  let cursor = 0;
+  let patched = false;
+  while (cursor + 46 <= bytes.length) {
+    if (view.getUint32(cursor, true) !== 0x02014b50) {
+      cursor++;
+      continue;
+    }
+    const nameLength = view.getUint16(cursor + 28, true);
+    const extraLength = view.getUint16(cursor + 30, true);
+    const commentLength = view.getUint16(cursor + 32, true);
+    const name = decoder.decode(bytes.subarray(cursor + 46, cursor + 46 + nameLength));
+    if (name === 'data/dataset_rows.json') {
+      const declaredSize = view.getUint32(cursor + 24, true);
+      const localHeaderOffset = view.getUint32(cursor + 42, true);
+      assert.ok(declaredSize > 1, 'fixture rows should have a nontrivial uncompressed size');
+      view.setUint32(cursor + 24, declaredSize - 1, true);
+      view.setUint32(localHeaderOffset + 22, declaredSize - 1, true);
+      patched = true;
+      break;
+    }
+    cursor += 46 + nameLength + extraLength + commentLength;
+  }
+  assert.equal(patched, true, 'test archive should contain the dataset rows central-directory record');
+  await assert.rejects(
+    importEbprojZipFile(asEbprojFile(new Blob([bytes], { type: 'application/zip' }))),
+    /inflates beyond its declared uncompressed size/
+  );
+});
+
 test('F-09: HTML report export escapes company, dataset, and section text as inert text nodes', () => {
   const payload = `<img src=x onerror="alert('xss')"> & report`;
   const report: ReportModel = {
