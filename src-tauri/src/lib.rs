@@ -62,7 +62,7 @@ impl SidecarHandle {
 }
 
 #[tauri::command]
-pub async fn rpc_call(
+async fn rpc_call(
     state: tauri::State<'_, Arc<SidecarHandle>>,
     method: String,
     params: serde_json::Value,
@@ -94,7 +94,7 @@ pub async fn rpc_call(
 }
 
 #[tauri::command]
-pub async fn rpc_cancel(
+async fn rpc_cancel(
     state: tauri::State<'_, Arc<SidecarHandle>>,
     id: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
