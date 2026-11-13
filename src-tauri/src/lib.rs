@@ -113,14 +113,16 @@ pub fn run() {
             // The capability grants fs operations but starts with no global paths.
             // Allow only the resolved APP_HOME (including portable mode); the dialog
             // plugin separately grants paths the user explicitly selects.
-            if let Err(error) = app.fs_scope().allow_directory(&app_home, true) {
-                eprintln!("Could not scope the filesystem to APP_HOME: {error}");
+            if let Err(_error) = app.fs_scope().allow_directory(&app_home, true) {
+                #[cfg(debug_assertions)]
+                eprintln!("Could not scope the filesystem to APP_HOME: {_error}");
             }
             let log_path = resolve_log_path(&app_home);
             let sidecar = SidecarHandle::new(app.handle().clone(), app_home, log_path);
             app.manage(Arc::clone(&sidecar));
-            if let Err(error) = sidecar.start() {
-                eprintln!("EnergyBaseline sidecar startup deferred: {error}");
+            if let Err(_error) = sidecar.start() {
+                #[cfg(debug_assertions)]
+                eprintln!("EnergyBaseline sidecar startup deferred: {_error}");
             }
             Ok(())
         })

@@ -43,14 +43,23 @@ def _configure_logging() -> str:
         except OSError:
             continue
 
-    # Logging must never prevent the stdio service from booting.
+    # Logging must never prevent the stdio service from booting. Stderr is a
+    # development-only fallback; release builds discard logs if no file is writable.
+    if os.environ.get("ENERGYBASELINE_DEBUG") == "1":
+        logging.basicConfig(
+            level=logging.WARNING,
+            format="%(asctime)s %(levelname)s %(name)s %(message)s",
+            stream=sys.stderr,
+            force=True,
+        )
+        return "stderr"
     logging.basicConfig(
         level=logging.WARNING,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
-        stream=sys.stderr,
+        handlers=[logging.NullHandler()],
         force=True,
     )
-    return "stderr"
+    return "unavailable"
 
 
 def main() -> int:
@@ -62,8 +71,9 @@ def main() -> int:
 
     log_path = _configure_logging()
     proto_out = isolate_protocol_stdout()
-    # Prove stray print() goes to stderr, never corrupting NDJSON protocol stdout (IPC-2).
-    print("sidecar.booting (redirected to stderr)")
+    # A debug-only marker proves stdout is isolated from the NDJSON protocol.
+    if os.environ.get("ENERGYBASELINE_DEBUG") == "1":
+        print("sidecar.booting (redirected to stderr)")
     logging.getLogger("energybaseline").info("sidecar.booting")
     server = SidecarIpcServer(proto_out=proto_out, app_home=os.environ.get("APP_HOME"), log_path=log_path)
     return server.serve_forever(sys.stdin)

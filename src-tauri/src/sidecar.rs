@@ -19,6 +19,10 @@ const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 const FORCE_SHUTDOWN_WAIT: Duration = Duration::from_secs(2);
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
+const MAX_PROGRESS_REQUEST_ID_BYTES: usize = 256;
+const MAX_PROGRESS_TARGET_BYTES: usize = 128;
+const MAX_PROGRESS_STAGE_BYTES: usize = 64;
+const MAX_PROGRESS_TEST_ID_BYTES: usize = 128;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RuntimePhase {
@@ -48,6 +52,13 @@ pub(crate) struct SidecarUiStatus {
     message: Option<String>,
     log_path: String,
     db: Option<Value>,
+}
+
+struct ValidatedProgress {
+    target: String,
+    stage: String,
+    test_id: Option<String>,
+    payload: Value,
 }
 
 struct RuntimeState {
@@ -202,7 +213,11 @@ impl<R: Runtime> SidecarHandle<R> {
             }
         }
         if cfg!(debug_assertions) {
-            command = command.env("PYTHONUNBUFFERED", "1");
+            command = command
+                .env("PYTHONUNBUFFERED", "1")
+                .env("ENERGYBASELINE_DEBUG", "1");
+        } else {
+            command = command.env("ENERGYBASELINE_DEBUG", "0");
         }
 
         let (receiver, child) = match command.spawn() {
@@ -441,10 +456,15 @@ impl<R: Runtime> SidecarHandle<R> {
     }
 
     fn handle_progress(&self, generation: u64, params: Value) {
-        let target = params.get("target").and_then(Value::as_str).unwrap_or("global");
-        let stage = params.get("stage").and_then(Value::as_str).unwrap_or("unknown");
-        let test_id = params.get("test_id").and_then(Value::as_str).unwrap_or("");
-        let throttle_key = format!("{target}:{stage}:{test_id}");
+        let Some(progress) = validate_progress(&params) else {
+            return;
+        };
+        let throttle_key = format!(
+            "{}:{}:{}",
+            progress.target,
+            progress.stage,
+            progress.test_id.as_deref().unwrap_or("")
+        );
         let now = Instant::now();
         let should_emit = {
             let Ok(mut runtime) = self.runtime.lock() else {
@@ -462,7 +482,7 @@ impl<R: Runtime> SidecarHandle<R> {
             }
         };
         if should_emit {
-            let _ = self.app.emit("sidecar-progress", params);
+            let _ = self.app.emit("sidecar-progress", progress.payload);
         }
     }
 
@@ -829,6 +849,52 @@ fn id_key(id: &Value) -> Result<String, String> {
     serde_json::to_string(id).map_err(|error| format!("INTERNAL: Could not encode RPC id: {error}"))
 }
 
+fn bounded_progress_label(value: &Value, max_bytes: usize) -> Option<String> {
+    let label = value.as_str()?;
+    if label.trim().is_empty()
+        || label.len() > max_bytes
+        || label.chars().any(|character| character.is_control())
+    {
+        return None;
+    }
+    Some(label.to_string())
+}
+
+fn validate_progress(params: &Value) -> Option<ValidatedProgress> {
+    let object = params.as_object()?;
+    let request_id = object.get("request_id")?;
+    if id_key(request_id).ok()?.len() > MAX_PROGRESS_REQUEST_ID_BYTES {
+        return None;
+    }
+    let target = bounded_progress_label(object.get("target")?, MAX_PROGRESS_TARGET_BYTES)?;
+    let stage = bounded_progress_label(object.get("stage")?, MAX_PROGRESS_STAGE_BYTES)?;
+    let percent = object.get("percent")?.as_u64()?;
+    if percent > 100 {
+        return None;
+    }
+    let test_id = match object.get("test_id") {
+        Some(value) => Some(bounded_progress_label(value, MAX_PROGRESS_TEST_ID_BYTES)?),
+        None => None,
+    };
+
+    let mut payload = json!({
+        "request_id": request_id,
+        "target": target,
+        "stage": stage,
+        "percent": percent,
+    });
+    if let Some(test_id) = &test_id {
+        payload["test_id"] = Value::String(test_id.clone());
+    }
+
+    Some(ValidatedProgress {
+        target,
+        stage,
+        test_id,
+        payload,
+    })
+}
+
 #[cfg(windows)]
 struct ProcessTreeGuard {
     job: windows_sys::Win32::Foundation::HANDLE,
@@ -935,7 +1001,7 @@ fn terminate_process_tree(process_tree: Option<ProcessTreeGuard>, pid: Option<u3
 
 #[cfg(test)]
 mod tests {
-    use super::{id_key, is_valid_id, MAX_FRAME_BYTES};
+    use super::{id_key, is_valid_id, validate_progress, MAX_FRAME_BYTES};
     use serde_json::json;
     #[cfg(feature = "integration")]
     use super::SidecarHandle;
@@ -1092,6 +1158,62 @@ mod tests {
     #[test]
     fn request_frame_limit_is_one_mib() {
         assert_eq!(MAX_FRAME_BYTES, 1024 * 1024);
+    }
+
+    #[test]
+    fn progress_notifications_are_validated_and_sanitized() {
+        let params = json!({
+            "request_id": "status-1",
+            "target": "system",
+            "stage": "status",
+            "percent": 100,
+            "test_id": "T1",
+            "unexpected": "must not reach the frontend",
+        });
+        let progress = validate_progress(&params).expect("valid progress should be accepted");
+        assert_eq!(progress.target, "system");
+        assert_eq!(progress.stage, "status");
+        assert_eq!(
+            progress.payload,
+            json!({
+                "request_id": "status-1",
+                "target": "system",
+                "stage": "status",
+                "percent": 100,
+                "test_id": "T1",
+            })
+        );
+    }
+
+    #[test]
+    fn progress_notifications_reject_invalid_ids_labels_and_percentages() {
+        let valid = json!({
+            "request_id": "request-1",
+            "target": "system",
+            "stage": "status",
+            "percent": 50,
+        });
+        let invalid_fields = [
+            ("request_id", json!(true)),
+            ("request_id", json!("x".repeat(257))),
+            ("target", json!("")),
+            ("target", json!("x".repeat(129))),
+            ("stage", json!("bad\nstage")),
+            ("percent", json!(-1)),
+            ("percent", json!(101)),
+            ("percent", json!(50.5)),
+            ("test_id", json!({"id": 1})),
+        ];
+        for (field, value) in invalid_fields {
+            let mut params = valid.clone();
+            params[field] = value;
+            assert!(validate_progress(&params).is_none(), "accepted invalid {field}");
+        }
+
+        let mut missing_percent = valid;
+        missing_percent.as_object_mut().unwrap().remove("percent");
+        assert!(validate_progress(&missing_percent).is_none());
+        assert!(validate_progress(&json!([])).is_none());
     }
 
     #[cfg(windows)]

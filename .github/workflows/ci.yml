@@ -6,41 +6,8 @@ on:
   workflow_dispatch:
 
 jobs:
-  cargo-lock:
-    name: Resolve Cargo lockfile
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Setup Rust stable toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Generate Cargo lockfile for bootstrap validation
-        run: cargo generate-lockfile --manifest-path src-tauri/Cargo.toml
-
-      - name: Expose Cargo lockfile for local bootstrap
-        shell: bash
-        run: |
-          set -euo pipefail
-          encoded="$(xz -9e -c src-tauri/Cargo.lock | base64 -w0)"
-          part=1
-          while IFS= read -r chunk || [[ -n "$chunk" ]]; do
-            printf '::notice title=CARGOLOCK_PART_%03d::%s\n' "$part" "$chunk"
-            part=$((part + 1))
-          # Keep ten-or-fewer chunks under GitHub's 4 KiB annotation payload limit.
-          done < <(printf '%s' "$encoded" | fold -w 3900)
-
-      - name: Upload Cargo lockfile for Phase 0 bootstrap
-        uses: actions/upload-artifact@v4
-        with:
-          name: cargo-lockfile-bootstrap
-          path: src-tauri/Cargo.lock
-          if-no-files-found: error
-
   validate:
     name: Validate (${{ matrix.os }})
-    needs: cargo-lock
     env:
       TAURI_CONFIG: '{"bundle":{"resources":[]}}'
     strategy:
@@ -51,12 +18,6 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
-      - name: Download generated Cargo lockfile
-        uses: actions/download-artifact@v4
-        with:
-          name: cargo-lockfile-bootstrap
-          path: src-tauri
 
       - name: Setup Node.js 22.22.3
         uses: actions/setup-node@v4
@@ -189,17 +150,10 @@ jobs:
 
   package-windows:
     name: Package Windows installer (M-1)
-    needs: cargo-lock
     runs-on: windows-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
-      - name: Download generated Cargo lockfile
-        uses: actions/download-artifact@v4
-        with:
-          name: cargo-lockfile-bootstrap
-          path: src-tauri
 
       - name: Setup Node.js 22.22.3
         uses: actions/setup-node@v4

@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -18,6 +19,7 @@ from energybaseline.config.settings import (  # noqa: E402
     resolve_database,
 )
 from energybaseline.sql.guard import validate_readonly_sql  # noqa: E402
+from energybaseline.main import _configure_logging  # noqa: E402
 
 
 class TestDbResolver(unittest.TestCase):
@@ -107,14 +109,45 @@ class TestDbResolver(unittest.TestCase):
 
 
 class TestSidecarIpc(unittest.TestCase):
+    def test_logging_stderr_fallback_is_debug_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            not_a_directory = Path(tmp) / "not-a-directory"
+            not_a_directory.write_text("blocks log directory creation", encoding="utf-8")
+            fallback_environment = {
+                "ENERGYBASELINE_LOG_PATH": str(not_a_directory / "sidecar.log"),
+                "APP_HOME": str(not_a_directory),
+            }
+            with patch("energybaseline.main.tempfile.gettempdir", return_value=not_a_directory):
+                with patch("energybaseline.main.logging.basicConfig") as basic_config:
+                    with patch.dict(os.environ, {**fallback_environment, "ENERGYBASELINE_DEBUG": "1"}):
+                        self.assertEqual(_configure_logging(), "stderr")
+                    basic_config.assert_called_once()
+                    self.assertIs(basic_config.call_args.kwargs["stream"], sys.stderr)
+
+                with patch("energybaseline.main.logging.basicConfig") as basic_config:
+                    with patch.dict(os.environ, {**fallback_environment, "ENERGYBASELINE_DEBUG": "0"}):
+                        self.assertEqual(_configure_logging(), "unavailable")
+                    basic_config.assert_called_once()
+                    self.assertNotIn("stream", basic_config.call_args.kwargs)
+                    self.assertIsInstance(
+                        basic_config.call_args.kwargs["handlers"][0], logging.NullHandler
+                    )
+
     def test_handshake_stray_print_isolation_and_stdin_eof(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
+            env = os.environ.copy()
+            env.update({
+                "APP_HOME": tmp,
+                "ENERGYBASELINE_LOG_PATH": str(Path(tmp) / "sidecar.log"),
+                "ENERGYBASELINE_DEBUG": "1",
+            })
             proc = subprocess.Popen(
                 [sys.executable, str(SIDECAR_DIR / "energybaseline" / "main.py")],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                env=env,
             )
             assert proc.stdin and proc.stdout and proc.stderr
             hello = json.dumps({
@@ -138,6 +171,34 @@ class TestSidecarIpc(unittest.TestCase):
             self.assertFalse(lines[2]["result"]["matplotlib_loaded"])
             self.assertEqual(lines[3]["error"]["code"], -32601)
             self.assertEqual(lines[4]["result"], {"cancelled": 3})
+
+    def test_release_mode_suppresses_debug_stderr(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env = os.environ.copy()
+            env.update({
+                "APP_HOME": tmp,
+                "ENERGYBASELINE_LOG_PATH": str(Path(tmp) / "sidecar.log"),
+                "ENERGYBASELINE_DEBUG": "0",
+            })
+            proc = subprocess.Popen(
+                [sys.executable, str(SIDECAR_DIR / "energybaseline" / "main.py")],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=env,
+            )
+            hello = json.dumps({
+                "protocol_version": "1.0",
+                "app_version": "5.2.0",
+                "parent_pid": os.getpid(),
+                "app_home": tmp,
+            })
+            stdout_data, stderr_data = proc.communicate(input=f"{hello}\n", timeout=10)
+            self.assertEqual(proc.returncode, 0)
+            self.assertIn("sidecar.ready", stdout_data)
+            self.assertNotIn("sidecar.booting", stdout_data)
+            self.assertNotIn("sidecar.booting", stderr_data)
 
     def test_protocol_version_mismatch_aborts(self) -> None:
         proc = subprocess.Popen(
