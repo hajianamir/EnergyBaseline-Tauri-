@@ -50,6 +50,9 @@ export const DiagnosticsEdaView: React.FC<DiagnosticsEdaViewProps> = ({
             {r.isOptionalTest && (
               <span className="font-mono text-[11px] font-semibold text-amber-700 dark:text-amber-400 mr-1.5">[O]</span>
             )}
+            {r.approximate && (
+              <span className="font-mono text-[10px] font-semibold uppercase text-amber-700 dark:text-amber-400 mr-1.5">Approx.</span>
+            )}
             {String(v)}
           </span>
         ),
@@ -507,27 +510,58 @@ export const DiagnosticsEdaView: React.FC<DiagnosticsEdaViewProps> = ({
                   <div className="text-base font-mono font-bold mt-1">{eda.causalMv.groupColumn}</div>
                 </div>
                 <div className="border border-slate-200 dark:border-slate-800 rounded p-3">
-                  <div className="text-slate-500">Adjusted DiD Effect</div>
+                  <div className="text-slate-500">Two-Way FE DiD Effect</div>
                   <div className="text-base font-mono font-bold mt-1">
                     {eda.causalMv.didEstimate} ± {(1.96 * (eda.causalMv.didSe ?? 0)).toFixed(2)}
                   </div>
                   <div className="text-[11px] text-slate-500">p = {eda.causalMv.didPValue}</div>
                 </div>
                 <div className="border border-slate-200 dark:border-slate-800 rounded p-3">
-                  <div className="text-slate-500">Covariate SMD (Before → After)</div>
+                  <div className="text-slate-500">Pre-Treatment Covariate SMD</div>
                   <div className="text-base font-mono font-bold mt-1">
-                    {eda.causalMv.smdBefore} → {eda.causalMv.smdAfter}
+                    {eda.causalMv.smdBefore ?? 'not computed'}
                   </div>
-                  <div className="text-[11px] text-slate-500">Kernel balancing reduction</div>
+                  <div className="text-[11px] text-slate-500">No matching weights applied; after-match SMD is not claimed.</div>
                 </div>
                 <div className="border border-slate-200 dark:border-slate-800 rounded p-3">
                   <div className="text-slate-500">Refutation & Parallel Trends</div>
                   <div className="text-base font-mono font-bold mt-1">
                     PT p={eda.causalMv.parallelTrendsP} · Placebo p={eda.causalMv.placeboRefutationP}
                   </div>
+                  <div className="text-[11px] text-slate-500">
+                    {eda.causalMv.parallelTrendsMethod === 'linear_pretrend_hac_fallback'
+                      ? 'Linear pre-trend HAC fallback'
+                      : eda.causalMv.parallelTrendsMethod === 'event_study_leads_joint_hac'
+                        ? 'Joint event-study lead HAC test'
+                        : 'Pre-trend method unavailable'}
+                  </div>
                 </div>
               </div>
               <p className="text-xs text-slate-700 dark:text-slate-300">{eda.causalMv.interpretation}</p>
+              {(eda.causalMv.eventStudy ?? []).length > 0 && (
+                <div className="overflow-x-auto border border-slate-200 dark:border-slate-800 rounded">
+                  <table className="w-full text-xs">
+                    <thead className="bg-slate-50 dark:bg-slate-800/60 text-left text-slate-500">
+                      <tr>
+                        <th className="px-3 py-2">Event time (periods)</th>
+                        <th className="px-3 py-2 text-right">TWFE estimate</th>
+                        <th className="px-3 py-2 text-right">HAC SE</th>
+                        <th className="px-3 py-2 text-right">p-value</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
+                      {(eda.causalMv.eventStudy ?? []).map((period) => (
+                        <tr key={period.relativePeriod}>
+                          <td className="px-3 py-2 font-mono">{period.relativePeriod}</td>
+                          <td className="px-3 py-2 text-right font-mono">{period.estimate.toFixed(3)}</td>
+                          <td className="px-3 py-2 text-right font-mono">{period.standardError?.toFixed(3) ?? '—'}</td>
+                          <td className="px-3 py-2 text-right font-mono">{period.pValue?.toExponential(2) ?? '—'}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
             </div>
           )}
         </section>

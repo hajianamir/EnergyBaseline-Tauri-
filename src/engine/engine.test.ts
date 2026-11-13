@@ -8,9 +8,13 @@ import {
 import { executeGuardedLocalSql, validateReadOnlySql } from './sqlGuard';
 import {
   buildDefaultVsgForTarget,
+  computeCausalMv,
   computeEdaAndMining,
+  computeMultivariateVif,
   dieboldMarianoHlnTest,
   getBaselineRows,
+  grangerCausalityTest,
+  mannKendallTrend,
   createDefaultTcpConfig,
   reevaluateTestResults,
   runDiagnosticsSuite,
@@ -28,7 +32,7 @@ import {
   shouldFitStackedEnsemble,
 } from './modeling';
 import { buildTemporalWarmupContext, predictFromLockedBaseline } from './monitoring';
-import type { DatasetRow } from './types';
+import type { DatasetRow, DatasetState } from './types';
 import { buildDeterministicReportModel, verifyReportNarrativeConsistency } from './report';
 import { resolveStandardForDomain } from './domains';
 
@@ -39,6 +43,55 @@ test('Synthetic ground-truth generator is deterministic for a fixed seed', () =>
   assert.equal(ds1.rows.length, 365);
   assert.deepEqual(ds1.rows[0], ds2.rows[0]);
 });
+
+function makePanelDataset(earlyPlaceboEffect = false): DatasetState {
+  const times = Array.from({ length: 24 }, (_, i) => new Date(Date.UTC(2025, 0, 1 + i)).toISOString());
+  const rows: DatasetRow[] = [];
+  for (let i = 0; i < times.length; i++) {
+    const common = 100 + 1.25 * i + 0.2 * Math.sin(i * 0.7);
+    const placeboShift = earlyPlaceboEffect && i >= 6 && i < 12 ? 4 : 0;
+    const periodEffect = i >= 12 ? 8 : 0;
+    rows.push({
+      timestamp: times[i],
+      group: 'control',
+      outcome: common + 0.15 * Math.sin(i * 0.3),
+      driver: 1 + 0.2 * i + 0.1 * Math.cos(i * 0.4),
+    });
+    rows.push({
+      timestamp: times[i],
+      group: 'treated',
+      outcome: common + 5 + 0.25 * Math.sin(i * 0.5) + placeboShift + periodEffect,
+      driver: 5 + 0.2 * i + 0.1 * Math.sin(i * 0.2),
+    });
+  }
+  return {
+    id: 'two-way-fe-did-fixture',
+    name: 'Two-way FE DiD fixture',
+    domain: 'custom',
+    rows,
+    rawRowCount: rows.length,
+    sha256: 'fixture-sha256',
+    columns: [
+      { name: 'timestamp', role: 'time', quantityType: 'index', aggregation: 'last', unit: 'UTC', unitFamily: 'time', availability: 'known_in_advance', dtype: 'datetime', roleMode: 'AUTO', suggestedRole: 'time' },
+      { name: 'outcome', role: 'target', quantityType: 'flow', aggregation: 'mean', unit: 'units', unitFamily: 'outcome', availability: 'observed_only', dtype: 'numeric', roleMode: 'AUTO', suggestedRole: 'target' },
+      { name: 'driver', role: 'predictor', quantityType: 'rate', aggregation: 'mean', unit: 'units', unitFamily: 'driver', availability: 'known_in_advance', dtype: 'numeric', roleMode: 'AUTO', suggestedRole: 'predictor' },
+      { name: 'group', role: 'group', quantityType: 'index', aggregation: 'last', unit: 'label', unitFamily: 'cohort', availability: 'known_in_advance', dtype: 'categorical', roleMode: 'AUTO', suggestedRole: 'group' },
+    ],
+    temporal: {
+      sourceGranularity: 'daily',
+      targetGranularity: 'daily',
+      timezone: 'UTC',
+      baselineStart: times[0],
+      baselineEnd: times[11],
+      reportingStart: times[12],
+      reportingEnd: times[times.length - 1],
+      dstPolicy: 'utc_store_flag_dst',
+      completenessThreshold: 0.75,
+    },
+    nonRoutineEvents: [],
+    sourceNote: 'deterministic test fixture',
+  };
+}
 
 test('Phase 2 / F-03: fold imputation and feature selection use training rows only', () => {
   const trainRows: DatasetRow[] = Array.from({ length: 20 }, (_, i) => ({
@@ -161,6 +214,78 @@ test('Phase 2 / F-03: Diebold-Mariano uses HAC variance and HLN finite-sample co
   assert.ok(Number.isFinite(result.statistic) && result.pValue >= 0 && result.pValue <= 1);
 });
 
+test('Phase 2 / F-13: VIF regresses each predictor on all others and has no fabricated p-value', () => {
+  const x2 = Array.from({ length: 120 }, (_, i) => Math.sin(i * 0.31));
+  const x3 = Array.from({ length: 120 }, (_, i) => Math.cos(i * 0.47));
+  const x1 = x2.map((value, i) => value + x3[i]);
+  const vif = computeMultivariateVif('x1', { x1, x2, x3 }, ['x1', 'x2', 'x3']);
+  assert.ok(vif.rSquared > 0.999, `multivariate R² should capture x1=x2+x3, got ${vif.rSquared}`);
+  assert.ok(vif.vif > 1000);
+  const ds = generateSyntheticDataset('energy_mv', 42);
+  const vsg = buildDefaultVsgForTarget(ds, 'kwh_total', '2026-01-01T00:00:00Z');
+  const tests = runDiagnosticsSuite(ds, 'kwh_total', vsg.entries, createDefaultTcpConfig(ds), 42);
+  const vifTests = tests.filter((result) => result.testName.includes('Variance Inflation Factor'));
+  assert.ok(vifTests.length >= 2);
+  assert.ok(vifTests.every((result) => result.pRaw === null && result.pAdjusted === null));
+});
+
+test('Phase 2 / F-13: T7 reports a lag-exclusion Granger test rather than treating VIF as causality', () => {
+  const x = Array.from({ length: 160 }, (_, i) => Math.sin(i * 0.31) + 0.2 * Math.cos(i * 0.73));
+  const y = new Array<number>(x.length).fill(0);
+  for (let i = 1; i < y.length; i++) y[i] = 0.35 * y[i - 1] + 3.5 * x[i - 1] + 0.1 * Math.sin(i * 1.9);
+  const testResult = grangerCausalityTest(x, y, 2)!;
+  assert.ok(testResult.statistic > 10);
+  assert.ok(testResult.pValue < 0.01);
+  const withGap = [...x];
+  withGap[50] = Number.NaN;
+  const gapAwareResult = grangerCausalityTest(withGap, y, 2)!;
+  assert.equal(gapAwareResult.nUsed, testResult.nUsed - 2, 'missing observations remove affected lag windows instead of compressing time');
+  const ds = generateSyntheticDataset('energy_mv', 42);
+  const vsg = buildDefaultVsgForTarget(ds, 'kwh_total', '2026-01-01T00:00:00Z');
+  const diagnostics = runDiagnosticsSuite(ds, 'kwh_total', vsg.entries, createDefaultTcpConfig(ds), 42);
+  assert.ok(diagnostics.some((result) => result.familyId === 'T7' && result.testName.startsWith('Granger Causality')));
+});
+
+test('Phase 2 / F-13: in-app stationarity screens identify themselves as approximate', () => {
+  const ds = generateSyntheticDataset('energy_mv', 42);
+  const vsg = buildDefaultVsgForTarget(ds, 'kwh_total', '2026-01-01T00:00:00Z');
+  const tests = runDiagnosticsSuite(ds, 'kwh_total', vsg.entries, createDefaultTcpConfig(ds), 42);
+  const stationarity = tests.filter((result) => result.familyId === 'T5' && /ADF|KPSS|Canova-Hansen|OCSB/.test(result.testName));
+  assert.ok(stationarity.length >= 4);
+  assert.ok(stationarity.every((result) => result.approximate === true));
+  assert.ok(stationarity.every((result) => /Approximate in-app/.test(result.assumptionsChecked)));
+});
+
+test('Phase 2 / F-13: Mann-Kendall variance corrects for ties and serial correlation', () => {
+  const values: number[] = [];
+  let state = 0;
+  for (let i = 0; i < 160; i++) {
+    state = 0.8 * state + Math.sin(i * 0.51) + 0.25 * Math.cos(i * 0.17);
+    values.push(Math.round(20 + i * 0.15 + state));
+  }
+  const result = mannKendallTrend(values);
+  assert.ok(result.tieCorrection < 1, `ties must reduce independent variance, got ${result.tieCorrection}`);
+  assert.notEqual(result.serialCorrection, 1, 'serial dependence must change the null variance');
+  assert.ok(result.variance > 0 && result.pValue >= 0 && result.pValue <= 1);
+});
+
+test('Phase 2 / F-13: T14 uses two-way FE DiD, event study, pre-trend and placebo tests', () => {
+  const panel = makePanelDataset();
+  const result = computeCausalMv(panel, 'outcome', ['driver']);
+  assert.equal(result.available, true);
+  assert.ok(Math.abs((result.didEstimate ?? 0) - 8) < 0.5, `expected the planted two-way FE effect, got ${result.didEstimate}`);
+  assert.ok((result.eventStudy?.length ?? 0) > 5);
+  assert.ok(result.eventStudy?.some((period) => period.relativePeriod === 0));
+  assert.notEqual(result.parallelTrendsP, null);
+  assert.notEqual(result.placeboRefutationP, null);
+  assert.notEqual(result.placeboRefutationP, 0.74, 'placebo p-value must be computed from the pre-period, not hard-coded');
+  assert.equal(result.smdAfter, null, 'no matching was applied, so no synthetic after-matching balance is reported');
+  const shiftedPlacebo = computeCausalMv(makePanelDataset(true), 'outcome', ['driver']);
+  assert.notEqual(shiftedPlacebo.placeboRefutationP, result.placeboRefutationP, 'placebo p-value should respond to pre-period data');
+  const reorderedPanel = { ...panel, rows: [...panel.rows].reverse() };
+  const reordered = computeCausalMv(reorderedPanel, 'outcome', ['driver']);
+  assert.equal(reordered.didEstimate, result.didEstimate, 'group assignment and estimates must be invariant to input row order');
+});
 
 test('DAT-3 refuses coarser-to-finer disaggregation with DATA_REFUSED', () => {
   const check = validateGranularityTransition('daily', 'hourly');

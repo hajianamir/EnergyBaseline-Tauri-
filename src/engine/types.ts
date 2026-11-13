@@ -229,6 +229,8 @@ export interface StatisticalTestResult {
   familyId: TestFamilyId;
   testName: string;
   isOptionalTest?: boolean;
+  /** True when this build uses an in-app approximation rather than a delegated reference implementation. */
+  approximate?: boolean;
   statistic: number | null;
   statisticName: string;
   df: string | null;
@@ -359,7 +361,14 @@ export interface EdaTargetSummary {
     smdBefore: number | null;
     smdAfter: number | null;
     parallelTrendsP: number | null;
+    parallelTrendsMethod?: 'event_study_leads_joint_hac' | 'linear_pretrend_hac_fallback';
     placeboRefutationP: number | null;
+    eventStudy?: {
+      relativePeriod: number;
+      estimate: number;
+      standardError: number | null;
+      pValue: number | null;
+    }[];
     interpretation: string;
   };
 }

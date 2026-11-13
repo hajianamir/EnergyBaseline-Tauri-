@@ -1073,6 +1073,192 @@ function olsSimple(x: number[], y: number[]): { slope: number; intercept: number
   return { slope, intercept, seSlope, r2, rss };
 }
 
+interface OlsFit {
+  beta: number[];
+  residuals: number[];
+  rss: number;
+  r2: number;
+  covariance: number[][] | null;
+  standardErrors: number[];
+  pValues: number[];
+  n: number;
+  dfResidual: number;
+}
+
+function invertMatrix(input: number[][]): number[][] | null {
+  const n = input.length;
+  if (n === 0 || input.some((row) => row.length !== n)) return null;
+  const a = input.map((row, i) => [...row, ...Array.from({ length: n }, (_, j) => Number(i === j))]);
+  for (let col = 0; col < n; col++) {
+    let pivot = col;
+    for (let row = col + 1; row < n; row++) {
+      if (Math.abs(a[row][col]) > Math.abs(a[pivot][col])) pivot = row;
+    }
+    if (Math.abs(a[pivot][col]) < 1e-12) return null;
+    [a[col], a[pivot]] = [a[pivot], a[col]];
+    const divisor = a[col][col];
+    for (let j = 0; j < 2 * n; j++) a[col][j] /= divisor;
+    for (let row = 0; row < n; row++) {
+      if (row === col) continue;
+      const factor = a[row][col];
+      for (let j = 0; j < 2 * n; j++) a[row][j] -= factor * a[col][j];
+    }
+  }
+  return a.map((row) => row.slice(n));
+}
+
+function multiplyMatrices(a: number[][], b: number[][]): number[][] {
+  return a.map((row) => b[0].map((_, j) => row.reduce((sum, value, k) => sum + value * b[k][j], 0)));
+}
+
+function fitLeastSquares(xRows: number[][], y: number[], hacLag = 0, ridge = 0): OlsFit | null {
+  const n = Math.min(xRows.length, y.length);
+  const p = xRows[0]?.length ?? 0;
+  if (n <= p || p === 0 || xRows.slice(0, n).some((row) => row.length !== p)) return null;
+  const xtx = Array.from({ length: p }, () => new Array(p).fill(0));
+  const xty = new Array(p).fill(0);
+  for (let i = 0; i < n; i++) {
+    for (let j = 0; j < p; j++) {
+      xty[j] += xRows[i][j] * y[i];
+      for (let k = 0; k < p; k++) xtx[j][k] += xRows[i][j] * xRows[i][k];
+    }
+  }
+  if (ridge > 0) for (let j = 1; j < p; j++) xtx[j][j] += ridge;
+  let bread = invertMatrix(xtx);
+  if (!bread && ridge === 0) {
+    for (let j = 1; j < p; j++) xtx[j][j] += 1e-9;
+    bread = invertMatrix(xtx);
+  }
+  if (!bread) return null;
+  const beta = bread.map((row) => row.reduce((sum, value, j) => sum + value * xty[j], 0));
+  const residuals = Array.from({ length: n }, (_, i) => y[i] - xRows[i].reduce((sum, v, j) => sum + v * beta[j], 0));
+  const rss = residuals.reduce((sum, value) => sum + value * value, 0);
+  const yMean = mean(y.slice(0, n));
+  const tss = y.slice(0, n).reduce((sum, value) => sum + (value - yMean) ** 2, 0);
+  const r2 = tss > 1e-12 ? Math.max(0, Math.min(1, 1 - rss / tss)) : 0;
+  const dfResidual = Math.max(1, n - p);
+
+  // Newey-West HAC sandwich covariance with Bartlett weights. With hacLag=0 this
+  // reduces to the heteroskedasticity-robust HC0 sandwich estimator.
+  const lagMax = Math.max(0, Math.min(Math.floor(hacLag), n - 1));
+  const meat = Array.from({ length: p }, () => new Array(p).fill(0));
+  for (let t = 0; t < n; t++) {
+    for (let j = 0; j < p; j++) for (let k = 0; k < p; k++) {
+      meat[j][k] += residuals[t] ** 2 * xRows[t][j] * xRows[t][k];
+    }
+  }
+  for (let lag = 1; lag <= lagMax; lag++) {
+    const weight = 1 - lag / (lagMax + 1);
+    for (let t = lag; t < n; t++) {
+      for (let j = 0; j < p; j++) for (let k = 0; k < p; k++) {
+        const cross = residuals[t] * residuals[t - lag] * weight;
+        meat[j][k] += cross * (xRows[t][j] * xRows[t - lag][k] + xRows[t - lag][j] * xRows[t][k]);
+      }
+    }
+  }
+  const covariance = multiplyMatrices(multiplyMatrices(bread, meat), bread);
+  const standardErrors = covariance.map((row, i) => Math.sqrt(Math.max(0, row[i])));
+  const pValues = beta.map((value, i) => tPValueTwoSided(value / Math.max(1e-12, standardErrors[i]), dfResidual));
+  return { beta, residuals, rss, r2, covariance, standardErrors, pValues, n, dfResidual };
+}
+
+/** Fold-independent complete-case multivariate VIF: regress one predictor on all the others. */
+export function computeMultivariateVif(
+  target: string,
+  series: Record<string, number[]>,
+  predictorNames: string[]
+): { vif: number; rSquared: number; nUsed: number } {
+  const names = Array.from(new Set(predictorNames)).filter((name) => name !== target && Array.isArray(series[name]));
+  const ySeries = series[target];
+  if (!ySeries || names.length === 0) return { vif: 1, rSquared: 0, nUsed: 0 };
+  const n = Math.min(ySeries.length, ...names.map((name) => series[name].length));
+  const xRows: number[][] = [];
+  const y: number[] = [];
+  for (let i = 0; i < n; i++) {
+    const values = [ySeries[i], ...names.map((name) => series[name][i])];
+    if (values.every((value) => Number.isFinite(value))) {
+      y.push(values[0]);
+      xRows.push([1, ...values.slice(1)]);
+    }
+  }
+  if (y.length <= names.length + 1) return { vif: 1, rSquared: 0, nUsed: y.length };
+  const fit = fitLeastSquares(xRows, y, 0, 1e-10);
+  const rSquared = fit?.r2 ?? 0;
+  return { vif: 1 / Math.max(1e-12, 1 - rSquared), rSquared, nUsed: y.length };
+}
+
+/** Joint lag-exclusion F test: do past x values improve prediction of y beyond past y? */
+export function grangerCausalityTest(
+  x: number[],
+  y: number[],
+  maxLags = 3
+): { statistic: number; pValue: number; lags: number; nUsed: number } | null {
+  const n = Math.min(x.length, y.length);
+  const p = Math.max(1, Math.min(Math.floor(maxLags), Math.floor(n / 5)));
+  if (n <= 3 * p + 6) return null;
+  const response: number[] = [];
+  const restricted: number[][] = [];
+  const unrestricted: number[][] = [];
+  for (let t = p; t < n; t++) {
+    const yLags = Array.from({ length: p }, (_, lag) => y[t - lag - 1]);
+    const xLags = Array.from({ length: p }, (_, lag) => x[t - lag - 1]);
+    const window = [y[t], ...yLags, ...xLags];
+    if (!window.every(Number.isFinite)) continue;
+    response.push(y[t]);
+    restricted.push([1, ...yLags]);
+    unrestricted.push([1, ...yLags, ...xLags]);
+  }
+  const fitR = fitLeastSquares(restricted, response, 0, 1e-12);
+  const fitU = fitLeastSquares(unrestricted, response, 0, 1e-12);
+  if (!fitR || !fitU) return null;
+  const dfDen = response.length - unrestricted[0].length;
+  if (dfDen <= 0 || fitU.rss <= 1e-16) return null;
+  const statistic = Math.max(0, ((fitR.rss - fitU.rss) / p) / (fitU.rss / dfDen));
+  return { statistic, pValue: fPValue(statistic, p, dfDen), lags: p, nUsed: response.length };
+}
+
+/** Mann-Kendall S variance corrected for ties and short-range serial correlation. */
+export function mannKendallTrend(series: number[]): {
+  s: number;
+  tau: number;
+  variance: number;
+  tieCorrection: number;
+  serialCorrection: number;
+  z: number;
+  pValue: number;
+} {
+  const n = series.length;
+  let s = 0;
+  for (let i = 0; i < n - 1; i++) for (let j = i + 1; j < n; j++) s += Math.sign(series[j] - series[i]);
+  const ties = new Map<number, number>();
+  for (const value of series) ties.set(value, (ties.get(value) ?? 0) + 1);
+  const tieTerm = Array.from(ties.values()).reduce((sum, count) => sum + count * (count - 1) * (2 * count + 5), 0);
+  const independentVariance = Math.max(0, (n * (n - 1) * (2 * n + 5) - tieTerm) / 18);
+  const noTieVariance = n >= 2 ? (n * (n - 1) * (2 * n + 5)) / 18 : 0;
+  const tieCorrection = noTieVariance > 0 ? independentVariance / noTieVariance : 1;
+  const ranks = rankArray(series);
+  const rankTrend = olsSimple(Array.from({ length: n }, (_, i) => i), ranks);
+  const detrendedRanks = ranks.map((rank, i) => rank - (rankTrend.intercept + rankTrend.slope * i));
+  const maxLag = Math.min(n - 1, Math.max(1, Math.ceil(4 * Math.pow(Math.max(1, n) / 100, 2 / 9))));
+  let serialCorrection = 1;
+  for (let lag = 1; lag <= maxLag; lag++) {
+    const rho = pearsonCorr(detrendedRanks.slice(0, n - lag), detrendedRanks.slice(lag));
+    serialCorrection += 2 * (1 - lag / (maxLag + 1)) * (1 - lag / n) * rho;
+  }
+  serialCorrection = Math.max(0.1, serialCorrection);
+  const correctedVariance = independentVariance * serialCorrection;
+  const z = correctedVariance > 0 ? (s === 0 ? 0 : (s - Math.sign(s)) / Math.sqrt(correctedVariance)) : 0;
+  return {
+    s,
+    tau: n > 1 ? s / (n * (n - 1) / 2) : 0,
+    variance: correctedVariance,
+    tieCorrection,
+    serialCorrection,
+    z,
+    pValue: normalPValueTwoSided(z),
+  };
+}
+
 /** Newey-West DM statistic with the Harvey-Leybourne-Newbold finite-sample correction. */
 export function dieboldMarianoHlnTest(
   lossDifferential: number[],
@@ -1105,7 +1291,6 @@ export function dieboldMarianoHlnTest(
     nUsed: n,
   };
 }
-
 
 function adfTest(series: number[], maxLags: number): { stat: number; pVal: number; lags: number } {
   const n = series.length;
@@ -1900,6 +2085,7 @@ export function runDiagnosticsSuite(
       variable: targetName,
       familyId: 'T5',
       testName: 'Augmented Dickey-Fuller (ADF)',
+      approximate: true,
       statistic: adf.stat,
       statisticName: 'ADF τ',
       df: `lags=${adf.lags}`,
@@ -1911,7 +2097,7 @@ export function runDiagnosticsSuite(
       ciHigh: null,
       ciMethod: 'MacKinnon trended approx',
       nUsed: yRaw.length,
-      assumptionsChecked: 'TC-4 Stationarity Decision Matrix',
+      assumptionsChecked: 'Approximate in-app ADF implementation; not delegated to statsmodels (TC-4 decision matrix).',
       assumptionStatus: 'met',
       decision: 'fail_to_reject',
       decisionAt001: 'fail_to_reject',
@@ -1931,6 +2117,7 @@ export function runDiagnosticsSuite(
       variable: targetName,
       familyId: 'T5',
       testName: 'KPSS Stationarity Test',
+      approximate: true,
       statistic: kpss.stat,
       statisticName: 'KPSS η',
       df: 'Newey-West bw',
@@ -1942,7 +2129,7 @@ export function runDiagnosticsSuite(
       ciHigh: null,
       ciMethod: 'KPSS critical interpolation',
       nUsed: yRaw.length,
-      assumptionsChecked: 'TC-4 paired with ADF',
+      assumptionsChecked: 'Approximate in-app KPSS implementation; not delegated to statsmodels (paired with ADF).',
       assumptionStatus: 'met',
       decision: 'fail_to_reject',
       decisionAt001: 'fail_to_reject',
@@ -1975,6 +2162,7 @@ export function runDiagnosticsSuite(
         familyId: 'T5',
         testName: `Canova-Hansen Seasonal Stationarity (s=${seasonalPeriod}) [O]`,
         isOptionalTest: true,
+        approximate: true,
         statistic: ch.stat,
         statisticName: 'CH LM',
         df: `s=${seasonalPeriod}`,
@@ -1986,7 +2174,7 @@ export function runDiagnosticsSuite(
         ciHigh: null,
         ciMethod: 'Von Mises seasonal LM criticals',
         nUsed: yRaw.length,
-        assumptionsChecked: 'H0: deterministic seasonality (stationarity)',
+        assumptionsChecked: 'Approximate in-app Canova-Hansen screen; not delegated to a seasonal stationarity implementation.',
         assumptionStatus: 'met',
         decision: 'fail_to_reject',
         decisionAt001: 'fail_to_reject',
@@ -2008,6 +2196,7 @@ export function runDiagnosticsSuite(
         familyId: 'T5',
         testName: `OCSB Seasonal Unit Root (s=${seasonalPeriod}) [O]`,
         isOptionalTest: true,
+        approximate: true,
         statistic: ocsb.minT,
         statisticName: 'OCSB min-t',
         df: `s=${seasonalPeriod}`,
@@ -2019,7 +2208,7 @@ export function runDiagnosticsSuite(
         ciHigh: null,
         ciMethod: 'Auxiliary seasonal diff t-approx',
         nUsed: yRaw.length,
-        assumptionsChecked: 'H0: seasonal unit root exists',
+        assumptionsChecked: 'Approximate in-app OCSB screen; not delegated to a seasonal unit-root implementation.',
         assumptionStatus: 'met',
         decision: 'fail_to_reject',
         decisionAt001: 'fail_to_reject',
@@ -2039,12 +2228,10 @@ export function runDiagnosticsSuite(
   if (!tcp.families.T6.enabled) {
     pushDisabled('T6', targetName, 'Mann-Kendall & Ljung-Box');
   } else if (yRaw.length >= tcp.families.T6.minSampleSize) {
-    const idx = Array.from({ length: yRaw.length }, (_, i) => i + 1);
-    const tau = kendallTauB(idx, yRaw);
-    const varS = (yRaw.length * (yRaw.length - 1) * (2 * yRaw.length + 5)) / 18;
-    const S = tau * ((yRaw.length * (yRaw.length - 1)) / 2);
-    const zMk = S / Math.sqrt(Math.max(1, varS));
-    const pMk = normalPValueTwoSided(zMk);
+    const mk = mannKendallTrend(yRaw);
+    const tau = mk.tau;
+    const zMk = mk.z;
+    const pMk = mk.pValue;
 
     // Ljung-Box Q(7)
     const m = mean(yRaw);
@@ -2075,9 +2262,9 @@ export function runDiagnosticsSuite(
       effectSizeName: "Kendall's |τ|",
       ciLow: null,
       ciHigh: null,
-      ciMethod: 'Normal MK variance',
+      ciMethod: 'Tie-corrected variance with detrended-rank Newey-West serial-correlation adjustment',
       nUsed: yRaw.length,
-      assumptionsChecked: 'Monotonic baseline drift screen',
+      assumptionsChecked: `Monotonic trend; tie correction=${mk.tieCorrection.toFixed(3)}, serial variance multiplier=${mk.serialCorrection.toFixed(3)}`,
       assumptionStatus: 'met',
       decision: 'fail_to_reject',
       decisionAt001: 'fail_to_reject',
@@ -2123,75 +2310,99 @@ export function runDiagnosticsSuite(
     });
   }
 
-  // T7: Multivariate Structure (VIF)
+  // T7: multivariate VIF and actual lag-exclusion Granger tests.
   if (!tcp.families.T7.enabled) {
-    pushDisabled('T7', targetName, 'Multicollinearity VIF Screen');
-  } else if (predictors.length >= 2) {
-    for (const pred of predictors.slice(0, 6)) {
-      const others = predictors.filter((p) => p.name !== pred.name).slice(0, 4);
-      let maxR2 = 0;
-      for (const o of others) {
-        const px: number[] = [];
-        const py: number[] = [];
-        for (const r of rows) {
-          const a = r[pred.name];
-          const b = r[o.name];
-          if (typeof a === 'number' && typeof b === 'number') {
-            px.push(a);
-            py.push(b);
-          }
-        }
-        const r = pearsonCorr(px, py);
-        if (r * r > maxR2) maxR2 = r * r;
+    pushDisabled('T7', targetName, 'Multivariate VIF & Granger Causality');
+  } else {
+    const vifNames = predictors.slice(0, 6).map((p) => p.name);
+    if (vifNames.length >= 2) {
+      const numericSeries: Record<string, number[]> = {};
+      for (const name of [targetName, ...vifNames]) {
+        numericSeries[name] = rows.map((r) => typeof r[name] === 'number' && Number.isFinite(r[name] as number) ? r[name] as number : Number.NaN);
       }
-      const vif = 1 / Math.max(0.02, 1 - maxR2);
+      for (const predictorName of vifNames) {
+        const vif = computeMultivariateVif(predictorName, numericSeries, vifNames);
+        results.push({
+          id: `${targetName}-T7-VIF-${predictorName}`,
+          target: targetName,
+          variable: predictorName,
+          familyId: 'T7',
+          testName: 'Multivariate Variance Inflation Factor (VIF)',
+          statistic: Number(vif.vif.toFixed(3)),
+          statisticName: 'VIF',
+          df: null,
+          // VIF is a descriptive collinearity measure, not a hypothesis test.
+          pRaw: null,
+          pAdjusted: null,
+          effectSize: Number(vif.rSquared.toFixed(4)),
+          effectSizeName: 'R² regressed on all other predictors',
+          ciLow: null,
+          ciHigh: null,
+          ciMethod: 'Complete-case multivariate OLS',
+          nUsed: vif.nUsed,
+          assumptionsChecked: `Each predictor regressed on all ${vifNames.length - 1} other eligible predictors; no inferential p-value applies.`,
+          assumptionStatus: vif.nUsed > vifNames.length + 1 ? 'met' : 'skipped_min_n',
+          decision: 'fail_to_reject',
+          decisionAt001: 'fail_to_reject',
+          decisionAt005: 'fail_to_reject',
+          decisionAt010: 'fail_to_reject',
+          decisionFlips: false,
+          interpretation: vif.vif > 10 ? `Severe multivariate collinearity (VIF=${vif.vif.toFixed(2)} > 10); candidate for VAL-6 pruning.` : `Multivariate VIF=${vif.vif.toFixed(2)} based on all other predictors.`,
+          downstreamAction: vif.vif > 10 ? 'Review or prune in linear models unless force_include' : 'Retain in predictor matrix',
+          mode: tcp.mode,
+          cacheKey: deterministicHash(`${dataHash}:${targetName}:T7:VIF:${predictorName}`),
+          artifactId: `ART-T7-VIF-${predictorName}`,
+        });
+      }
+    }
+
+    for (const pred of predictors.slice(0, 4)) {
+      const xSeries = rows.map((row) => typeof row[pred.name] === 'number' && Number.isFinite(row[pred.name] as number) ? row[pred.name] as number : Number.NaN);
+      const ySeries = rows.map((row) => typeof row[targetName] === 'number' && Number.isFinite(row[targetName] as number) ? row[targetName] as number : Number.NaN);
+      if (rows.length < Math.max(tcp.families.T7.minSampleSize, 25)) continue;
+      const granger = grangerCausalityTest(xSeries, ySeries, tcp.families.T7.fixedLags);
+      if (!granger || granger.nUsed < Math.max(tcp.families.T7.minSampleSize, 25)) continue;
       results.push({
-        id: `${targetName}-T7-VIF-${pred.name}`,
+        id: `${targetName}-T7-Granger-${pred.name}`,
         target: targetName,
         variable: pred.name,
         familyId: 'T7',
-        testName: 'Variance Inflation Factor (VIF)',
-        statistic: Number(vif.toFixed(2)),
-        statisticName: 'VIF',
-        df: null,
-        pRaw: vif > 10 ? 0.005 : vif > 5 ? 0.04 : 0.5,
-        pAdjusted: vif > 10 ? 0.005 : vif > 5 ? 0.04 : 0.5,
-        effectSize: Number(Math.sqrt(maxR2).toFixed(3)),
-        effectSizeName: 'Max |r|',
+        testName: `Granger Causality (${pred.name} → ${targetName})`,
+        approximate: true,
+        statistic: Number(granger.statistic.toFixed(4)),
+        statisticName: 'F',
+        df: `${granger.lags},${granger.nUsed - 2 * granger.lags - 1}`,
+        pRaw: granger.pValue,
+        pAdjusted: granger.pValue,
+        effectSize: Number(Math.max(0, granger.statistic).toFixed(4)),
+        effectSizeName: 'Nested-model F statistic',
         ciLow: null,
         ciHigh: null,
-        ciMethod: 'Pairwise collinearity bound',
-        nUsed: rows.length,
-        assumptionsChecked: 'VAL-6 Collinearity check (threshold 10)',
+        ciMethod: 'Restricted vs unrestricted lag regression; approximate F-tail mapping',
+        nUsed: granger.nUsed,
+        assumptionsChecked: `H0: ${pred.name} lags add no predictive information beyond target lags; observational predictive test, not causal identification.`,
         assumptionStatus: 'met',
         decision: 'fail_to_reject',
         decisionAt001: 'fail_to_reject',
         decisionAt005: 'fail_to_reject',
         decisionAt010: 'fail_to_reject',
         decisionFlips: false,
-        interpretation: vif > 10 ? `Severe collinearity (VIF=${vif.toFixed(1)} > 10); candidate for VAL-6 pruning.` : `Acceptable collinearity (VIF=${vif.toFixed(2)}).`,
-        downstreamAction: vif > 10 ? 'Prune in linear models unless force_include' : 'Retain in predictor matrix',
+        interpretation: granger.pValue < tcp.alpha ? `Rejects lag exclusion: ${pred.name} improves prediction of ${targetName} at ${granger.lags} lag(s); this is predictive evidence, not structural causality.` : `No evidence that ${pred.name} lags improve prediction of ${targetName} at ${granger.lags} lag(s).`,
+        downstreamAction: granger.pValue < tcp.alpha ? 'Consider lagged predictor in forecasting; do not interpret as causal effect' : 'No Granger-predictive signal detected',
         mode: tcp.mode,
-        cacheKey: deterministicHash(`${dataHash}:${targetName}:T7:${pred.name}`),
-        artifactId: `ART-T7-${pred.name}`,
+        cacheKey: deterministicHash(`${dataHash}:${targetName}:T7:Granger:${pred.name}:${granger.lags}`),
+        artifactId: `ART-T7-GRANGER-${pred.name}`,
       });
     }
 
-    // T7 [O]: Transfer Entropy Directional Screening (X_{t-1} -> Y_t | Y_{t-1})
+    // T7 [O]: Transfer Entropy remains a separate directional screening statistic.
     if (tcp.includeOptionalTests) {
       for (const pred of predictors.slice(0, 4)) {
-        const px: number[] = [];
-        const py: number[] = [];
-        for (const r of rows) {
-          const a = r[pred.name];
-          const b = r[targetName];
-          if (typeof a === 'number' && typeof b === 'number') {
-            px.push(a);
-            py.push(b);
-          }
-        }
-        if (px.length >= 24) {
-          const te = transferEntropyScreen(px, py);
+        const pairs = rows
+          .map((r) => [r[pred.name], r[targetName]] as const)
+          .filter((pair): pair is readonly [number, number] => typeof pair[0] === 'number' && Number.isFinite(pair[0]) && typeof pair[1] === 'number' && Number.isFinite(pair[1]));
+        if (pairs.length >= 24) {
+          const te = transferEntropyScreen(pairs.map((pair) => pair[0]), pairs.map((pair) => pair[1]));
           results.push({
             id: `${targetName}-T7-TE-${pred.name}`,
             target: targetName,
@@ -2199,6 +2410,7 @@ export function runDiagnosticsSuite(
             familyId: 'T7',
             testName: `Transfer Entropy (${pred.name} → ${targetName}) [O]`,
             isOptionalTest: true,
+            approximate: true,
             statistic: te.teBits,
             statisticName: 'TE (bits)',
             df: 'lag=1, Q=4 bins',
@@ -2208,8 +2420,8 @@ export function runDiagnosticsSuite(
             effectSizeName: 'Info Flow (bits)',
             ciLow: null,
             ciHigh: null,
-            ciMethod: 'Conditional MI chi-square',
-            nUsed: px.length,
+            ciMethod: 'Conditional MI chi-square approximation',
+            nUsed: pairs.length,
             assumptionsChecked: 'TC-3: Predictive information flow screening only (not causal proof)',
             assumptionStatus: 'met',
             decision: 'fail_to_reject',
@@ -2504,20 +2716,20 @@ export function runDiagnosticsSuite(
           target: targetName,
           variable: groupCol.name,
           familyId: 'T14',
-          testName: `Causal M&V Difference-in-Means / DiD (${groupCol.name})`,
-          statistic: Number((edaSummary.didEstimate / Math.max(1e-6, edaSummary.didSe ?? 1)).toFixed(3)),
-          statisticName: 'DiD t',
-          df: String(allRows.length - 2),
+          testName: `Two-Way Fixed Effects DiD + Event Study (${groupCol.name})`,
+          statistic: Number((edaSummary.didEstimate / Math.max(1e-12, edaSummary.didSe ?? 0)).toFixed(3)),
+          statisticName: 'DiD HAC t',
+          df: String(Math.max(1, allRows.length - 2)),
           pRaw: edaSummary.didPValue,
           pAdjusted: edaSummary.didPValue,
-          effectSize: Number((edaSummary.smdBefore ?? 0).toFixed(3)),
-          effectSizeName: 'Covariate SMD',
+          effectSize: edaSummary.smdBefore === null ? null : Number(edaSummary.smdBefore.toFixed(3)),
+          effectSizeName: 'Pre-treatment covariate SMD',
           ciLow: Number((edaSummary.didEstimate - 1.96 * (edaSummary.didSe ?? 0)).toFixed(2)),
           ciHigh: Number((edaSummary.didEstimate + 1.96 * (edaSummary.didSe ?? 0)).toFixed(2)),
-          ciMethod: 'HAC/OLS DiD CI',
+          ciMethod: 'Newey-West HAC covariance on two-group-differenced TWFE regression',
           nUsed: allRows.length,
-          assumptionsChecked: `Parallel trends p=${edaSummary.parallelTrendsP?.toFixed(3)}; SMD_after=${edaSummary.smdAfter?.toFixed(3)}`,
-          assumptionStatus: 'met',
+          assumptionsChecked: `${edaSummary.parallelTrendsMethod ?? 'Pre-trend HAC test'} p=${edaSummary.parallelTrendsP === null ? 'not estimable' : edaSummary.parallelTrendsP.toFixed(4)}; pre-period placebo p=${edaSummary.placeboRefutationP === null ? 'not estimable' : edaSummary.placeboRefutationP.toFixed(4)}; after-matching SMD not reported because no matching was performed.`,
+          assumptionStatus: edaSummary.parallelTrendsP === null ? 'skipped_min_n' : edaSummary.parallelTrendsP < tcp.alpha ? 'violated' : 'met',
           decision: 'fail_to_reject',
           decisionAt001: 'fail_to_reject',
           decisionAt005: 'fail_to_reject',
@@ -2538,111 +2750,168 @@ export function runDiagnosticsSuite(
 
 // ---------- EDA & Data Mining Engine (F1 - F9 + T14 Causal M&V) ----------
 
-function computeCausalMv(
+export function computeCausalMv(
   dataset: DatasetState,
   targetName: string,
   predictorNames: string[]
 ): EdaTargetSummary['causalMv'] {
   const groupCol = dataset.columns.find((c) => c.role === 'group');
-  if (!groupCol) {
-    return {
-      available: false,
-      groupColumn: null,
-      treatedMean: null,
-      controlMean: null,
-      didEstimate: null,
-      didSe: null,
-      didPValue: null,
-      smdBefore: null,
-      smdAfter: null,
-      parallelTrendsP: null,
-      placeboRefutationP: null,
-      interpretation: 'No group column assigned; Causal M&V mode inactive.',
-    };
-  }
-  const rows = dataset.rows;
-  const groups = Array.from(new Set(rows.map((r) => r[groupCol.name]).filter((v) => v !== null && v !== undefined)));
-  if (groups.length < 2) {
-    return {
-      available: false,
-      groupColumn: groupCol.name,
-      treatedMean: null,
-      controlMean: null,
-      didEstimate: null,
-      didSe: null,
-      didPValue: null,
-      smdBefore: null,
-      smdAfter: null,
-      parallelTrendsP: null,
-      placeboRefutationP: null,
-      interpretation: `Group column '${groupCol.name}' requires at least 2 levels for causal comparison.`,
-    };
-  }
+  const unavailable = (message: string, groupColumn = groupCol?.name ?? null): EdaTargetSummary['causalMv'] => ({
+    available: false,
+    groupColumn,
+    treatedMean: null,
+    controlMean: null,
+    didEstimate: null,
+    didSe: null,
+    didPValue: null,
+    smdBefore: null,
+    smdAfter: null,
+    parallelTrendsP: null,
+    placeboRefutationP: null,
+    eventStudy: [],
+    interpretation: message,
+  });
+  if (!groupCol) return unavailable('No group column assigned; causal M&V is unavailable.');
 
-  const gControl = groups[0];
-  const gTreated = groups[1];
-  const ctrlVals = rows.filter((r) => r[groupCol.name] === gControl).map((r) => r[targetName]).filter((v): v is number => typeof v === 'number');
-  const trtVals = rows.filter((r) => r[groupCol.name] === gTreated).map((r) => r[targetName]).filter((v): v is number => typeof v === 'number');
-  if (ctrlVals.length < 5 || trtVals.length < 5) {
-    return {
-      available: false,
-      groupColumn: groupCol.name,
-      treatedMean: null,
-      controlMean: null,
-      didEstimate: null,
-      didSe: null,
-      didPValue: null,
-      smdBefore: null,
-      smdAfter: null,
-      parallelTrendsP: null,
-      placeboRefutationP: null,
-      interpretation: 'Insufficient observations per group.',
-    };
+  const groups = Array.from(new Set(dataset.rows.map((row) => row[groupCol.name]).filter((value) => value !== null && value !== undefined)))
+    .sort((a, b) => String(a).localeCompare(String(b)));
+  if (groups.length !== 2) return unavailable(`Two-way FE DiD requires exactly two group levels; found ${groups.length}.`);
+  const controlGroup = groups[0];
+  const treatedGroup = groups[1];
+  const rows = dataset.rows
+    .filter((row) => typeof row[targetName] === 'number' && Number.isFinite(row[targetName] as number))
+    .slice()
+    .sort((a, b) => a.timestamp.localeCompare(b.timestamp));
+  const timeKeys = Array.from(new Set(rows.map((row) => row.timestamp))).sort();
+  const requestedPostStart = dataset.temporal.reportingStart;
+  let postStart = timeKeys.findIndex((timestamp) => timestamp >= requestedPostStart);
+  if (postStart < 0) {
+    const baselineEnd = dataset.temporal.baselineEnd;
+    postStart = timeKeys.findIndex((timestamp) => timestamp > baselineEnd);
+  }
+  if (postStart < 0) postStart = Math.floor(timeKeys.length / 2);
+  if (timeKeys.length < 10 || postStart < 3 || timeKeys.length - postStart < 3) {
+    return unavailable('Two-way FE DiD needs at least three pre- and three post-intervention periods.');
   }
 
-  const mCtrl = mean(ctrlVals);
-  const mTrt = mean(trtVals);
-  // Covariate adjustment on first predictor (residualized DiD / propensity-weighted check)
-  const covName = predictorNames[0];
-  let didEst = mTrt - mCtrl;
-  let didSe = Math.sqrt(variance(ctrlVals) / ctrlVals.length + variance(trtVals) / trtVals.length);
-  let smdBefore = 0;
-  let smdAfter = 0;
+  // For a two-group balanced panel, subtracting control from treated removes the
+  // time fixed effects; an intercept in the differenced regression absorbs group FE.
+  // HAC standard errors account for serial dependence in the time-differenced outcome.
+  const pairedDiffs: { timestamp: string; difference: number }[] = [];
+  const treatmentValues: number[] = [];
+  const controlValues: number[] = [];
+  for (const timestamp of timeKeys) {
+    const atTime = rows.filter((row) => row.timestamp === timestamp);
+    const treated = atTime.filter((row) => row[groupCol.name] === treatedGroup).map((row) => row[targetName] as number);
+    const control = atTime.filter((row) => row[groupCol.name] === controlGroup).map((row) => row[targetName] as number);
+    if (treated.length === 0 || control.length === 0) continue;
+    const treatedMeanAtTime = mean(treated);
+    const controlMeanAtTime = mean(control);
+    pairedDiffs.push({ timestamp, difference: treatedMeanAtTime - controlMeanAtTime });
+    treatmentValues.push(...treated);
+    controlValues.push(...control);
+  }
+  const pairedPostStart = pairedDiffs.findIndex((item) => item.timestamp >= requestedPostStart);
+  const effectivePostStart = pairedPostStart >= 0 ? pairedPostStart : pairedDiffs.findIndex((item) => item.timestamp > dataset.temporal.baselineEnd);
+  const postIndex = effectivePostStart >= 0 ? effectivePostStart : Math.floor(pairedDiffs.length / 2);
+  if (pairedDiffs.length < 10 || postIndex < 3 || pairedDiffs.length - postIndex < 3) {
+    return unavailable('Two-way FE DiD requires both groups to be observed in at least ten common periods, with three pre and three post periods.');
+  }
 
-  if (covName) {
-    const cx = rows.filter((r) => r[groupCol.name] === gControl).map((r) => r[covName]).filter((v): v is number => typeof v === 'number');
-    const tx = rows.filter((r) => r[groupCol.name] === gTreated).map((r) => r[covName]).filter((v): v is number => typeof v === 'number');
-    if (cx.length > 4 && tx.length > 4) {
-      const pooledS = Math.sqrt((variance(cx) + variance(tx)) / 2) || 1;
-      smdBefore = Math.abs(mean(tx) - mean(cx)) / pooledS;
-      smdAfter = Number((smdBefore * 0.22).toFixed(3)); // kernel-balancing / matching weight reduction
-      const ctrlFit = olsSimple(cx.slice(0, ctrlVals.length), ctrlVals.slice(0, cx.length));
-      const adjTrt = trtVals.slice(0, tx.length).map((y, i) => y - (ctrlFit.intercept + ctrlFit.slope * tx[i]));
-      didEst = mean(adjTrt);
-      didSe = stdDev(adjTrt) / Math.sqrt(adjTrt.length);
+  const differences = pairedDiffs.map((item) => item.difference);
+  const post = differences.map((_, index) => Number(index >= postIndex));
+  const hacLag = Math.min(Math.floor(differences.length / 4), Math.max(1, Math.floor(4 * Math.pow(differences.length / 100, 2 / 9))));
+  const didFit = fitLeastSquares(differences.map((_, index) => [1, post[index]]), differences, hacLag);
+  if (!didFit) return unavailable('Two-way FE DiD design matrix is rank deficient.');
+
+  // Event-study dummies, with period -1 omitted as the reference. The far tails
+  // are pooled so the small-panel regression remains estimable.
+  const preWindow = Math.min(6, postIndex);
+  const postWindow = Math.min(6, differences.length - postIndex);
+  const eventPeriods = Array.from({ length: preWindow + postWindow + 1 }, (_, index) => index - preWindow).filter((period) => period !== -1);
+  const periodForIndex = differences.map((_, index) => {
+    const relative = index - postIndex;
+    return Math.max(-preWindow, Math.min(postWindow, relative));
+  });
+  const eventDesign = differences.map((_, index) => [1, ...eventPeriods.map((period) => Number(periodForIndex[index] === period))]);
+  const eventFit = fitLeastSquares(eventDesign, differences, hacLag);
+  const eventStudy = eventFit
+    ? eventPeriods.map((period, index) => ({
+        relativePeriod: period,
+        estimate: Number(eventFit.beta[index + 1].toFixed(4)),
+        standardError: Number(eventFit.standardErrors[index + 1].toFixed(4)),
+        pValue: Number(eventFit.pValues[index + 1].toFixed(6)),
+      }))
+    : [];
+  const leadIndices = eventPeriods
+    .map((period, index) => ({ period, coefficientIndex: index + 1 }))
+    .filter(({ period }) => period < -1)
+    .map(({ coefficientIndex }) => coefficientIndex);
+  let parallelTrendsP: number | null = null;
+  let parallelTrendsMethod: EdaTargetSummary['causalMv']['parallelTrendsMethod'];
+  if (eventFit?.covariance && leadIndices.length > 0) {
+    const leadCovariance = leadIndices.map((i) => leadIndices.map((j) => eventFit.covariance![i][j]));
+    const leadInverse = invertMatrix(leadCovariance);
+    if (leadInverse) {
+      const leadBeta = leadIndices.map((i) => eventFit.beta[i]);
+      const wald = leadBeta.reduce((sum, value, i) => sum + value * leadInverse[i].reduce((inner, inv, j) => inner + inv * leadBeta[j], 0), 0);
+      parallelTrendsP = chiSquarePValue(Math.max(0, wald), leadIndices.length);
+      parallelTrendsMethod = 'event_study_leads_joint_hac';
     }
   }
-  const tStat = didEst / Math.max(1e-6, didSe);
-  const pVal = tPValueTwoSided(tStat, ctrlVals.length + trtVals.length - 2);
-  // Parallel trends check on first half of control window
-  const half = Math.floor(ctrlVals.length / 2);
-  const slope1 = half > 4 ? olsSimple(Array.from({ length: half }, (_, i) => i), ctrlVals.slice(0, half)).slope : 0;
-  const slope2 = half > 4 ? olsSimple(Array.from({ length: ctrlVals.length - half }, (_, i) => i), ctrlVals.slice(half)).slope : 0;
-  const ptP = normalPValueTwoSided((slope1 - slope2) / Math.max(0.1, stdDev(ctrlVals) / Math.sqrt(half)));
+  if (parallelTrendsP === null) {
+    // A low-rank event-study covariance can occur in short panels. Fall back to
+    // a directly estimated HAC pre-period differential-trend test and label it.
+    const preTrend = differences.slice(0, postIndex);
+    const preTrendFit = fitLeastSquares(preTrend.map((_, index) => [1, index]), preTrend, Math.min(hacLag, preTrend.length - 1));
+    parallelTrendsP = preTrendFit?.pValues[1] ?? null;
+    if (parallelTrendsP !== null) parallelTrendsMethod = 'linear_pretrend_hac_fallback';
+  }
 
+  // Placebo refutation: re-estimate a fake intervention within the pre-period.
+  const preDifferences = differences.slice(0, postIndex);
+  const placeboCut = Math.floor(preDifferences.length / 2);
+  let placeboRefutationP: number | null = null;
+  if (placeboCut >= 3 && preDifferences.length - placeboCut >= 3) {
+    const placeboPost = preDifferences.map((_, index) => Number(index >= placeboCut));
+    const placeboFit = fitLeastSquares(preDifferences.map((_, index) => [1, placeboPost[index]]), preDifferences, Math.min(hacLag, placeboCut - 1));
+    placeboRefutationP = placeboFit?.pValues[1] ?? null;
+  }
+
+  // Report the observed pre-treatment covariate imbalance only. No matching or
+  // balancing weights are applied here, so an after-adjustment SMD is not claimed.
+  const covName = predictorNames.find((name) => dataset.columns.some((column) => column.name === name && column.dtype === 'numeric'));
+  let smdBefore: number | null = null;
+  if (covName) {
+    const preRows = rows.filter((row) => row.timestamp < pairedDiffs[postIndex].timestamp);
+    const treatedCov = preRows.filter((row) => row[groupCol.name] === treatedGroup).map((row) => row[covName]).filter((value): value is number => typeof value === 'number' && Number.isFinite(value));
+    const controlCov = preRows.filter((row) => row[groupCol.name] === controlGroup).map((row) => row[covName]).filter((value): value is number => typeof value === 'number' && Number.isFinite(value));
+    if (treatedCov.length > 1 && controlCov.length > 1) {
+      const pooled = Math.sqrt((variance(treatedCov) + variance(controlCov)) / 2);
+      smdBefore = pooled > 1e-12 ? Math.abs(mean(treatedCov) - mean(controlCov)) / pooled : null;
+    }
+  }
+
+  const didEstimate = didFit.beta[1];
+  const didSe = didFit.standardErrors[1];
+  const didPValue = didFit.pValues[1];
+  const treatedMean = mean(treatmentValues);
+  const controlMean = mean(controlValues);
   return {
     available: true,
     groupColumn: groupCol.name,
-    treatedMean: Number(mTrt.toFixed(2)),
-    controlMean: Number(mCtrl.toFixed(2)),
-    didEstimate: Number(didEst.toFixed(2)),
-    didSe: Number(didSe.toFixed(2)),
-    didPValue: Number(pVal.toFixed(5)),
-    smdBefore: Number(smdBefore.toFixed(3)),
-    smdAfter,
-    parallelTrendsP: Number(ptP.toFixed(3)),
-    placeboRefutationP: 0.74,
-    interpretation: `Covariate-adjusted effect (${String(gTreated)} vs ${String(gControl)}): ${didEst >= 0 ? '+' : ''}${didEst.toFixed(2)} ± ${(1.96 * didSe).toFixed(2)} (p=${pVal.toFixed(4)}). SMD reduced from ${smdBefore.toFixed(2)} to ${smdAfter.toFixed(2)}; placebo refutation p=0.74 (passes).`,
+    treatedMean: Number(treatedMean.toFixed(2)),
+    controlMean: Number(controlMean.toFixed(2)),
+    didEstimate: Number(didEstimate.toFixed(4)),
+    didSe: Number(didSe.toFixed(4)),
+    didPValue: Number(didPValue.toFixed(6)),
+    smdBefore: smdBefore === null ? null : Number(smdBefore.toFixed(4)),
+    smdAfter: null,
+    parallelTrendsP: parallelTrendsP === null ? null : Number(parallelTrendsP.toFixed(6)),
+    parallelTrendsMethod,
+    placeboRefutationP: placeboRefutationP === null ? null : Number(placeboRefutationP.toFixed(6)),
+    eventStudy,
+    interpretation: `Two-way fixed-effects DiD (${String(treatedGroup)} vs ${String(controlGroup)}; post begins ${pairedDiffs[postIndex].timestamp.slice(0, 10)}): ${didEstimate >= 0 ? '+' : ''}${didEstimate.toFixed(2)} (Newey-West HAC SE=${didSe.toFixed(2)}, p=${didPValue.toFixed(4)}). ${parallelTrendsMethod === 'linear_pretrend_hac_fallback' ? 'Linear pre-trend HAC fallback' : 'Event-study pre-trend joint'} p=${parallelTrendsP === null ? 'not estimable' : parallelTrendsP.toFixed(4)}; pre-period placebo p=${placeboRefutationP === null ? 'not estimable' : placeboRefutationP.toFixed(4)}. No covariate matching was performed${smdBefore === null ? '' : ` (pre-treatment SMD=${smdBefore.toFixed(2)})`}.`,
   };
 }
 
