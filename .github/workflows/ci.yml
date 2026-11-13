@@ -28,8 +28,8 @@ jobs:
           while IFS= read -r chunk || [[ -n "$chunk" ]]; do
             printf '::notice title=CARGOLOCK_PART_%03d::%s\n' "$part" "$chunk"
             part=$((part + 1))
-          # Stay below GitHub Actions' per-step annotation cap with larger chunks.
-          done < <(printf '%s' "$encoded" | fold -w 12000)
+          # Keep ten-or-fewer chunks under GitHub's 4 KiB annotation payload limit.
+          done < <(printf '%s' "$encoded" | fold -w 3900)
 
       - name: Upload Cargo lockfile for Phase 0 bootstrap
         uses: actions/upload-artifact@v4
