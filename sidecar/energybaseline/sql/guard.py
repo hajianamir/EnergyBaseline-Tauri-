@@ -55,7 +55,7 @@ FORBIDDEN_CLAUSES = (
     "LO_EXPORT",
 )
 
-MAX_SQL_LENGTH = 64 * 1024
+_MAX_SQL_BYTES = 64 * 1024
 
 
 @dataclass
@@ -151,11 +151,19 @@ def _strip_comments_and_strings(sql: str) -> tuple[str, Optional[str]]:
 
 
 def validate_readonly_sql(raw_sql: str) -> SqlGuardDecision:
+    # Reject obviously oversized inputs before allocating encoded bytes or parsing.
+    if len(raw_sql) > _MAX_SQL_BYTES:
+        return SqlGuardDecision(False, f"SQL exceeds the {_MAX_SQL_BYTES}-byte safety limit.", None, ["SQL_TOO_LARGE"])
+    try:
+        sql_byte_length = len(raw_sql.encode("utf-8"))
+    except UnicodeEncodeError:
+        return SqlGuardDecision(False, "SQL contains invalid Unicode surrogate code points.", None, ["INVALID_UNICODE"])
+    if sql_byte_length > _MAX_SQL_BYTES:
+        return SqlGuardDecision(False, f"SQL exceeds the {_MAX_SQL_BYTES}-byte safety limit.", None, ["SQL_TOO_LARGE"])
+
     if not raw_sql or not raw_sql.strip():
         return SqlGuardDecision(False, "Empty SQL query.", None, [])
 
-    if len(raw_sql) > MAX_SQL_LENGTH:
-        return SqlGuardDecision(False, f"SQL exceeds the {MAX_SQL_LENGTH}-character safety limit.", None, ["SQL_TOO_LARGE"])
     if "\x00" in raw_sql:
         return SqlGuardDecision(False, "SQL containing NUL characters is rejected.", None, ["NUL"])
 

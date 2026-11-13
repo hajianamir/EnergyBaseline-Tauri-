@@ -5,7 +5,7 @@ import {
   generateSyntheticDataset,
   validateGranularityTransition,
 } from './synthetic';
-import { executeGuardedLocalSql, validateReadOnlySql } from './sqlGuard';
+import { executeGuardedLocalSql, MAX_SQL_BYTES, validateReadOnlySql } from './sqlGuard';
 import {
   buildDefaultVsgForTarget,
   computeCausalMv,
@@ -576,6 +576,27 @@ test('F-09: HTML report export escapes company, dataset, and section text as ine
   assert.equal(html.includes('<img'), false);
   assert.equal(html.includes('<script'), false);
   assert.equal(html.includes(payload), false);
+});
+
+test('F-10: TypeScript SQL guard enforces the shared 64 KiB UTF-8 byte boundary', () => {
+  const asciiAtLimit = `SELECT 1${' '.repeat(MAX_SQL_BYTES - 'SELECT 1'.length)}`;
+  const asciiOverLimit = `${asciiAtLimit} `;
+  assert.equal(new TextEncoder().encode(asciiAtLimit).byteLength, MAX_SQL_BYTES);
+  assert.equal(validateReadOnlySql(asciiAtLimit).allowed, true);
+  assert.equal(new TextEncoder().encode(asciiOverLimit).byteLength, MAX_SQL_BYTES + 1);
+  assert.deepEqual(validateReadOnlySql(asciiOverLimit).rejectedTokens, ['SQL_TOO_LARGE']);
+
+  const unicodeAtLimit = `SELECT '${'é'.repeat(32_763)}a'`;
+  const unicodeOverLimit = `${unicodeAtLimit.slice(0, -1)}a'`;
+  assert.ok(unicodeAtLimit.length < MAX_SQL_BYTES, 'Unicode fixture has fewer characters than its UTF-8 byte count');
+  assert.equal(new TextEncoder().encode(unicodeAtLimit).byteLength, MAX_SQL_BYTES);
+  assert.equal(validateReadOnlySql(unicodeAtLimit).allowed, true);
+  assert.equal(new TextEncoder().encode(unicodeOverLimit).byteLength, MAX_SQL_BYTES + 1);
+  assert.deepEqual(validateReadOnlySql(unicodeOverLimit).rejectedTokens, ['SQL_TOO_LARGE']);
+
+  const invalidUnicode = validateReadOnlySql(`SELECT ${String.fromCharCode(0xd800)}`);
+  assert.equal(invalidUnicode.allowed, false);
+  assert.deepEqual(invalidUnicode.rejectedTokens, ['INVALID_UNICODE']);
 });
 
 test('PM-3 SQL guard rejects DDL/DML/stacked queries and accepts valid SELECT', () => {

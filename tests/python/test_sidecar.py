@@ -19,7 +19,7 @@ from energybaseline.config.settings import (  # noqa: E402
     online_sqlite_backup,
     resolve_database,
 )
-from energybaseline.sql.guard import validate_readonly_sql  # noqa: E402
+from energybaseline.sql.guard import _MAX_SQL_BYTES, validate_readonly_sql  # noqa: E402
 from energybaseline.main import _configure_logging  # noqa: E402
 from energybaseline.ipc.protocol import (  # noqa: E402
     ALLOWLISTED_METHODS,
@@ -308,6 +308,26 @@ class TestSidecarIpc(unittest.TestCase):
 
 
 class TestSqlGuard(unittest.TestCase):
+    def test_64_kib_utf8_size_parity_boundary(self) -> None:
+        limit = _MAX_SQL_BYTES
+        ascii_at_limit = "SELECT 1" + " " * (limit - len("SELECT 1"))
+        ascii_over_limit = ascii_at_limit + " "
+        self.assertEqual(len(ascii_at_limit.encode("utf-8")), limit)
+        self.assertTrue(validate_readonly_sql(ascii_at_limit).allowed)
+        self.assertEqual(validate_readonly_sql(ascii_over_limit).rejected_tokens, ["SQL_TOO_LARGE"])
+
+        unicode_at_limit = "SELECT '" + "é" * 32_763 + "a'"
+        unicode_over_limit = unicode_at_limit[:-1] + "a'"
+        self.assertLess(len(unicode_at_limit), limit)
+        self.assertEqual(len(unicode_at_limit.encode("utf-8")), limit)
+        self.assertTrue(validate_readonly_sql(unicode_at_limit).allowed)
+        self.assertEqual(len(unicode_over_limit.encode("utf-8")), limit + 1)
+        self.assertEqual(validate_readonly_sql(unicode_over_limit).rejected_tokens, ["SQL_TOO_LARGE"])
+
+        invalid_unicode = validate_readonly_sql("SELECT " + chr(0xD800))
+        self.assertFalse(invalid_unicode.allowed)
+        self.assertEqual(invalid_unicode.rejected_tokens, ["INVALID_UNICODE"])
+
     def test_corpus(self) -> None:
         for q in (
             "SELECT * FROM meters WHERE id = 1",

@@ -54,7 +54,8 @@ const FORBIDDEN_CLAUSES_OR_FUNCS = [
   'LO_EXPORT',
 ];
 
-const MAX_SQL_LENGTH = 64 * 1024;
+export const MAX_SQL_BYTES = 64 * 1024;
+const SQL_UTF8_ENCODER = new TextEncoder();
 
 interface SqlLexResult {
   stripped: string;
@@ -159,15 +160,38 @@ function stripSqlCommentsAndLiterals(sql: string): SqlLexResult {
  * - Root must be SELECT, WITH...SELECT, UNION, INTERSECT, or EXCEPT
  * - Every token checked against DDL/DML and dangerous functions/clauses
  */
+function hasUnpairedSurrogate(value: string): boolean {
+  for (let index = 0; index < value.length; index++) {
+    const code = value.charCodeAt(index);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (!(next >= 0xdc00 && next <= 0xdfff)) return true;
+      index++;
+    } else if (code >= 0xdc00 && code <= 0xdfff) {
+      return true;
+    }
+  }
+  return false;
+}
+
 export function validateReadOnlySql(rawSql: string): SqlGuardResult {
+  // Check cheap bounds before trimming or lexing; very large inputs should not
+  // trigger an additional allocation just to compute their UTF-8 byte length.
+  if (rawSql.length > MAX_SQL_BYTES) {
+    return { allowed: false, reason: `SQL exceeds the ${MAX_SQL_BYTES}-byte safety limit.`, normalizedRoot: null, rejectedTokens: ['SQL_TOO_LARGE'] };
+  }
+  if (hasUnpairedSurrogate(rawSql)) {
+    return { allowed: false, reason: 'SQL contains invalid Unicode surrogate code points.', normalizedRoot: null, rejectedTokens: ['INVALID_UNICODE'] };
+  }
+  if (SQL_UTF8_ENCODER.encode(rawSql).byteLength > MAX_SQL_BYTES) {
+    return { allowed: false, reason: `SQL exceeds the ${MAX_SQL_BYTES}-byte safety limit.`, normalizedRoot: null, rejectedTokens: ['SQL_TOO_LARGE'] };
+  }
+
   const trimmed = rawSql.trim();
   if (!trimmed) {
     return { allowed: false, reason: 'Empty SQL statement.', normalizedRoot: null, rejectedTokens: [] };
   }
 
-  if (trimmed.length > MAX_SQL_LENGTH) {
-    return { allowed: false, reason: `SQL exceeds the ${MAX_SQL_LENGTH}-character safety limit.`, normalizedRoot: null, rejectedTokens: ['SQL_TOO_LARGE'] };
-  }
   if (trimmed.includes('\0')) {
     return { allowed: false, reason: 'SQL containing NUL characters is rejected.', normalizedRoot: null, rejectedTokens: ['NUL'] };
   }
