@@ -1,0 +1,21 @@
+[package]
+name = "energybaseline"
+version = "5.2.0"
+description = "EnergyBaseline Tauri 2 Desktop Shell"
+authors = ["EnergyBaseline Engineering"]
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-shell = "2.5"
+tauri-plugin-dialog = "2"
+tauri-plugin-fs = "2"
+tauri-plugin-single-instance = "2"
+tauri-plugin-window-state = "2"
+tauri-plugin-updater = "2"
+tauri-plugin-notification = "2"

@@ -1,0 +1,33 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "main-capability",
+  "description": "Explicit non-wildcard ACL for EnergyBaseline main window (ARC-1..ARC-6).",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "core:window:allow-set-progress-bar",
+    "dialog:allow-open",
+    "dialog:allow-save",
+    "notification:default",
+    "window-state:default",
+    {
+      "identifier": "fs:allow-read-file",
+      "allow": [{ "path": "$APPLOCALDATA/EnergyBaseline/**" }]
+    },
+    {
+      "identifier": "fs:allow-write-file",
+      "allow": [{ "path": "$APPLOCALDATA/EnergyBaseline/**" }]
+    },
+    {
+      "identifier": "shell:allow-spawn",
+      "allow": [
+        {
+          "name": "energybaseline-sidecar",
+          "cmd": "energybaseline_sidecar.exe",
+          "args": ["--stdio"],
+          "sidecar": false
+        }
+      ]
+    }
+  ]
+}

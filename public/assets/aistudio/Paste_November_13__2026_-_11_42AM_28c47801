@@ -1,0 +1,546 @@
+# Master Prompt v5.2 — EnergyBaseline: Tauri 2 + Python Sidecar Desktop Analytics Platform
+
+> **What changed from v5.1 (verified against 2026 sources):** corrected MAPIE v1 class names (`TimeSeriesRegressor`, not `TimeSeriesConformalRegressor`); TanStack Table v9 marked stable and pinned to 9.2.6/9.3 (Aug 2026); Tauri shell `processGroup` Job Object option documented (shell ≥ 2.5.0); `sqlglot.parse` AST guard specified node-by-node; PyInstaller onedir cold-start quantified (1.2–2.5 s vs 6–10 s onefile); WebView2 installer sizes verified (`downloadBootstrapper` ≈ 2 MB, `offlineInstaller` ≈ 127 MB, `fixedRuntime` ≈ 180 MB); Little's MCAR implementation path confirmed via `statsmodels.imputation.mice.MICEData.mcar_test()`; Chow / Quandt–Andrews explicitly marked **custom** (not in statsmodels core); **M-1 (Bootstrap & Skeleton)** milestone added before M0; **Fast Mode** for tests added; **Action Policy** clarified for outlier treatment; and advanced capabilities (causal inference, drift, calibration, model cards, ONNX export, SBOM) added.
+
+---
+
+## 0. How to Read This Prompt
+
+**Priority legend (applies to every requirement):**
+- **[M] MANDATORY:** release-blocking. It **MUST** be implemented and proven by an automated test or a documented manual check. Cannot be deferred.
+- **[S] SHOULD:** on by default. May be deferred **only** with a written entry in the *Deviations Register* (reason, impact, plan).
+- **[O] OPTIONAL:** behind a feature flag. If not shipped, it **MUST** be listed in the *Not-Implemented Register* of the report.
+
+**Conflict resolution:** [M] > [S] > [O]. At the same level, the more specific rule wins. Ambiguities go into the *Assumptions Register*. Ask at most 5 blocking questions up front; otherwise assume, document, and proceed.
+
+**Library-verification policy [M]:** Before using any library API or version named here (MAPIE, TanStack Table, Tailwind v4, `arch`, `sqlglot`, `statsmodels`, Optuna, PyTorch, `shap`, etc.), verify that it exists and behaves as described **in the installed version**. If a claim fails, report it, use the closest verified alternative, and log it in the Deviations Register. **Never invent an API.**
+
+**Traceability [M]:** Every requirement has an ID. Deliver `docs/requirements_matrix.md` mapping ID → code → test → status. Also deliver `docs/deviations.md`, `docs/assumptions.md`, and `docs/not_implemented.md`.
+
+---
+
+## 1. Role and Product Definition
+
+You are a **senior desktop architect, Rust/Tauri engineer, Python data-platform engineer, and M&V/statistical-modeling expert**. Build a **production-grade, offline, single-user Windows desktop application**.
+
+| Layer | Decision |
+|---|---|
+| Platform | **Windows 10 22H2 and Windows 11, x64** (system WebView2) |
+| Shell | **Tauri 2** (Rust) |
+| Frontend | React 19 + TypeScript (strict) + Vite + Tailwind CSS v4 + shadcn/ui (Radix) |
+| Engine | **Python 3.11+** sidecar, frozen with PyInstaller **onedir** |
+| IPC | **JSON-RPC 2.0 over stdin/stdout** (NDJSON). **No HTTP, no localhost ports.** |
+| Storage | SQLite via SQLAlchemy 2.x + Alembic, with zero-fail boot |
+| Packaging | Tauri **NSIS** installer, one `EnergyBaseline.exe` launcher, `.lnk` with custom `.ico` |
+
+**Product flow [M]:** ingest time-series data → column setup → **Variable Selection Gate** → **Test Configuration** → profile, diagnose, and mine data → identify drivers → build an **independent baseline per TARGET** → compare a broad portfolio (including neural networks) → show a **Top-5 per target with explicit representation** → **user selects and locks one** → unlock **Prediction & Monitoring** (file / external SQL / manual) → deviation vs the locked baseline, drift status, interactive dashboard. **AUTO is available on every user-selectable setting, with a documented resolution log.**
+
+### 1.1 Advanced Product Capabilities (v5.2 additions) [M/S]
+
+- **[M] Causal M&V mode:** when a `group` column exists, unlock IPMVP Option C/D and DiD/PS/kernel-balancing diagnostics (T14) plus `DoWhy`/`EconML`-based effect estimation with refutation tests.
+- **[M] Drift & model-health monitoring:** PSI, KS, Wasserstein per predictor; CUSUM/EWMA/Page-Hinkley on residuals; rolling CV(RMSE)/NMBE; a traffic-light status per target; a **re-validation recommendation** (never auto-retrain).
+- **[M] Calibration report:** empirical vs nominal coverage, interval width, Winkler score, conditional coverage by regime, T12 tests (Kupiec, Christoffersen).
+- **[S] Automated EDA bundle:** optional `ydata-profiling` / `sweetviz` HTML profile attached to the report, clearly labelled "descriptive, not inferential".
+- **[S] Model cards:** every locked baseline gets a machine-readable card (intended use, training window, features, assumptions, known limitations, calibration summary).
+- **[S] ONNX export** for the final trained model of parametric/tree/NN families where supported, with a runtime-consistency test (`onnxruntime` vs the Python model on a fixed test batch, tolerance documented).
+- **[S] Report diff:** compare two runs (or two locked baselines) and show what changed in metrics, features, thresholds, and AUTO decisions.
+- **[S] Synthetic ground-truth generator** with configurable planted effects (coefficients, unit roots, breaks, seasonality, MCAR/MAR, outliers) used by the test suite and exposed as a "sanity dataset" in Help.
+- **[M] SBOM and third-party notices** shipped with the installer (CycloneDX JSON + `THIRD_PARTY_NOTICES.md`).
+- **[M] Security hardening:** SQL-guard fuzzing, credential scrubbing in logs, capability ACL, strict CSP, Authenticode signing, and a documented threat model in `SECURITY.md`.
+
+---
+
+## 2. Non-Goals [M]
+No cloud, multi-user, web server, Electron, Docker/Redis/Celery/S3, telemetry/analytics, mobile, LLM-generated report text, or auto-deletion of user data.
+
+---
+
+## 3. Delivery Protocol [M]
+
+Deliver incrementally. **Do not write breadth before the vertical slice works.** Each milestone ends with green tests, an updated requirements matrix, and run instructions.
+
+- **M-1 — Bootstrap & Skeleton:** Tauri shell + frozen onedir sidecar + stdio handshake + stdin-EOF shutdown + Job Object (`processGroup`) + SQLite zero-fail boot + one trivial RPC (`system.status`) with progress/cancel + NSIS installer build. **Gate:** all ARC/IPC/LIF/DB requirements pass **before** any data code is written. Resolve the onedir-vs-`externalBin` packaging question here.
+- **M0 — Data Vertical Slice:** ingest a CSV, run one trivial analysis end-to-end, render a chart, save a `.ebproj`, and reopen it. **Gate:** PIPE-1..3, DAT-1..6, PER-1..2 pass on this slice.
+- **M1:** Data and Time layer (roles, aggregation, DST, windowing) + **Column Setup + Variable Selection Gate (VSG)**.
+- **M2:** AUTO engine + audit log + **Test Configuration & Decision Policy (TCP)** + T-catalog (pre-model families) + result cache + **Fast Mode**.
+- **M2b:** EDA Atlas and Data Mining (F1–F9).
+- **M3:** Modeling, validation, scoring, Top-5, lock + T10/T11 integration + model cards.
+- **M4:** Conformal UQ + T12 + Prediction & Monitoring + Drift + causal M&V mode.
+- **M5:** Full report depth (RPT-1..7; HTML/PDF/Excel) + report diff + Excel formula export.
+- **M6:** Persistence polish, UX polish, updater, CI, security review, SBOM, docs.
+
+Per-response output: file tree → code → tests → how to run → Deviations/Assumptions deltas.
+
+---
+
+## 4. Global Rules (Non-Negotiable) [M]
+
+- **G-1** Desktop, offline, Windows-native. The UI renders in system WebView2; the engine is a **child process**, never a network service.
+- **G-2** Python 3.11+ engine only. No Node backend, FastAPI, Flask, or Uvicorn. The frontend is static assets via `frontendDist`.
+- **G-3** One double-clickable launcher (`EnergyBaseline.exe`). No terminal for end users. `install.bat`/`start.bat`/`stop.bat` are developer-only.
+- **G-4** **SQLite fallback is non-negotiable** (§8). External DBs are optional and, by default, only a Prediction input source.
+- **G-5** **Deterministic and reproducible** within the scope defined in AUTO-5.
+- **G-6** **No silent deletion or modification.** Every exclusion, transformation, imputation, test-driven action, and AUTO decision is logged with its signal and rule.
+- **G-7** All UI, reports, logs, and docs in **English**. The UI **MUST** be i18n-ready (`react-i18next`), but only English ships.
+- **G-8** **Clean shutdown via stdin EOF** (LIF-1). No heartbeat polling.
+- **G-9** **Never hallucinate numbers.** Every figure in the UI or reports comes from computed artifacts (RPT-4, §27).
+- **G-10** No telemetry. Network access happens only on explicit user action (SQL connection, update check).
+- **G-11** **No LLM in the report path.** Narrative text is rule/template-based and traceable to artifact IDs (RPT-4).
+
+---
+
+## 5. Pipeline Order [M]
+
+```
+Ingest → Column Setup (roles / types / units / availability)
+→ ★ Variable Selection Gate (VSG, §10)
+→ ★ Test Configuration & Decision Policy (TCP, §13)
+→ Profiling & EDA → Diagnostics Suite (pre-model tests, T1–T9, T13)
+→ Data Mining → Feature Engineering & Selection (per target)
+→ Modeling → Validation → Post-model tests (T10–T12)
+→ Scoring → Top-5 → Lock → Prediction & Monitoring → Drift
+```
+
+- **PIPE-1** The user **MUST** review and can change the variable selection and test configuration **before** any inferential test runs. The wizard cannot proceed from Column Setup without passing the VSG and TCP, even if the user simply accepts AUTO defaults. Accepting is a logged event.
+- **PIPE-2** Two concepts, never conflated:
+  - **Candidate Pool**: chosen by the user in the VSG. Defines which variables are *analyzed and eligible*.
+  - **Selected Features**: chosen by the per-target pipeline after tests. Defines which variables *enter the model*.
+- **PIPE-3** Test phases: **T1–T9 and T13 run pre-model**; **T10–T12 run post-model** on out-of-fold results; **T14 runs only when a `group` column exists**.
+
+---
+
+## 6. Tauri Shell (Rust)
+
+- **ARC-1 [M]** Capabilities (ACL) are explicit in `src-tauri/capabilities/`, scoped to named windows. **No wildcard scopes, no allow-all.**
+- **ARC-2 [M]** Strict CSP: `default-src 'self'`; no remote scripts; no `unsafe-eval`; `connect-src` limited to Tauri IPC. Do not disable Tauri's CSP asset modification.
+- **ARC-3 [M]** The shell plugin scope allows **only** the sidecar with fixed arguments. The fs scope is `APP_HOME` plus paths the user picked via the dialog plugin.
+- **ARC-4 [M]** Plugins: shell (≥ 2.5.0, with `processGroup: true` so the sidecar and its children are placed in a Windows **Job Object** and killed as a tree), dialog, fs, single-instance, window-state, updater, notification. Taskbar progress uses Tauri core APIs (`set_progress_bar`); tray is optional. `.ebproj` file association is set in bundle config.
+- **ARC-5 [M]** **The Rust core does not open the SQLite database.** The sidecar is the single DB owner.
+- **ARC-6 [M]** The shell exposes only `rpc_call` and `rpc_cancel` to the frontend; both validate the method against a **compile-time allowlist** and enforce a max frame size. A blind proxy is forbidden (it would bypass the ACL).
+- **ARC-7 [M]** The shell MUST NOT use a `localhost` HTTP server for the sidecar. If the sidecar’s own I/O is file-based (Parquet/JSON under `APP_HOME/cache/`), the shell validates the path is inside `APP_HOME` before forwarding it to the frontend.
+
+---
+
+## 7. IPC and Sidecar
+
+### 7.1 Protocol contract
+- **IPC-1 [M]** Framing is NDJSON (UTF-8, one JSON object per line, no embedded newlines). Frames are capped at **1 MiB**. Larger payloads travel as **files** (Parquet/Arrow/JSON under `APP_HOME/cache/`), referenced by `{path, sha256, rows}`.
+- **IPC-2 [M]** **stdout is reserved for protocol frames.** At startup, the sidecar duplicates the original stdout fd for the protocol and redirects `sys.stdout`/fd 1 to stderr, so a stray `print()` cannot corrupt frames. A test **MUST** prove this.
+- **IPC-3 [M]** The Rust side exposes a minimal set of Tauri commands (`rpc_call`, `rpc_cancel`) and **validates `method` against a compile-time allowlist**, with param-size limits.
+- **IPC-4 [M]** Contract-first: JSON Schemas (generated from Pydantic v2 models) are the single source. TypeScript types are generated in CI. Contract tests run on both sides.
+- **IPC-5 [M]** Error taxonomy: standard JSON-RPC codes plus app codes `CANCELLED`, `VALIDATION`, `DATA_REFUSED`, `TIMEOUT`, `INTERNAL`, `PROTOCOL_VERSION`. Every error includes a user-readable message and a log reference.
+- **IPC-6 [M]** Progress notifications `{target, stage, test_id?, percent}` are coalesced and throttled to **≤ 10 Hz** and forwarded as Tauri events.
+- **IPC-7 [M]** Data grids use **server-side windowing**: the UI requests row windows `{offset, limit, sort, filter}` and **never holds more than a bounded window in JS memory**. Chart series above AUTO-chosen limits are downsampled in the sidecar (LTTB/M4).
+
+### 7.2 Handshake
+- **IPC-8 [M]** The Rust core spawns the sidecar with an **explicit environment** (`APP_HOME`, DB variables, log dir) and writes one `hello` line to stdin: `{protocol_version, app_version, parent_pid, app_home}`. The sidecar replies on stdout with `sidecar.ready` `{pid, protocol_version, sidecar_version, db:{ok, url_masked, fallback, writable}}`, or `sidecar.fatal {log_path}`. **No handshake file, no nonce.**
+- **IPC-9 [M]** Ready timeout is **10 s warm** (configurable up to 30 s; first run after install may use 30 s with a splash screen). On timeout the shell shows a built-in `error.html` with the log path and a Retry button, and kills the sidecar.
+- **IPC-10 [M]** A protocol-version mismatch aborts with a clear message.
+
+### 7.3 Lifecycle
+- **LIF-1 [M]** **Stdin EOF is the authoritative graceful-shutdown signal.** On window close, Rust closes the sidecar’s stdin. The sidecar cancels jobs, stops the pool, checkpoints, closes the DB, and exits within 5 s. The shell waits up to 10 s, then terminates.
+- **LIF-2 [M]** **Windows Job Object with `KILL_ON_JOB_CLOSE`** contains the sidecar and all its children (via Tauri shell `processGroup: true`). If the shell crashes or is killed, **no process may survive**. Test: kill the shell → zero orphans within 5 s.
+- **LIF-3 [O]** A parent-PID watchdog is optional (redundant with EOF + Job Object).
+- **LIF-4 [M]** If the sidecar crashes mid-run, the UI shows the error, offers restart, and the run **resumes from the last stage checkpoint** (PER-2).
+- **LIF-5 [M]** Updater installation **MUST** stop the sidecar first, because NSIS replaces locked files.
+
+### 7.4 Sidecar internals
+- **SCR-1 [M]** PyInstaller **onedir** (never onefile). Call `multiprocessing.freeze_support()` first. Use the `spawn` start method. Measured onedir warm start is 1.2–2.5 s versus 6–10 s for onefile.
+- **SCR-2 [M]** CPU-bound work runs in a **bounded process pool**. Pin BLAS/OMP threads so that `workers × threads ≤ physical cores`.
+- **SCR-3 [M]** Cancellation is cooperative at stage boundaries **and** inside epoch/trial/fold/test callbacks. A worker that does not stop within 10 s is killed.
+- **SCR-4 [M]** Lazy-import heavy libraries (torch, xgboost, lightgbm, catboost, matplotlib). The idle process **MUST NOT** import matplotlib. Static report charts are rendered by a short-lived worker (Agg backend).
+- **SCR-5 [M]** Neural networks use **PyTorch CPU-only** wheels. Model export uses safe formats (PER-6).
+- **SCR-6 [M] Size honesty:** figures like 4.7 MB / 64 MB describe an empty Tauri shell only and **MUST NOT** be quoted for the full product. At M-1 measure and publish installer size, cold/warm start and idle RAM, then fix budgets. Offer the NN stack as an optional component if the budget is exceeded [S].
+- **SCR-7 [M]** Method surface (allowlisted): `data.ingest`, `data.window`, `vsg.get`, `vsg.set`, `vsg.preset_save`, `vsg.preset_load`, `tcp.get`, `tcp.set`, `tcp.estimate`, `tcp.reevaluate`, `analysis.run`, `analysis.cancel`, `diagnostics.run`, `model.predict`, `model.export`, `model.card`, `report.generate`, `report.diff`, `sql.test_connection`, `sql.run_query`, `session.save`, `session.load`, `system.status`, `system.health`, `system.sbom`.
+
+---
+
+## 8. Hard Requirement — SQLite Fallback with Zero-Fail Boot [M]
+
+- **DB-1** Exactly one module (`energybaseline/config/settings.py`) reads DB environment variables. Everyone else calls `get_database_url()`. A CI grep test enforces this.
+- **DB-2** Priority list: `EB_DATABASE_URL` [S], then `DATABASE_URL`, `POSTGRES_URL`, `DB_CONNECTION_STRING`, `DB_URI`. The first non-empty, non-whitespace value wins.
+- **DB-3** If none is set, the default is the canonical literal **`sqlite:///./data/app.db`**. A relative SQLite path is **always resolved against `APP_HOME`, never the CWD.**
+- **DB-4** `APP_HOME` is `%LOCALAPPDATA%\EnergyBaseline` by default, or `.\` next to the exe when a `portable.flag` file exists. `data/` is created **before** any connection attempt.
+- **DB-5** **Never raise at import time** on a missing variable. **Fallback ladder:** configured URL → default under `APP_HOME` → `%TEMP%\EnergyBaseline` (prominent “data may be lost” warning) → in-memory SQLite (persistent red banner). Boot never fails.
+- **DB-6** A non-SQLite URL is probed (≈3 s timeout). If unreachable, degrade to SQLite, write an audit entry, **and show a visible UI banner** (never silent).
+- **DB-7** Log `INFO db.url_resolved url=… fallback=…` with credentials masked. Expose `get_engine_url()` for SQLAlchemy.
+- **DB-8** SQLite pragmas: `journal_mode=WAL`, `foreign_keys=ON`, `busy_timeout=5000`, `synchronous=NORMAL`. Only the main sidecar process writes (workers return results).
+- **DB-9** Self-test at boot: write and read a sentinel row in a `health` table. Expose `{ok, url, fallback, writable}` on the Status page.
+- **DB-10** Alembic `env.py` uses the same resolver. Migrations are bundled as PyInstaller data and run programmatically at boot **after an automatic pre-migration backup** (SQLite online backup API). On failure, restore the backup and show the error. Never delete data.
+- **DB-11** Tests: no env; whitespace env; unreachable Postgres; read-only `APP_HOME`; clean-machine `alembic upgrade head` in the frozen build.
+
+---
+
+## 9. Data, Time, and Column Roles
+
+- **DAT-1 [M]** Per-column **role**: `time | target | predictor | static_factor | group | weight | ignore`. Per-column **quantity type**: `flow | stock | rate | quality | index`. Also a unit string and an **availability flag** (`known_in_advance | observed_only`). **Column-name heuristics may only *suggest* roles in the wizard; they never decide.**
+- **DAT-2 [M]** Aggregation defaults by quantity type: flow→sum; stock→last; rate→time-weighted mean; quality→mean (or median); index→mean. Override is allowed and logged.
+- **DAT-3 [M]** The user declares sampling period, aggregation, timezone, baseline window and reporting window. **Finer data is aggregated; coarser data is refused** (`DATA_REFUSED`, with an explanation). Disaggregation is never performed.
+- **DAT-4 [M]** Timestamps are stored in UTC and displayed in local time. DST is handled explicitly (23/25-hour days, duplicated and missing hours flagged). Duplicate timestamps, irregular spacing and gaps get a logged policy. Buckets below the AUTO completeness threshold become NaN and are **never rescaled**.
+- **DAT-5 [M] “No fabrication” defined precisely:** no synthetic rows, no disaggregation, and **no imputation of the target in any evaluation set**. Predictor imputation is permitted only with max-gap limits, missingness-indicator columns and logging. Metrics use observed targets only.
+- **DAT-6 [M]** Ingest: CSV/Excel/Parquet, with encoding and decimal-separator detection, streamed reading and a Parquet cache. Use a columnar engine (Polars or pandas+pyarrow) for large files.
+- **DAT-7 [S]** A *Non-Routine Events* table (date ranges, reason) lets the user flag periods that are excluded or adjusted. Static factors are handled per IPMVP/ISO 50006 concepts.
+- **DAT-8 [M] Outlier Action Policy:** T2 and T10 **flag** first. Removal, winsorization, or interpolation happens only through a logged **Action Policy** (`flag_only` | `ask_user` | `auto_apply`) and is recorded with the rule, the affected rows, and the resulting change to the training set. The target is never altered inside an evaluation set.
+
+---
+
+## 10. Variable Selection Gate (VSG) [M]
+
+- **VSG-1** Per **target** and per variable, the user sets one **Inclusion State**:
+
+  | State | Meaning |
+  |---|---|
+  | `force_include` | Must remain in the model unless it violates a leakage or integrity rule (the conflict is shown, never silently overridden) |
+  | `candidate` | Eligible; AUTO feature selection decides |
+  | `analysis_only` | Included in EDA, tests and mining; never a model predictor |
+  | `exclude` | Excluded from tests and modeling, but still listed in the data dictionary |
+
+- **VSG-2** Default state is **AUTO**. AUTO resolves from role, constant/near-constant checks, missing rate, leakage flags and availability, each logged with signals and rule (AUTO-2 format).
+- **VSG-3** The gate shows, **per variable**, a pre-test profile: type, unit, missing %, unique count, variance, constant/near-constant flag, leakage suspicion, `known_in_advance` flag and a mini-histogram. It also shows an **Impact Preview**: number of variables, number of tests to run, multiple-testing family sizes, estimated compute time (Fast Mode vs Full Mode).
+- **VSG-4** Bulk actions: select by role/type/name pattern/missing-rate range; invert; copy one target’s selection to another; **save and load selection presets** (JSON, reusable across projects).
+- **VSG-5** **Test scope per variable group:** the user may restrict which test families run on which variables (see TCP-8).
+- **VSG-6** **Integrity checks are not disableable:** leakage rules (MT-2), time-order checks, DST/duplicate-timestamp handling, target-never-in-predictors. The gate shows a conflict if the user forces something that violates them.
+- **VSG-7** **Selection provenance:** every selection records `source` (`AUTO` | `USER_OVERRIDE`), timestamp and **`phase`** (`pre_test` | `post_test`). A change made after test results are visible is flagged `post_hoc` and listed under Limitations (“data-dependent selection”). A selection made before results is `pre_registered`.
+- **VSG-8** Changing the selection after a run **invalidates only dependent stages** (via the cache key in TCP-10) and shows which stages will recompute.
+- **VSG-9 [S]** Excluded variables can optionally get a **descriptive-only profile** (no inferential tests) so that nothing about them is hidden.
+
+---
+
+## 11. Multi-Target Independence [M]
+
+- **MT-1** One or more TARGETs, each with an **independent end-to-end pipeline** (VSG state, preprocessing, leakage rules, feature selection, portfolio, HPO, Top-5, lock).
+- **MT-2 Leakage rules (per target):**
+  - other TARGETs are never predictors;
+  - predictors **not available at prediction time** are excluded in forward mode;
+  - a predictor with |r| ≥ 0.99 is flagged “suspected leakage” and **AUTO-excluded only if** it shares the target’s declared unit family or an algebraic identity is detected;
+  - otherwise it is kept with a warning, and the user may override. All of this is logged.
+- **MT-3** Targets run sequentially or in parallel (capped by cores) with per-target progress and a global cancel. **The merged AUTO log is sorted by target, not by completion order.**
+- **MT-4** Per-target seed = `hash(global_seed, target_id)`.
+- **MT-5 [S]** **Conditional diagnostics:** regime labels (F4) are used to produce conditional correlation matrices, conditional coverage, and conditional CV(RMSE); labels are **never** model inputs (leakage).
+
+---
+
+## 12. AUTO Mode and Determinism
+
+- **AUTO-1 [M]** Every setting defaults to **AUTO** and is resolved per target from data signals.
+- **AUTO-2 [M]** Every AUTO decision records: `setting_key`, `value`, `signals` (e.g., “missing rate 4.2 % < 5 % → linear interpolation”), `rule`, `mode` (`AUTO` | `USER_OVERRIDE`), `target`, `timestamp`.
+- **AUTO-3 [M]** The UI has a read-only **AUTO Resolutions** inspector. The report has an **AUTO Resolutions Log** section. User overrides never silently revert to hard-coded values.
+- **AUTO-4 [M]** AUTO **never fabricates data** (DAT-5).
+- **AUTO-5 [M] Determinism scope:**
+  - AUTO decisions are a pure function of (dataset, seed, config) and **MUST be identical** across runs. Test: hash of the AUTO log.
+  - Classical model metrics are reproducible to 1e-9.
+  - NN metrics use `torch.use_deterministic_algorithms`, pinned threads and a documented tolerance.
+  - Bootstrap and Monte Carlo procedures use seeded generators; the worker count never changes results.
+- **AUTO-6 [M] Effort profile:** `fast | standard | thorough`. `fast` is AUTO for exploratory first runs (critical tests only, small HPO budget); `thorough` is AUTO for final baseline runs. The user may override; the choice is logged. **Fast Mode must still produce a valid Top-5** (with a notice that the test suite was reduced).
+
+---
+
+## 13. Test Configuration & Decision Policy (TCP) [M]
+
+- **TCP-1 Global settings** (all default AUTO, all overridable, all logged as `USER_OVERRIDE`):
+  - significance level **α** (allowed range 0.001–0.20; values > 0.10 show a warning; presets: Strict 0.01 / Standard 0.05 [AUTO default] / Exploratory 0.10 / Custom);
+  - **confidence level** (80/90/95/99 %, Custom within 50–99.9 %; default 95 %), which also drives the UQ coverage default (UQ-2);
+  - **multiple-testing correction**: none | Bonferroni | Holm | Benjamini–Hochberg | Benjamini–Yekutieli. Raw **and** adjusted p-values are always stored;
+  - **correction family definition**: per test type × per target (default) | per target | global | per variable;
+  - **decision rule**: `p_only` | `p_and_effect_size` (default) | `ci_based` | `equivalence` (TOST).
+- **TCP-2 Per-test overrides:** every test has its own parameter panel with validated ranges and tooltips explaining each parameter. At minimum:
+  - α and correction (inherit or override);
+  - **alternative** (`two-sided` | `greater` | `less`) where applicable;
+  - **max lags** (fixed | AIC | BIC | Schwert rule), **deterministic terms** (`n`/`c`/`ct`/`ctt` for ADF/KPSS), **HAC kernel and bandwidth**;
+  - **minimum sample size** (below it the test is skipped with a logged reason);
+  - **effect-size thresholds** (|r|, Cohen's d, Cliff's δ, η², Cramér's V, SMD) with small/medium/large cut points;
+  - **equivalence margin** for TOST;
+  - **bootstrap settings** (method, block length AUTO, replicates ≥ 1,000 AUTO, seed).
+- **TCP-3 Test selection tree:** the user can enable/disable each test family and each test, with dependencies shown (e.g., Granger requires stationarity checks), a cost estimate and a “why you might keep this” hint. A disabled test appears in the report as **“not run (user)”**, never omitted. Disabling warns if downstream stages rely on it.
+- **TCP-4 Expected-sign and monotonicity constraints:** per predictor per target: `+` | `−` | `free` | `non-monotonic allowed`, optionally with a tolerance. Used for coefficient **sign checks** (parametric), **monotonic constraints** (LightGBM/XGBoost where supported), **PDP/ALE plausibility** (non-parametric), and the physical-plausibility score (SC-1). Violations are reported with magnitude and CI, never silently corrected.
+- **TCP-5 Gate role per test result:** each test has a role the user can change: `informational` (reported only); `warning` (UI/report flag); `gating` (triggers a downstream action: difference, flag, exclude from the Candidate Pool, switch imputation, change CV scheme). Downstream actions follow an **Action Policy**: `flag_only` | `ask_user` (default for destructive actions) | `auto_apply` (always logged). **No test result ever deletes data silently.**
+- **TCP-6 What-if re-evaluation:** because statistics and p-values are stored, changing α, correction, decision rule or effect-size thresholds **re-evaluates decisions instantly without recomputing** the statistic. The UI shows a diff of flipped decisions. Parameters that change the statistic itself (lags, trend spec, bootstrap) recompute only the affected tests.
+- **TCP-7 Decision sensitivity table:** for every test, show the decision at α ∈ {0.01, 0.05, 0.10}, flagging **“decision flips”** between levels. The report summarizes how many conclusions are threshold-sensitive.
+- **TCP-8 Test scope matrix:** a variables × test-families grid (per target) where the user ticks which tests apply to which variables. Default AUTO from role and type.
+- **TCP-9 [M] Pre-registration mode:** the user may lock the Test Configuration **before running** it. The lock is hashed and stored. Any later change is labeled `post_hoc` in the report. **The default AUTO configuration is considered pre-registered if accepted before results are shown**; the UI must make this explicit.
+- **TCP-10 Result caching:** results are keyed by `(data_hash, variable_set, test_id, parameters, seed, library_versions)`. The cache enables TCP-6 and VSG-8 and is part of reproducibility.
+- **TCP-11 Guard rails:** validate every input (type, range, cross-parameter consistency). Warn when a configuration is statistically unsound (e.g., high α with no correction across hundreds of tests; ADF max-lag larger than n/3; a normality test on n > 5,000 with a p-only decision). Warnings are shown, the user may proceed (logged).
+- **TCP-12 Effect size and practical significance:** with `p_and_effect_size`, a result is “significant” only if p_adj < α **and** the effect size exceeds its threshold. The report distinguishes **statistical** from **practical** significance.
+- **TCP-13 Configuration snapshot:** the full effective configuration (AUTO-resolved and user values) is saved in the project, exported with reports and included in the Reproducibility section.
+- **TCP-14 [S] Bayesian alternative:** when the user selects a Bayesian decision framework, the engine may report Bayes factors or posterior probabilities of a region of practical equivalence (ROPE) instead of p-values. **Never mix Bayesian and frequentist evidence in the same comparison table without clear labels.**
+
+---
+
+## 14. Comprehensive Test Catalog [M]
+
+Each test emits: statistic, p-value (**raw and adjusted**), df, effect size (where defined), CI, n used, assumptions checked, decision, interpretation, downstream action, `mode`.
+
+**Implementation honesty [M]:** `statsmodels` provides ADF, KPSS, Granger, Ljung–Box, Breusch–Godfrey, Breusch–Pagan, White, RESET, ARCH-LM, Jarque–Bera, Cook's D, TOST and more. **Phillips–Perron, DF-GLS and Zivot–Andrews come from `arch`** (verify). **Little's MCAR** is available via `statsmodels.imputation.mice.MICEData(df).mcar_test()`. **Chow, Quandt–Andrews, Pettitt, Diebold–Mariano, Nemenyi, and other missing functions are custom** (or from a verified package such as `pychow`). **Every custom test MUST be validated against R reference values** (`strucchange`, `MissMech`, `tseries`, `urca`, `forecast`, `Kendall`, etc.). Anything not shipped goes into the Not-Implemented Register.
+
+| ID | Family | Tests and priority |
+|---|---|---|
+| **T1** | Distribution & normality | **[M]** Shapiro–Wilk (n ≤ 5,000), D'Agostino–Pearson, Anderson–Darling, Lilliefors, Jarque–Bera, skewness/kurtosis z-tests, QQ/PP plots |
+| **T2** | Outliers (flag only) | **[M]** Tukey fences, Hampel/MAD, Grubbs, Generalized ESD (Rosner), STL-residual, robust Mahalanobis (MCD), IsolationForest, LOF · **[O]** Dixon |
+| **T3** | Group / regime comparison | **[M]** Welch t, Mann–Whitney, one-way and Welch ANOVA, Kruskal–Wallis; post-hoc Tukey HSD, Games–Howell, Dunn; Levene/Brown–Forsythe, Bartlett, Fligner–Killeen; 2-sample KS, k-sample Anderson–Darling, Cramér–von Mises; paired t, Wilcoxon signed-rank, sign test |
+| **T4** | Association | **[M]** Pearson, Spearman, Kendall τ-b, distance correlation, mutual information, partial and semi-partial correlation, point-biserial, correlation ratio η, Cramér's V, χ², Fisher exact, lagged cross-correlation · **[O]** MIC, Hoeffding's D |
+| **T5** | Stationarity / unit roots | **[M]** ADF (deterministic-term selection), KPSS (c, ct), PP · **[S]** DF-GLS, Zivot–Andrews (one break) · **[O]** seasonal unit-root tests (OCSB/Canova–Hansen; verify availability) |
+| **T6** | Trend, seasonality, randomness | **[M]** Mann–Kendall (autocorrelation-modified and seasonal variants), Sen's slope, seasonal-subseries Kruskal–Wallis, Friedman, STL/MSTL seasonal and trend strength, runs test, Ljung–Box on the raw series · **[S]** Cox–Stuart, QS test, Fisher g periodogram test, turning-point, Bartels rank, BDS nonlinearity |
+| **T7** | Multivariate structure | **[M]** KMO, Bartlett sphericity, VIF, condition number, eigenvalue analysis, Granger (on stationary series, corrected) · **[S]** Engle–Granger and Johansen cointegration, Mardia/Henze–Zirkler normality · **[O]** transfer entropy |
+| **T8** | Missingness | **[M]** Little's MCAR (`statsmodels` MICE), pattern analysis (matrix, co-occurrence), logistic test of missingness vs covariates, gap run-length distribution |
+| **T9** | Structural stability | **[M]** Chow (custom, HAC option), Quandt–Andrews sup-F (custom, bootstrap p-values), CUSUM, CUSUM-SQ, Pettitt, PELT/BinSeg · **[S]** Bai–Perron, ICSS (variance breaks), SNHT · **[O]** Hansen instability, Bayesian online change-point |
+| **T10** | Regression diagnostics (post-model, OOF residuals) | **[M]** residual normality, Durbin–Watson, Ljung–Box, Breusch–Godfrey, Breusch–Pagan, White, Goldfeld–Quandt, ARCH-LM, RESET, Harvey–Collier, Rainbow; Cook's D (flag > 4/n), DFFITS, DFBETAS, leverage, studentized residuals; coefficient t/F/Wald with HAC SEs; partial F; LR test for nested models; **sign checks (TCP-4)**. For non-parametric ML models these are descriptive only (state this). |
+| **T11** | Model comparison | **[M]** Diebold–Mariano (Harvey–Leybourne–Newbold correction), corrected resampled t-test (Nadeau–Bengio), Wilcoxon on fold errors, Friedman + Nemenyi, paired bootstrap CI of metric differences · **[S]** TOST model equivalence, Model Confidence Set |
+| **T12** | Interval calibration | **[M]** Kupiec POF, Christoffersen independence/conditional coverage, binomial coverage test, rolling coverage |
+| **T13** | Power & sample size | **[S]** minimum detectable effect and a-priori power analysis (never “observed power”) |
+| **T14** | M&V balance (only with a `group` column) | **[O]** TOST with configurable margin, SMD < 0.1 + Love plot, parallel-trends test, propensity overlap, kernel balancing |
+
+**Mandatory test-specific logic [M]:**
+
+- **TC-1 Assumptions:** every test declares its assumptions (independence, normality, stationarity, minimum n). The engine checks them and, if violated, **auto-switches to a robust or non-parametric variant (logged)** or marks the result “assumption violated”.
+- **TC-2 Autocorrelation-aware inference:** correlation and mean-comparison tests on time series use HAC or **block-bootstrap / effective-sample-size** inference. Classical p-values for autocorrelated series are labeled “naive”.
+- **TC-3** Never claim causation from Granger, cointegration or correlation. Granger is used for **candidate lag screening only**, on stationary series, with correction.
+- **TC-4 Stationarity decision matrix (T5):** ADF rejects & KPSS does not → stationary; ADF does not reject & KPSS rejects → non-stationary → difference or flag; both reject → trend-stationary or structural break suspected; neither rejects → inconclusive (low power). Differencing is applied only if the model family needs it, and is logged.
+- **TC-5 Structural breaks (T9):** Chow applies when the break date is known; Quandt–Andrews when unknown. A baseline-vs-reporting Chow requires actuals in the reporting window. **In M&V, a detected break is reported as “possible savings or non-routine event”, never as automatic model failure.**
+- **TC-6 Missingness (T8):** Little's MCAR assumes multivariate normality; interpret cautiously for time series. If MCAR is rejected or inconclusive, default to **time-aware** imputation (bounded interpolation, iterative imputer with lags) plus missingness indicators. MNAR is untestable; document it.
+- **TC-7 Influence (T2/T10):** flag only; removal requires a logged Action Policy (DAT-8).
+- **TC-8 Large-n behavior:** with very large n nearly every p-value is significant, so effect size and practical thresholds (TCP-12) are mandatory in the display. Large-n tests (distance correlation, Shapiro–Wilk) use documented subsampling or approximate variants, logged.
+
+---
+
+## 15. Confidence Intervals Everywhere [M]
+
+- **CI-1 [M]** Every **key estimate** in the UI and the report carries a **CI at the selected confidence level**: correlations (Fisher-z and bootstrap), coefficients (HAC), CV(RMSE)/NMBE/MAE/R² (block bootstrap), effect sizes, prediction and conformal intervals (§19), change-point locations (bootstrap), seasonal indices, and PDP/ALE bands.
+- **CI-2 [M]** Time-series bootstrap defaults to the **stationary or circular block bootstrap** with AUTO block length (e.g., Politis–White), logged.
+- **CI-3 [M]** Display the CI method next to each interval (tooltip and report appendix).
+- **CI-4 [S]** For **secondary** estimates (e.g., permutation-importance deltas, minor subgroup statistics), a CI is reported when the cost is bounded; otherwise a bootstrap replicate count and a “no CI” flag are shown.
+
+---
+
+## 16. Exploratory Analysis & Data Mining [M]
+
+**F1. Univariate profiling (every variable in the Candidate Pool)** — statistics; charts (histogram + KDE, ECDF, QQ, box/violin, time plot, calendar heatmap, hour×weekday heatmap, seasonal subseries, STL/MSTL, ACF/PACF, periodogram, lag plot, missingness matrix).
+
+**F2. Correlation & dependence suite (mandatory depth)** — matrices (Pearson, Spearman, Kendall, distance correlation, MI, partial) **each with CI, raw and adjusted p-values and n used**; charts (clustered heatmap, target-ranked bar with CI, scatter matrix, LOESS/GAM smoother, hexbin, correlation network, **lagged cross-correlation heatmap**, rolling correlation, stability across periods/regimes); diagnostics (nonlinearity flag, Simpson's-paradox check, multicollinearity report, spurious-correlation warning).
+
+**F3. Multivariate structure** — **[M]** PCA (scree, loadings, biplot, contributions); factor analysis with KMO/Bartlett. **[O]** ICA/NMF; t-SNE/UMAP labeled visualization-only.
+
+**F4. Clustering & regimes** — KMeans, GMM, hierarchical, DBSCAN/HDBSCAN; validity indices (silhouette, Davies–Bouldin, Calinski–Harabasz, gap statistic); **bootstrap stability (ARI)**; daily load-profile clustering; regime labels feed conditional diagnostics.
+
+**F5. Anomaly detection** — ensemble (robust z, STL-residual, IsolationForest, LOF, One-Class SVM, MCD-Mahalanobis); matrix-profile discords [S]; autoencoder reconstruction [O]; voting with agreement score; flag first, log treatment.
+
+**F6. Pattern mining** — association rules on discretized variables (support, confidence, lift, leverage, conviction, user thresholds); **rule extraction for operating regimes** via shallow decision trees; frequent episodes/sequential patterns and subgroup discovery [O].
+
+**F7. Time-series mining** — MSTL, forecastability (spectral entropy, ACF-based), lead-lag structure, motifs/discords [S], HMM regimes [S], change-point detection with CI on locations; domain-aware engineering views (load-duration curve, base/peak load, on/off-state detection, weather signature, degree-day base-temperature optimization with CI).
+
+**F8. Feature relevance (before modeling)** — MI, ANOVA-F, permutation importance, **stability selection**, Boruta; SHAP [S] (with `approximate=True` for n > 10k, logged). Rank agreement across methods (Kendall's W) with a consensus chart.
+
+**F9. Data Quality Score** — a transparent formula (completeness, validity, consistency, timeliness, uniqueness), with component weights shown and a per-variable breakdown.
+
+**F10 [S] Automated EDA attach** — optional `ydata-profiling` or `sweetviz` HTML profile attached to the report, labelled “descriptive, not inferential”.
+
+---
+
+## 17. Modeling and Validation
+
+### 17.1 Portfolio
+- **Mandatory [M] baseline set:** mean baseline; degree-day regression; MLR; Ridge; Lasso; Elastic Net; piecewise/change-point (1P–5P aligned with ASHRAE 14, verify the exact variant list); TOWT; Random Forest; ExtraTrees; Gradient Boosting; XGBoost; LightGBM; SVR (RBF); MLP; **at least one sequence NN (LSTM, GRU, or TCN)**.
+- **[S]:** polynomial deg-2, GAM (B-splines), Bayesian ridge, quantile regression, Gaussian Process (**with an AUTO size cap and a sparse/subsample strategy, documented**), 1D-CNN, CNN-LSTM, autoencoder regressor.
+- **[O]:** CatBoost, N-BEATS, TFT, PatchTST, Informer. Anything not shipped is listed as “not implemented”.
+- **Constraints [M]:** expected-sign and monotonicity settings (TCP-4) are applied where the model family supports them; otherwise they are checked post-hoc and reported.
+- **NN gate [M]:** an NN is rejected if it does not beat the best classical model's CV(RMSE) by the margin (AUTO default 5 %), or if its parameter count exceeds the observation count. The reason is recorded.
+- **Ensemble [M]:** a blend is created only if it improves out-of-fold CV(RMSE) by > 3 % (AUTO-logged). **Blend weights are learned by constrained NNLS on inner-fold OOF predictions and evaluated on outer folds** (never fit and scored on the same OOF). If the data cannot support learned weights, use an equal-weight heuristic and label it as such.
+- **Baseline artifact [M]:** every locked model exports a safe artifact (ONNX/skops/JSON coefficients where possible; pickle only with SHA-256 verification and a user warning). A **model card** is produced (intended use, training window, features, assumptions, calibration summary, known limitations).
+
+### 17.2 Validation design [M]
+- **VAL-1** Blocked K-fold for histories < 2 years (contiguous folds, seasonal coverage checked and logged); forward-chaining otherwise.
+- **VAL-2** **Purge gap ≥ max(1 day, 1 sampling step, max lag, max rolling-window length).**
+- **VAL-3** Nested tuning: HPO runs inside each training fold. **Scaling, imputation and feature selection (Boruta/RFE/Lasso/MI/Granger-based screening) are fit inside training folds only**, as part of one pipeline object. Only variables in the **Candidate Pool** (PIPE-2) are eligible; `force_include` variables bypass selection (VSG-1).
+- **VAL-4** HPO: Optuna (TPE default; random and CMA-ES selectable; seeded sampler). **CMA-ES requires `optuna.samplers.CmaEsSampler`; verify it exists in the installed Optuna version (some 2026 builds removed it — if absent, use the `cmaes` package or skip with a logged deviation)**. Trials scale with data size under AUTO (3–8 for very small, 15–25 for 200–5,000 rows, 5–10 for very large) with a per-model time budget.
+- **VAL-5** **Final untouched holdout** (the most recent block; AUTO-enabled when n is sufficient). The locked model's holdout metrics are reported separately to expose selection bias (winner's curse).
+- **VAL-6** Feature constraints: collinearity pruning at |r| ≥ 0.95, then iterative VIF (threshold 10, or 5 when n < 100); `k_max = min(p, n/20)`. Pruning never removes a `force_include` variable silently; conflicts are shown.
+- **VAL-7 Metric definitions (state formulas and sign convention in the report):** `CV(RMSE) = sqrt(Σ(y−ŷ)²/n) / ȳ × 100`; `NMBE = Σ(y−ŷ) / (n·ȳ) × 100`; guard |ȳ| ≈ 0 (metrics become “undefined” with a flag); sMAPE guarded the same way. Primary metrics are out-of-fold and **without** a DoF correction. For parametric models also report Guideline-14-style DoF-adjusted in-sample values, labeled separately.
+
+---
+
+## 18. Acceptance Gates, Scoring, and Top-5 [M]
+
+- **SC-1 Gates (per target, from the active threshold profile):** CV(RMSE), |NMBE|, R² (advisory unless the profile cites a source), physical plausibility ≥ 0.5 (no negative predictions for non-negative quantities, no wrong-sign response per TCP-4, no extreme extrapolation), and the NN gate.
+- **SC-2 Thirteen scoring criteria:** CV(RMSE), R², |NMBE|, MAE, sMAPE, fold robustness, parsimony (parameters + BIC rank), residual diagnostics (T10), physical plausibility, interpretability tier, standards alignment, uncertainty width, data-sufficiency penalty.
+- **SC-3 Normalization and ties:** robust min–max over the qualified set. Ties break by lower complexity, then by name (deterministic). Document that R²/CV(RMSE)/MAE are correlated, so the weight profile **MUST** be shown and justified.
+- **SC-4 Sensitivity:** report **rank stability** of the Top-1 under ±20 % weight perturbation (seeded Monte Carlo), and the T11 comparison between Top-1 and runner-up (so ranks that are statistically indistinguishable are labeled as such).
+- **SC-5 Weight profiles:** `balanced` (AUTO for n ≥ 200), `interpretable` (AUTO for n < 200), `accuracy_first`, `custom` (13 weights summing to 1.0, validated).
+- **SC-6 Top-5 card:** rank; name and family; **representation** (SC-7); OOF metrics with CI; **conformal interval at the selected coverage** (§19); score; rationale.
+- **SC-7 “Explicit formula” defined precisely:**
+  - Parametric models (MLR, Ridge/Lasso/EN, polynomial, piecewise, degree-day, TOWT, GAM): **closed-form equation** (rendered with KaTeX) with fitted coefficients, units and standard errors where available. Piecewise models show per-segment equations and change-points. **Excel formula export [S]** for the top parametric model.
+  - Non-parametric models (trees, boosting, SVR, GP, NN): **architecture + hyperparameters** plus a **clearly labeled global surrogate** (shallow tree or sparse linear fit to the model's predictions, with fidelity R² reported), permutation importance and PDP/ALE. **The surrogate is never presented as the model's formula.**
+- **SC-8 Two distinct registers:** **Rejected** (failed a gate, with the reason) vs **Qualified but not shortlisted** (passed the gates, rank > 5, with score gaps).
+- **SC-9** If fewer than five qualify, show those and a notice. If **none** qualify, show the best available with an explicit limitations warning; the user **MUST** acknowledge it before locking.
+- **SC-10 Lock:** one model per target by radio selection, with an optional note and a timestamp. A lock creates an **immutable, versioned Baseline** (model artifact SHA-256, feature list, preprocessing pipeline, VSG and TCP snapshots, training window, thresholds, profile, seed, calibration summary). Re-locking creates a new version; changes are audited events; history stays visible.
+
+---
+
+## 19. Uncertainty Quantification [M]
+
+- **UQ-1 [M]** Default is **conformal prediction** via **MAPIE v1**: `SplitConformalRegressor`, `CrossConformalRegressor`, `JackknifeAfterBootstrapRegressor`, `ConformalizedQuantileRegressor`, and the **`TimeSeriesRegressor`** class (methods `"enbpi"` or `"aci"`) for time-series baselines. **Verify the exact class names in the installed MAPIE v1.x before use.**
+- **UQ-2 [M]** Coverage is selectable (80/90/95/99 %); the default follows the global confidence level (TCP-1).
+- **UQ-3 [M] Honesty:** exchangeability is violated by autocorrelated series, so coverage is **approximate**. Report rolling empirical coverage and never claim a distribution-free guarantee for time series.
+- **UQ-4 [M] Calibration report:** empirical vs nominal coverage (reliability diagram), mean interval width, Winkler/interval score, **conditional coverage by regime** (load level, season, F4 clusters), and the **T12 tests** (Kupiec, Christoffersen). PIT histograms **only** for models with predictive distributions (GP, Bayesian ridge, MC-dropout).
+- **UQ-5 [M]** The residual-quantile (or block-bootstrap) method is retained as a labeled fallback. Bayesian posterior and MC-dropout/deep-ensemble intervals may be shown alongside, clearly labeled, and only if calibration shows they are competitive.
+
+---
+
+## 20. Prediction & Monitoring
+
+- **PM-1 [M]** The module unlocks **per target** as soon as that target's baseline is locked.
+- **PM-2 [M] File input:** Excel/CSV/Parquet, with **schema validation before prediction** (missing columns, dtype mismatches, timestamp continuity/timezone) and **range/extrapolation warnings** (share of rows outside the training distribution).
+- **PM-3 [M] External SQL:** MySQL, SQL Server, PostgreSQL, SQLite, ODBC.
+  - **Guard:** parse with `sqlglot.parse` (not `parse_one`) and accept **exactly one statement**. Its root type must be `Select`, `Union`, `Intersect`, or `Except`. Walk **every AST node** and reject any DDL/DML (`Insert`, `Update`, `Delete`, `Drop`, `Alter`, `Create`, `Truncate`, `Merge`, `Grant`, `Revoke`) and any dangerous function or clause (`xp_cmdshell`, `OPENROWSET`, `LOAD_FILE`, `INTO OUTFILE`, `COPY`, `ATTACH`, `PRAGMA`). Reject stacked queries via semicolons.
+  - Use a read-only transaction/connection where the driver supports it; enforce a row limit and a ~10 s timeout; recommend a read-only DB account; TLS verification on by default.
+  - **Credentials** go to Windows Credential Manager/DPAPI (`keyring` or `win32crypt`) and **never** appear in `.ebproj`, logs or exports.
+  - ODBC drivers are external. Detect them and show guidance. An unreachable server degrades to an offline notice.
+  - **Fuzz-test the guard** (PM-Tests).
+- **PM-4 [M] Manual entry:** an auto-generated form with range hints, plus a batch paste table.
+- **PM-5 [M] Per-timestamp outputs:** baseline, actual, **deviation = actual − baseline** (sign convention stated), deviation %, cumulative deviation and %, normalized deviation (`deviation / OOF RMSE`), conformal interval, alert flag. **Percent metrics are NaN with a flag when |baseline| < ε.**
+- **PM-6 [M] Alerts:** AUTO rule `max(10 %, 2 × CV(RMSE))`, with a fallback to `k × RMSE` near zero. The user may choose percent, `k × RMSE` or outside-interval. **Persistence (N consecutive exceedances) and hysteresis are also AUTO-resolved and logged.**
+- **PM-7 [M] Dashboard:** KPI cards; actual vs baseline chart; deviation chart with threshold bands; top-N deviations table; date filter; per-target or side-by-side view; PDF/Excel export; snapshot to SQLite. A snapshot stores the **baseline version and the input hash**.
+
+---
+
+## 21. Drift Detection and Baseline Validity [M]
+
+- **DR-1 Input drift:** PSI (bins from the training distribution), KS test, Wasserstein distance per predictor; chi-square for categorical predictors.
+- **DR-2 Residual drift:** CUSUM, EWMA and Page-Hinkley on standardized residuals; rolling out-of-sample CV(RMSE)/NMBE vs the baseline's OOF values; structural-break tests from T9 applied to the monitoring window (TC-5 wording applies).
+- **DR-3** Thresholds are AUTO and logged. Status is a **traffic light per target**.
+- **DR-4** Output is a recommendation **“baseline re-validation recommended”**. **The system never retrains or replaces a locked baseline automatically.**
+- **DR-5** The `spc` profile (Shewhart/Western Electric/EWMA/CUSUM) applies **here (residual monitoring), not as a model-acceptance gate.**
+
+---
+
+## 22. Domains, Threshold Profiles, Persistence
+
+### 22.1 Domains and profiles
+- **DOM-1 [M]** Domains: `energy | manufacturing | water | healthcare | custom` (default aggregation, feature generators, thresholds, report vocabulary). Quantity type comes from DAT-1, never from name regex.
+- **DOM-2 [M]** Threshold profiles are **versioned JSON files with a `citation` field**: `ashrae14`, `iso50015`, `spc`, `custom`. For `ashrae14`, use criteria by granularity (monthly CV(RMSE) ≤ 15 % and |NMBE| ≤ 5 %; hourly CV(RMSE) ≤ 30 % and |NMBE| ≤ 10 %). Daily and other granularities are user/AUTO-defined and labeled **non-normative**. **The implementer MUST verify values against the licensed standard text. The app MUST say “criteria aligned with…”, never “ASHRAE compliant”.** Also reference ISO 50006 (EnB/EnPI) in energy reports [S].
+- **DOM-3 [S]** `manufacturing` labels the deviation “process deviation”; `healthcare` labels it “performance indicator deviation”. For healthcare, show a local-only data-handling notice.
+
+### 22.2 Persistence
+- **PER-1 [M]** `.ebproj` is a **ZIP container** with `manifest.json` (schema_version, dataset reference as relative path + SHA-256 + size + rows, config snapshot, **VSG selections and TCP configuration with provenance**, AUTO log, selections, snapshots, artifact hashes, model cards). If the dataset moves, show a relink dialog. **No credentials.** Project-schema migrations are supported.
+- **PER-2 [M]** Autosave every 5 min and on significant change (debounced), with **atomic writes** (temp + rename). **Stage checkpoints** per target enable crash recovery that **resumes** from the last completed stage.
+- **PER-3 [M]** Recent projects (10). Save/Load from the File menu.
+- **PER-4 [M]** Backup = ZIP of the DB (**via the SQLite online backup API, never a raw copy of a live WAL database**), `data/models/`, `data/uploads/`, and the project file, with a hash manifest. Restore validates hashes.
+- **PER-5 [M]** Retention policy (age/size) for uploads, test-cache entries and old `run_*` folders, with a dry-run listing, a confirmation and a manual “purge now”. **Artifacts of locked baselines are never purged.**
+- **PER-6 [M] Artifact safety:** model artifacts use safe formats (ONNX/skops/JSON coefficients) where possible. Any pickle-based artifact is loaded **only after SHA-256 verification** against the DB, and **never from an imported `.ebproj` without an explicit user warning**.
+
+---
+
+## 23. Reporting and Audit
+
+- **REP-1 [M]** One **report model (JSON)** is the single source for all renderers (HTML preview, PDF, Excel), which guarantees consistency.
+- **REP-2 [M] Sections (cross-reference by name, never by number):** Executive Summary; Multi-Target Comparative Summary; Temporal Configuration; Input Data and Data Dictionary; **Variable Selection & Test Configuration**; Data Quality; Exclusions and Reasons; **EDA Atlas**; **Correlation & Dependence Atlas**; Exploratory and Engineering Analysis; Statistical Diagnostics; **Data Mining Findings**; Feature Engineering and Selection; Model Portfolio and Validation Design; Model Leaderboard; Top-5 Shortlist; Decision Rationale; Selected Baseline; **Sign/Monotonicity Compliance**; **Model Card**; Uncertainty and Calibration; **Confidence Level & Interval Methods**; Comparative Diagnostics (Top-3); **Decision-Sensitivity Summary**; **Rejected and Not-Shortlisted Registers**; **AUTO Resolutions Log**; User Selections Log; **Drift and Monitoring Summary**; Limitations and Assumptions (including `post_hoc` selections); **Not-Implemented and Deviations Registers**; Local Storage Confirmation; Reproducibility (seed, versions, config, hashes); **Full Test Results Appendix**; **Glossary**; Audit Log Appendix.
+- **REP-3 [M] Formats:** HTML (interactive ECharts in the UI; static charts rendered by a short-lived worker for exports), **PDF (ReportLab or another pure-Python writer; no GTK/WeasyPrint dependency, no Qt)**, and multi-sheet Excel. Generation runs in the sidecar.
+- **REP-4 [S]** Section toggles; executive/full/compliance layouts; logo and company name; **report diff** between two runs.
+- **REP-5 [M]** The report explains **why the chosen baseline won and why each alternative lost or was rejected**.
+- **RPT-1 [M] Standard section template:** every section and sub-section contains **Purpose → Method → Settings used (AUTO/USER_OVERRIDE) → Results (table) → Charts → Interpretation → Decision/Impact on pipeline → Caveats/Assumptions**.
+- **RPT-2 [M] Depth levels:** `Executive` (≤ 10 pages), `Standard`, `Full Technical` (all tests, all charts, all tables, full appendices). Each has a hyperlinked TOC.
+- **RPT-3 [M] Mandatory content:** Variable Selection & Test Configuration; Full Test Results Appendix (raw/adjusted p, effect size, CI, assumptions, decision, sensitivity across α); Correlation & Dependence Atlas; Confidence Level & Interval Methods; Decision-Sensitivity Summary; EDA Atlas per variable; Data Mining Findings; Sign/Monotonicity Compliance; Model Cards; Calibration Report.
+- **RPT-4 [M] Narrative engine:** interpretation text is **deterministic and rule/template-based (no LLM)**. Each sentence is generated from stored artifact values and carries an **artifact ID**. A build-failing test verifies that every number in the narrative matches the artifact it cites (G-9).
+- **RPT-5 [M] Chart standards:** every chart has a title, axis labels with units, legend, sample size, CI bands where applicable, a color-blind-safe palette and an alt-text caption. Static renders (PNG/SVG) for PDF; interactive ECharts for HTML/UI. Export per chart plus a **chart bundle ZIP**.
+- **RPT-6 [M]** The report includes a **Glossary** (plain-language definitions of each test, metric and symbol) and a **How to read this report** page.
+- **RPT-7 [M]** Excel export: one sheet per target plus one sheet per test family with all statistics, correlation matrices (values, CI, p), configuration snapshot, AUTO/USER log, selections, audit and reproducibility. **Excel formula export for the top parametric model [S].**
+
+---
+
+## 24. UI/UX
+
+- **UX-1 [M]** Left collapsible sidebar + breadcrumb + optional right inspector. A **guided stepper** enforces the mandatory flow (data → column setup → **variable selection** → **test configuration** → run → select & lock → monitor). Locked steps explain why they are locked.
+- **UX-2 [M]** Design system: neutral palette + one accent, Inter/system font, spacing scale 4/8/12/16/24/32, radii 6/8/12, three elevations, Lucide icons, dark/light themes (system detection on first run, persisted).
+- **UX-3 [M]** Command palette (Ctrl+K) over actions, settings, pages, recent projects and columns. Every action has a shortcut.
+- **UX-4 [M] WCAG 2.2 AA:** visible focus, full keyboard navigation, ARIA on custom widgets, high-contrast theme, font scaling 80–200 %, color-blind-safe chart palette. axe-core in CI.
+- **UX-5 [M]** Charts (ECharts; `echarts-gl` only if 3D is needed; **Plotly is not bundled**): zoom/pan, tooltips, crosshair, brush selection, export PNG/SVG, copy to clipboard. Tables: server-windowed virtualization, per-column sort/filter, pinning, CSV export, Excel-style copy/paste. **TanStack Table v9 (stable Aug 2026, supports React Compiler) + TanStack Virtual; pin to 9.2.6/9.3 and verify in the lockfile**.
+- **UX-6 [M]** Toasts (completion/warning/error with “view log” and “retry”), empty states with a primary CTA, inline validation with explicit messages, skeletons for slow loads. **The WebView is never blocked by computation.**
+- **UX-7 [M] Status page:** sidecar state, DB health `{ok, url, fallback, writable}`, versions, paths, and a **“Where is my data stored?”** section.
+- **UX-8 [M] VSG screen:** a per-target variable table (state selector, pre-test profile, mini-histogram, leakage/availability badges), bulk-action toolbar, preset menu, conflict panel, and a live **Impact Preview** (Fast Mode vs Full Mode).
+- **UX-9 [M] TCP screen:** global settings with presets, a test-selection tree with cost estimates, per-test parameter panels with tooltips, a variables × test-families scope matrix, an expected-sign editor, a gate-role/action-policy editor, and guard-rail warnings. After a run: a **what-if panel** (change α/correction/decision rule → instant diff of flipped decisions) and the **decision-sensitivity table**.
+- **UX-10 [S]** First-run wizard (domain → sample or own data → configure → run), guided tour, embedded help.
+- **UX-11 [M]** System integration: single-instance, drag-and-drop files, `.ebproj` association, native notifications for long runs, taskbar progress (tray optional).
+- **UX-12 [S] Report diff viewer** in the UI (two runs / two baselines side by side, highlighted changes).
+
+---
+
+## 25. Security and Privacy [M]
+
+Offline by default. No telemetry. Logs are rotated, structured, stored in `APP_HOME/logs`, and scrubbed of credentials. **Threat model** in `SECURITY.md` (local attacker, malicious data file, SQL injection, artifact tampering). SBOM (CycloneDX) and third-party license notices ship with the app. Dependency audit (`pip-audit`, `cargo-deny`) runs in CI.
+
+---
+
+## 26. Packaging, Signing, Updates
+
+- **PKG-1 [M]** NSIS installer, per-user by default (no admin needed; `APP_HOME` in `%LOCALAPPDATA%`), machine-wide optional. The onedir sidecar is shipped as bundled resources and launched by an absolute resolved path (validated at M-1).
+- **PKG-2 [M] WebView2:** default `downloadBootstrapper` (~2 MB). Provide an **air-gapped build** using `offlineInstaller` (~127 MB) or `fixedRuntime` (~180 MB). Note that `embedBootstrapper` still needs internet. Document the behavior and sizes.
+- **PKG-3 [M] Signing:** **Authenticode-sign** the installer, shell exe and sidecar exe/DLLs (PyInstaller binaries are common false-positive targets for SmartScreen/AV; consider a rebuilt bootloader). Updater signatures (Ed25519/minisign) are **separate**. Private keys live only in CI secrets.
+- **PKG-4 [M]** Updater: runs only on explicit user action or a configured schedule, never blocks boot, and degrades to a clear “offline” status. The app is fully functional without it (see LIF-5).
+- **PKG-5 [M]** The uninstaller asks whether to keep user data and never deletes it silently.
+- **PKG-6 [M]** CI: pinned Python with a hash-locked lock file, pinned Rust toolchain, reproducible sidecar and shell builds, signed artifacts, SHA-256 checksums.
+
+---
+
+## 27. Testing and Quality Gates [M]
+
+- **Python:** unit and property-based tests (hypothesis) for time aggregation/DST; custom statistics validated against R reference values; leakage tests; SQL-guard fuzzing; resolver cases (DB-11); migration tests.
+- **Ground truth (anti-hallucination):** a synthetic generator with planted coefficients, correlations, unit roots, change-points, seasonality, MCAR/MAR missingness, outliers and noise. **The pipeline must recover them within stated tolerances.** Tests must detect planted effects with the expected power, and **Type I error ≈ α under the null (verified by Monte Carlo)**.
+- **TCP tests:** cache-key invalidation; α/correction/decision-rule changes flip decisions correctly **without recompute**; fuzzed TCP/VSG inputs (out-of-range, inconsistent); integrity rules cannot be disabled; provenance flags (`pre_test`/`post_test`/`post_hoc`) are correct.
+- **Determinism:** same seed twice → identical AUTO-log hash and the metric tolerances from AUTO-5.
+- **Protocol:** contract tests, fuzzed/oversized frames, stray-`print` test, cancel, crash-and-resume, **kill-shell → zero orphans ≤ 5 s**, 1 M-row windowing.
+- **Frontend:** Vitest + Testing Library; E2E with `tauri-driver`/Playwright; axe-core.
+- **Performance:** run the T-suite in the worker pool within the Effort profile (AUTO-6). The UI shows a cost estimate beforehand, supports cancel, and streams per-test progress. Measure and publish on reference hardware (warm sidecar ready ≤ 3 s target with a 10 s hard limit; first paint; grid scroll at 60 fps on 1 M rows via windowing; idle RAM).
+- **No literal metrics:** a test fails the build if report templates contain hard-coded metric values, and the **narrative-number consistency test** (RPT-4) must pass (G-9).
+- **SQL guard:** a corpus of malicious and edge-case SQL (stacked statements, `SELECT INTO`, CTE-wrapped DML, `xp_cmdshell`, `LOAD_FILE`, `INTO OUTFILE`, `COPY`, `ATTACH`, `PRAGMA`) must be rejected; a corpus of benign read-only SQL must be accepted.
+- **R validation:** every custom statistical test has an R reference script in `tests/reference/` and a tolerance test comparing Python vs R output.
+
+---
+
+## 28. Acceptance Criteria (each ID maps to the requirements matrix)
+
+The software is accepted **only if all [M] items pass**:
+
+1. **AC-01** Tauri 2 desktop app + Python sidecar, offline, with **no browser, no localhost server, no HTTP API** (G-1, G-2, IPC-*).
+2. **AC-02** Double-click launches the GUI; no terminal (G-3).
+3. **AC-03** Handshake ≤ 10 s warm; **stdin-EOF shutdown; Job Object leaves zero orphans after a shell crash** (IPC-8/9, LIF-1/2).
+4. **AC-04** Capabilities explicit; no wildcards; strict CSP; method allowlist (ARC-1..3, IPC-3).
+5. **AC-05** SQLite fallback fully satisfied: single resolver, `APP_HOME`-anchored path, fallback ladder, no import-time raise, self-test, Alembic (DB-1..11).
+6. **AC-06** Roles/quantity types; declared sampling/aggregation/timezone/DST/windows; finer→aggregated, coarser→refused with explanation; outlier treatment only via a logged Action Policy (DAT-*).
+7. **AC-07** Multi-target with independent pipelines, Top-5s and locks; per-target leakage rules (MT-*).
+8. **AC-08** AUTO everywhere; logged with signals and rules; deterministic; visible in the GUI and report (AUTO-*).
+9. **AC-09** The diagnostics suite executes with multiple-testing corrections, assumption checks, robust fallbacks and the stationarity decision matrix (§14, TC-*); Fast Mode still produces a valid Top-5.
+10. **AC-10** Portfolio spans linear, tree, kernel and NN families; the NN gate rejects explicitly (§17.1).
+11. **AC-11** Validation is leakage-safe: purge ≥ lag/window, in-fold preprocessing, nested HPO, final holdout (VAL-*).
+12. **AC-12** Top-5 per target with SC-7 representations, metrics with CI, intervals, score and rationale; separate Rejected and Not-Shortlisted registers (SC-*).
+13. **AC-13** Lock required per target before Prediction; the baseline is immutable and versioned; a model card is produced (SC-10, PM-1).
+14. **AC-14** Prediction supports file/SQL (guarded with `sqlglot.parse`, credentials in the OS store)/manual; outputs, alerts, dashboard, exports, snapshots (PM-*).
+15. **AC-15** Conformal UQ is the default with a calibration report and T12 tests; fallback available; no over-claimed guarantees (UQ-*).
+16. **AC-16** Drift detection with a traffic light and a re-validation recommendation, never auto-retraining (DR-*).
+17. **AC-17** Professional English report with all sections and a complete explanation of the decision (REP-*).
+18. **AC-18** Project save/load, autosave, resume-from-checkpoint, backup (online API)/restore, retention (PER-*).
+19. **AC-19** UX per spec, including WCAG 2.2 AA checks (UX-*).
+20. **AC-20** NSIS installer, single launcher, Authenticode-signed binaries, signed updater, reproducible CI, SBOM shipped (PKG-*, §25).
+21. **AC-21** Ground-truth recovery, determinism and orphan tests pass; R reference validation passes (§27).
+22. **AC-22** Repository delivers full source, build scripts, tests (Python + frontend), sample datasets (a synthetic generator and license-clean public data with attribution), example reports, the requirements matrix, the Deviations/Assumptions/Not-Implemented registers, and an English user guide with **“Where is my data stored?”**.
+23. **AC-23** The VSG is shown before any test; the four inclusion states work per target; presets save/load; integrity rules are not disableable; provenance (`pre_test`/`post_test`, `post_hoc`) is recorded (VSG-*, PIPE-*).
+24. **AC-24** TCP settings (α, confidence, correction, family, decision rule, per-test parameters, direction, effect-size thresholds, expected signs, gate roles, action policy) work globally and per test; **what-if re-evaluation without recompute** works; the decision-sensitivity table is produced (TCP-*).
+25. **AC-25** All **[M]** tests in T1–T14 are implemented; each custom test is validated against R reference values; assumption checks and robust fallbacks work; disabled tests are reported as “not run (user)”.
+26. **AC-26** Every estimate has a CI with a stated method; time-series inference uses block bootstrap/HAC (CI-*, TC-2).
+27. **AC-27** The F1–F9 analyses run with the specified charts and tables. Clustering results include validity indices and bootstrap stability. Optional automated-EDA attach works when installed.
+28. **AC-28** The report meets RPT-1..7, including the Correlation Atlas, the Full Test Results Appendix, Model Cards and traceable narratives. The narrative-number consistency test passes.
+29. **AC-29** Causal M&V mode works when a `group` column exists: T14 balance tests, parallel-trends, propensity overlap, and a DoWhy/EconML effect estimate with refutation tests; the result is reported as “possible savings / non-routine event”, never as automatic model failure.
+30. **AC-30** SQL guard passes the malicious/benign corpus; credentials never appear in `.ebproj`, logs or exports; the threat model is documented.
+
+---
+
+## 29. Final Constraints (Restated) [M]
+
+- Implement a **working system**, not a plan or mock-up, **milestone by milestone** (§3), starting with **M-1 (Bootstrap & Skeleton)**.
+- **Never hallucinate metrics, test results or library APIs.** Compute and verify. Every custom test has an R reference.
+- **Never silently delete or alter data.** Log everything, including every test-driven action and every outlier treatment.
+- **Desktop, offline, Windows, Tauri 2 + Python sidecar. No Electron, no browser, no localhost server.**
+- **SQLite-first**; external SQL is an optional Prediction input.
+- **The user chooses variables (VSG) and test policy (TCP) before any test runs.** Integrity rules cannot be disabled.
+- **AUTO everywhere**, with documented reasoning and a recorded `AUTO` vs `USER_OVERRIDE` mode. Fast Mode and Full Mode both produce a valid result.
+- **Comprehensive test catalog, confidence intervals everywhere, exhaustive EDA/data mining, and a fully narrated, chart-rich report.**
+- **Top-5 with explicit representations** before locking. **Multi-target independence** end to end. **Conformal UQ** by default.
+- **All UI, reports, logs and docs in English.** The UI is i18n-ready.
+- Document every assumption and every deviation. No LLM in the report path.

@@ -1,0 +1,7 @@
+# Assumptions Register
+
+1. **ASM-001 (Time-Series Bootstrap Default):** When estimating confidence intervals for correlations and out-of-fold regression metrics, a circular block bootstrap with Politis–White-inspired lag-1 autocorrelation block length `round(n^(1/3) * (1 + 2*|r1|))` is used as AUTO default (CI-2).
+2. **ASM-002 (Daily Granularity Non-Normative Thresholds):** ASHRAE Guideline 14 specifies monthly (CV(RMSE) ≤ 15%, |NMBE| ≤ 5%) and hourly (CV(RMSE) ≤ 30%, |NMBE| ≤ 10%) criteria. For daily granularity, AUTO sets non-normative interim gates at CV(RMSE) ≤ 20%, |NMBE| ≤ 5% and labels them explicitly as non-normative (DOM-2).
+3. **ASM-003 (Action Policy Safety):** T2 and T10 outlier detections default to `flag_only` so baseline or monitoring rows are never silently deleted or altered without an explicit user-confirmed Action Policy (DAT-8).
+4. **ASM-004 (Deviation Sign Convention):** Monitoring deviations are strictly defined as `Deviation = Actual − Baseline` (PM-5). In energy conservation M&V, negative deviations during reporting periods indicate energy savings relative to counterfactual baseline.
+5. **ASM-005 (Conformal Coverage Honesty):** Because time-series observations exhibit serial correlation, exchangeability is violated; conformal prediction intervals via rolling residual quantiles are explicitly labeled as approximate empirical coverage (UQ-3).
