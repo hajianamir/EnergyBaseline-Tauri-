@@ -15,6 +15,7 @@ import {
 import {
   buildDeterministicReportModel,
   computeRunDiff,
+  renderHtmlReport,
   verifyReportNarrativeConsistency,
 } from '../engine/report';
 import { CheckCircle2, Download, GitCompare } from 'lucide-react';
@@ -95,12 +96,7 @@ export const ReportView: React.FC<ReportViewProps> = ({
   };
 
   const exportHtmlReport = () => {
-    const htmlBody = `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>${companyName} — EnergyBaseline Report</title><style>body{font-family:system-ui,sans-serif;max-width:960px;margin:2rem auto;padding:0 1rem;color:#0f172a}h1,h2{color:#0369a1}table{border-collapse:collapse;width:100%;margin:1rem 0;font-size:12px}th,td{border:1px solid #cbd5e1;padding:6px;text-align:left}</style></head><body><h1>${companyName} — M&V Baseline Report (${depth})</h1><p>Dataset: ${report.datasetName} (SHA-256: ${report.datasetSha256}) · Seed: ${report.seed}</p>${visibleSections
-      .map(
-        (s) =>
-          `<section><h2>${s.title}</h2><p><strong>Purpose:</strong> ${s.purpose}</p><p><strong>Method:</strong> ${s.method}</p><p><strong>Settings:</strong> ${s.settingsUsed}</p><p><strong>Results:</strong> ${s.resultsSummary}</p><p><strong>Interpretation:</strong> ${s.interpretation}</p><p><strong>Decision Impact:</strong> ${s.decisionImpact}</p><p><strong>Caveats:</strong> ${s.caveats}</p></section>`
-      )
-      .join('')}</body></html>`;
+    const htmlBody = renderHtmlReport(companyName, depth, report, visibleSections);
     const blob = new Blob([htmlBody], { type: 'text/html;charset=utf-8' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');

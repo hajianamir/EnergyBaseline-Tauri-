@@ -33,7 +33,8 @@ import {
 } from './modeling';
 import { buildTemporalWarmupContext, predictFromLockedBaseline } from './monitoring';
 import type { DatasetRow, DatasetState } from './types';
-import { buildDeterministicReportModel, verifyReportNarrativeConsistency } from './report';
+import { buildDeterministicReportModel, renderHtmlReport, verifyReportNarrativeConsistency } from './report';
+import type { ReportModel, ReportSection } from './report';
 import { resolveStandardForDomain } from './domains';
 
 test('Synthetic ground-truth generator is deterministic for a fixed seed', () => {
@@ -296,6 +297,39 @@ test('DAT-3 refuses coarser-to-finer disaggregation with DATA_REFUSED', () => {
   const aggRes = aggregateRowsToTargetGranularity(ds.rows, ds.columns, 'daily', 'monthly');
   assert.equal(aggRes.refusalError, null);
   assert.equal(aggRes.rows.length, 12);
+});
+
+test('F-09: HTML report export escapes company, dataset, and section text as inert text', () => {
+  const payload = `<img src=x onerror="alert('xss')"> & report`;
+  const report: ReportModel = {
+    generatedAt: '2026-11-13T00:00:00.000Z',
+    datasetName: payload,
+    datasetSha256: payload,
+    domain: 'custom',
+    seed: 42,
+    sections: [],
+    glossary: [],
+    howToRead: [],
+  };
+  const section: ReportSection = {
+    id: 'untrusted',
+    title: payload,
+    depthMin: 'Executive',
+    purpose: payload,
+    method: payload,
+    settingsUsed: payload,
+    resultsSummary: payload,
+    interpretation: payload,
+    decisionImpact: payload,
+    caveats: payload,
+    citedArtifacts: [],
+  };
+
+  const html = renderHtmlReport(payload, 'Standard', report, [section]);
+  assert.ok(html.includes('&lt;img src=x onerror=&quot;alert(&#39;xss&#39;)&quot;&gt; &amp; report'));
+  assert.equal(html.includes('<img'), false);
+  assert.equal(html.includes('<script'), false);
+  assert.equal(html.includes(payload), false);
 });
 
 test('PM-3 SQL guard rejects DDL/DML/stacked queries and accepts valid SELECT', () => {

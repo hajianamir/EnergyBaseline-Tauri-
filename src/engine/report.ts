@@ -40,6 +40,35 @@ export interface ReportModel {
   howToRead: string[];
 }
 
+/** Escape untrusted or data-derived text before interpolating it into an HTML text node. */
+export function escapeHtml(value: unknown): string {
+  return String(value).replace(/[&<>"']/g, (character) => {
+    switch (character) {
+      case '&': return '&amp;';
+      case '<': return '&lt;';
+      case '>': return '&gt;';
+      case '"': return '&quot;';
+      case "'": return '&#39;';
+      default: return character;
+    }
+  });
+}
+
+/** Render a static HTML report; every dynamic value is text, never trusted markup. */
+export function renderHtmlReport(
+  companyName: string,
+  depth: string,
+  report: ReportModel,
+  visibleSections: ReportSection[]
+): string {
+  const text = escapeHtml;
+  const sections = visibleSections.map((section) =>
+    `<section><h2>${text(section.title)}</h2><p><strong>Purpose:</strong> ${text(section.purpose)}</p><p><strong>Method:</strong> ${text(section.method)}</p><p><strong>Settings:</strong> ${text(section.settingsUsed)}</p><p><strong>Results:</strong> ${text(section.resultsSummary)}</p><p><strong>Interpretation:</strong> ${text(section.interpretation)}</p><p><strong>Decision Impact:</strong> ${text(section.decisionImpact)}</p><p><strong>Caveats:</strong> ${text(section.caveats)}</p></section>`
+  ).join('');
+
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>${text(companyName)} — EnergyBaseline Report</title><style>body{font-family:system-ui,sans-serif;max-width:960px;margin:2rem auto;padding:0 1rem;color:#0f172a}h1,h2{color:#0369a1}table{border-collapse:collapse;width:100%;margin:1rem 0;font-size:12px}th,td{border:1px solid #cbd5e1;padding:6px;text-align:left}</style></head><body><h1>${text(companyName)} — M&amp;V Baseline Report (${text(depth)})</h1><p>Dataset: ${text(report.datasetName)} (SHA-256: ${text(report.datasetSha256)}) · Seed: ${text(report.seed)}</p>${sections}</body></html>`;
+}
+
 export function buildDeterministicReportModel(params: {
   dataset: DatasetState;
   vsgByTarget: Record<string, Record<string, VsgEntry>>;
