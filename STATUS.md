@@ -15,7 +15,7 @@ Updated: 2026-11-13 (UTC)
 | 2 | Analytical validity | Started — acceptance gated on Phase 1 | `2a0a69c` (F-03), `a955196` (F-13) | `npm run test:engine` passed 20/20; lint/build passed; CI run `43475990780` passed Windows/Ubuntu validation and the Windows installer job. | Regression-tested, not physically accepted; Phase 1/F-01 remain open. Do not mark Passed from CI alone. |
 | 3 | Truthful statistics | Not started | — | — | Wave 2 starts only after Wave 1 regression tests are committed. |
 | 4 | Governance and integrity | Not started | — | — | Wave 2 starts after Phase 2/3 regression tests are committed. |
-| 5 | Security | In progress — F-09 regression committed locally; CI pending | — | F-09 HTML export escaping: engine tests 21/21, lint and production build passed locally. | Wave 1.2 findings F-09–F-12; physical acceptance remains separate and gated. |
+| 5 | Security | In progress — F-09 regression-tested; F-10 underway | `4af5d65` (F-09) | F-09 CI `43477894324` passed Windows/Ubuntu and Windows installer packaging. F-10 SQL guard: engine 21/21, Python 16 passed/1 PyInstaller-only skip, lint/build passed locally; CI pending. | Wave 1.2 findings F-09–F-12; physical acceptance remains separate and gated. |
 | 6 | Persistence and `.ebproj` | Not started | — | — | Wave 1.3; implement sidecar handlers/tests only, with no frontend persistence before Phase 1 acceptance. |
 | 7 | Reporting | Not started | — | — | Wave 3 starts only after Wave 2 regression tests are committed. |
 | 8 | Regression and CI tests | Not started | — | — | Wave 3 follows Wave 2; installed-Windows E2E does not replace physical acceptance. |
@@ -46,7 +46,7 @@ The F-01–F-13 identifiers and their detailed acceptance criteria remain those 
 | F-07 | Not started | — | — | Pending its specified phase and acceptance criteria. |
 | F-08 | Not started | — | — | Pending its specified phase and acceptance criteria. |
 | F-09 | Fixed — regression-test-only | `4af5d65` | HTML export test verifies company, dataset, and section text is escaped in inert HTML text nodes; engine 21/21, lint/build passed locally; CI run `43477894324` passed on Windows/Ubuntu and packaged the Windows installer. | Physical Windows acceptance remains pending; Phase 5 is not Passed. |
-| F-10 | Not started | — | — | Pending its specified phase and acceptance criteria. |
+| F-10 | In progress — local regressions passing; CI pending | — | TS/Python parity corpus covers malformed quotes/comments, nested comments, stacked statements, dangerous file/extension/process functions, NUL, and quoted literal false positives; engine 21/21, Python 16 passed/1 PyInstaller-only skip, lint/build pass locally. | Keep the SQL guard read-only; no SQL query executor is introduced by this finding. Physical acceptance remains pending. |
 | F-11 | Not started | — | — | Pending its specified phase and acceptance criteria. |
 | F-12 | Not started | — | — | Pending its specified phase and acceptance criteria. |
 | F-13 | Fixed — regression-test-only | `a955196` | F-13 engine regressions pass; lint/build pass; CI run `43475990780` passed. | Physical Windows acceptance remains pending; Phase 2 is not Passed. |

@@ -319,16 +319,36 @@ class TestSqlGuard(unittest.TestCase):
         for q in (
             "DROP TABLE meters",
             "SELECT * FROM meters; DELETE FROM meters",
+            "SELECT 1; -- comment\n SELECT 2",
             "WITH c AS (DELETE FROM meters) SELECT * FROM c",
             "SELECT * INTO evil FROM meters",
             "SELECT xp_cmdshell('whoami')",
             "SELECT LOAD_FILE('/etc/shadow')",
+            "SELECT load_extension('/tmp/evil.dll')",
+            "SELECT readfile('/etc/passwd')",
+            "SELECT writefile('/tmp/evil', 'payload')",
+            "SELECT pg_read_file('/etc/passwd')",
             "SELECT * FROM meters INTO OUTFILE '/tmp/pwn'",
             "COPY meters TO '/tmp/x.csv'",
             "ATTACH DATABASE 'x.db' AS x",
             "PRAGMA user_version = 99",
+            "SELECT 'unterminated",
+            "SELECT 'a" + chr(92) + "'; DROP TABLE meters",
+            "SELECT 1 /* unterminated comment",
+            "SELECT 1 /* outer /* nested */",
+            "SELECT 1" + chr(0),
         ):
             self.assertFalse(validate_readonly_sql(q).allowed, q)
+
+        for q in (
+            "SELECT 'DELETE; DROP -- is literal'",
+            "SELECT 'value''; DELETE FROM meters'",
+            "SELECT $$; DROP TABLE meters$$",
+            "SELECT 1; -- trailing comment\n",
+            "SELECT 1 /* outer /* nested ; DROP */ comment */",
+            "SELECT 1 # trailing comment\n",
+        ):
+            self.assertTrue(validate_readonly_sql(q).allowed, q)
 
 
 if __name__ == "__main__":

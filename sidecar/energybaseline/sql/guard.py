@@ -38,11 +38,24 @@ FORBIDDEN_CLAUSES = (
     "OPENROWSET",
     "OPENDATASOURCE",
     "LOAD_FILE",
+    "LOAD_EXTENSION",
+    "READFILE",
+    "WRITEFILE",
+    "PG_READ_FILE",
+    "PG_READ_BINARY_FILE",
+    "PG_LS_DIR",
     "INTO OUTFILE",
     "INTO DUMPFILE",
     "PG_SLEEP",
+    "SLEEP",
+    "BENCHMARK",
     "DBLINK",
+    "DBLINK_EXEC",
+    "LO_IMPORT",
+    "LO_EXPORT",
 )
+
+MAX_SQL_LENGTH = 64 * 1024
 
 
 @dataclass
@@ -53,52 +66,107 @@ class SqlGuardDecision:
     rejected_tokens: List[str]
 
 
-def _strip_comments_and_strings(sql: str) -> str:
+def _strip_comments_and_strings(sql: str) -> tuple[str, Optional[str]]:
+    """Strip SQL comments/string data, preserving separators and quoted identifiers."""
     out: List[str] = []
     i = 0
-    in_single = False
-    in_double = False
     n = len(sql)
     while i < n:
         ch = sql[i]
         nxt = sql[i + 1] if i + 1 < n else ""
-        if not in_single and not in_double and ch == "-" and nxt == "-":
-            while i < n and sql[i] != "\n":
+
+        if (ch == "-" and nxt == "-") or ch == "#":
+            while i < n and sql[i] not in "\r\n":
                 i += 1
             out.append(" ")
             continue
-        if not in_single and not in_double and ch == "/" and nxt == "*":
+
+        if ch == "/" and nxt == "*":
             i += 2
-            while i < n and not (sql[i] == "*" and (i + 1 < n and sql[i + 1] == "/")):
-                i += 1
-            i += 2
+            depth = 1
+            while i < n and depth > 0:
+                if sql[i : i + 2] == "/*":
+                    depth += 1
+                    i += 2
+                elif sql[i : i + 2] == "*/":
+                    depth -= 1
+                    i += 2
+                else:
+                    i += 1
+            if depth:
+                return "".join(out), "Unterminated block comment."
             out.append(" ")
             continue
-        if ch == "'" and not in_double:
-            in_single = not in_single
+
+        if ch == "'":
+            i += 1
+            terminated = False
+            while i < n:
+                if sql[i : i + 2] == "''":
+                    i += 2
+                elif sql[i] == "'":
+                    i += 1
+                    terminated = True
+                    break
+                else:
+                    i += 1
+            if not terminated:
+                return "".join(out), "Unterminated string literal."
             out.append(" ")
-            i += 1
             continue
-        if ch == '"' and not in_single:
-            in_double = not in_double
-            out.append(ch)
+
+        if ch == "$":
+            match = re.match(r"\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$", sql[i:])
+            if match:
+                delimiter = match.group(0)
+                end = sql.find(delimiter, i + len(delimiter))
+                if end < 0:
+                    return "".join(out), "Unterminated dollar-quoted string literal."
+                i = end + len(delimiter)
+                out.append(" ")
+                continue
+
+        if ch in {'"', "`", "["}:
+            start = i
+            close = "]" if ch == "[" else ch
             i += 1
+            terminated = False
+            while i < n:
+                if sql[i] == close and i + 1 < n and sql[i + 1] == close:
+                    i += 2
+                elif sql[i] == close:
+                    i += 1
+                    terminated = True
+                    break
+                else:
+                    i += 1
+            if not terminated:
+                return "".join(out), "Unterminated quoted identifier."
+            out.append(sql[start:i])
             continue
-        out.append(" " if in_single else ch)
+
+        out.append(ch)
         i += 1
-    return "".join(out).strip()
+    return "".join(out).strip(), None
 
 
 def validate_readonly_sql(raw_sql: str) -> SqlGuardDecision:
     if not raw_sql or not raw_sql.strip():
         return SqlGuardDecision(False, "Empty SQL query.", None, [])
 
-    stripped = _strip_comments_and_strings(raw_sql)
+    if len(raw_sql) > MAX_SQL_LENGTH:
+        return SqlGuardDecision(False, f"SQL exceeds the {MAX_SQL_LENGTH}-character safety limit.", None, ["SQL_TOO_LARGE"])
+    if "\x00" in raw_sql:
+        return SqlGuardDecision(False, "SQL containing NUL characters is rejected.", None, ["NUL"])
+
+    stripped, lexical_error = _strip_comments_and_strings(raw_sql)
+    if lexical_error:
+        return SqlGuardDecision(False, f"Malformed SQL lexical structure: {lexical_error}", None, ["LEXICAL_ERROR"])
     no_trailing_semi = re.sub(r";\s*$", "", stripped)
     if ";" in no_trailing_semi:
         return SqlGuardDecision(False, "Stacked SQL queries are forbidden.", None, [";"])
 
-    upper = no_trailing_semi.upper()
+    upper = no_trailing_semi.strip().upper()
     rejected: List[str] = []
 
     for clause in FORBIDDEN_CLAUSES:

@@ -36,50 +36,121 @@ const FORBIDDEN_CLAUSES_OR_FUNCS = [
   'OPENROWSET',
   'OPENDATASOURCE',
   'LOAD_FILE',
+  'LOAD_EXTENSION',
+  'READFILE',
+  'WRITEFILE',
+  'PG_READ_FILE',
+  'PG_READ_BINARY_FILE',
+  'PG_LS_DIR',
   'INTO OUTFILE',
   'INTO DUMPFILE',
   'SELECT INTO',
   'PG_SLEEP',
+  'SLEEP',
+  'BENCHMARK',
   'DBLINK',
+  'DBLINK_EXEC',
+  'LO_IMPORT',
+  'LO_EXPORT',
 ];
 
-function stripSqlCommentsAndLiterals(sql: string): { stripped: string; stringLiteralsFree: string } {
-  // Remove -- line comments and /* ... */ block comments while preserving structure
+const MAX_SQL_LENGTH = 64 * 1024;
+
+interface SqlLexResult {
+  stripped: string;
+  lexicalError?: string;
+}
+
+/** Remove comments and string literals without losing statement separators.
+ * Quoted identifiers remain visible for conservative keyword/function checks.
+ */
+function stripSqlCommentsAndLiterals(sql: string): SqlLexResult {
   let out = '';
   let i = 0;
-  let inSingle = false;
-  let inDouble = false;
   while (i < sql.length) {
     const ch = sql[i];
     const next = sql[i + 1] ?? '';
-    if (!inSingle && !inDouble && ch === '-' && next === '-') {
-      while (i < sql.length && sql[i] !== '\n') i++;
+
+    if ((ch === '-' && next === '-') || ch === '#') {
+      while (i < sql.length && sql[i] !== '\n' && sql[i] !== '\r') i++;
       out += ' ';
       continue;
     }
-    if (!inSingle && !inDouble && ch === '/' && next === '*') {
+
+    if (ch === '/' && next === '*') {
       i += 2;
-      while (i < sql.length && !(sql[i] === '*' && sql[i + 1] === '/')) i++;
-      i += 2;
+      let depth = 1;
+      while (i < sql.length && depth > 0) {
+        if (sql[i] === '/' && sql[i + 1] === '*') {
+          depth++;
+          i += 2;
+        } else if (sql[i] === '*' && sql[i + 1] === '/') {
+          depth--;
+          i += 2;
+        } else {
+          i++;
+        }
+      }
+      if (depth !== 0) return { stripped: out, lexicalError: 'Unterminated block comment.' };
       out += ' ';
       continue;
     }
-    if (ch === "'" && !inDouble) {
-      inSingle = !inSingle;
+
+    if (ch === "'") {
+      i++;
+      let terminated = false;
+      while (i < sql.length) {
+        if (sql[i] === "'" && sql[i + 1] === "'") {
+          i += 2;
+        } else if (sql[i] === "'") {
+          i++;
+          terminated = true;
+          break;
+        } else {
+          i++;
+        }
+      }
+      if (!terminated) return { stripped: out, lexicalError: 'Unterminated string literal.' };
       out += ' ';
-      i++;
       continue;
     }
-    if (ch === '"' && !inSingle) {
-      inDouble = !inDouble;
-      out += ch;
+
+    if (ch === '$') {
+      const delimiter = sql.slice(i).match(/^\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$/)?.[0];
+      if (delimiter) {
+        const end = sql.indexOf(delimiter, i + delimiter.length);
+        if (end < 0) return { stripped: out, lexicalError: 'Unterminated dollar-quoted string literal.' };
+        i = end + delimiter.length;
+        out += ' ';
+        continue;
+      }
+    }
+
+    if (ch === '"' || ch === '`' || ch === '[') {
+      const start = i;
+      const close = ch === '[' ? ']' : ch;
       i++;
+      let terminated = false;
+      while (i < sql.length) {
+        if (sql[i] === close && sql[i + 1] === close) {
+          i += 2;
+        } else if (sql[i] === close) {
+          i++;
+          terminated = true;
+          break;
+        } else {
+          i++;
+        }
+      }
+      if (!terminated) return { stripped: out, lexicalError: 'Unterminated quoted identifier.' };
+      out += sql.slice(start, i);
       continue;
     }
-    out += inSingle ? ' ' : ch;
+
+    out += ch;
     i++;
   }
-  return { stripped: out.trim(), stringLiteralsFree: out.toUpperCase() };
+  return { stripped: out.trim() };
 }
 
 /**
@@ -94,9 +165,19 @@ export function validateReadOnlySql(rawSql: string): SqlGuardResult {
     return { allowed: false, reason: 'Empty SQL statement.', normalizedRoot: null, rejectedTokens: [] };
   }
 
-  const { stripped, stringLiteralsFree } = stripSqlCommentsAndLiterals(trimmed);
+  if (trimmed.length > MAX_SQL_LENGTH) {
+    return { allowed: false, reason: `SQL exceeds the ${MAX_SQL_LENGTH}-character safety limit.`, normalizedRoot: null, rejectedTokens: ['SQL_TOO_LARGE'] };
+  }
+  if (trimmed.includes('\0')) {
+    return { allowed: false, reason: 'SQL containing NUL characters is rejected.', normalizedRoot: null, rejectedTokens: ['NUL'] };
+  }
+
+  const scanned = stripSqlCommentsAndLiterals(trimmed);
+  if (scanned.lexicalError) {
+    return { allowed: false, reason: `Malformed SQL lexical structure: ${scanned.lexicalError}`, normalizedRoot: null, rejectedTokens: ['LEXICAL_ERROR'] };
+  }
   // Allow a single trailing semicolon, reject any interior semicolon (stacked statements)
-  const withoutTrailingSemi = stripped.replace(/;\s*$/, '');
+  const withoutTrailingSemi = scanned.stripped.replace(/;\s*$/, '');
   if (withoutTrailingSemi.includes(';')) {
     return {
       allowed: false,
@@ -106,7 +187,7 @@ export function validateReadOnlySql(rawSql: string): SqlGuardResult {
     };
   }
 
-  const upper = stringLiteralsFree.replace(/;\s*$/, '').trim();
+  const upper = withoutTrailingSemi.trim().toUpperCase();
   const rejected: string[] = [];
 
   for (const clause of FORBIDDEN_CLAUSES_OR_FUNCS) {

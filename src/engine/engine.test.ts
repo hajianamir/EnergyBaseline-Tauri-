@@ -345,16 +345,37 @@ test('PM-3 SQL guard rejects DDL/DML/stacked queries and accepts valid SELECT', 
   const malicious = [
     'DROP TABLE users',
     'SELECT * FROM t; DELETE FROM t',
+    'SELECT 1; -- comment\n SELECT 2',
     'WITH x AS (DELETE FROM t RETURNING *) SELECT * FROM x',
     'SELECT * INTO backup_tbl FROM t',
     "SELECT xp_cmdshell('dir')",
     'SELECT LOAD_FILE("/etc/passwd")',
+    "SELECT load_extension('/tmp/evil.dll')",
+    "SELECT readfile('/etc/passwd')",
+    "SELECT writefile('/tmp/evil', 'payload')",
+    "SELECT pg_read_file('/etc/passwd')",
     'PRAGMA table_info(users)',
     'ATTACH DATABASE "x.db" AS x',
     'SELECT * FROM t INTO OUTFILE "/tmp/x"',
+    "SELECT 'unterminated",
+    "SELECT 'a" + String.fromCharCode(92) + "'; DROP TABLE users",
+    'SELECT 1 /* unterminated comment',
+    'SELECT 1 /* outer /* nested */',
+    'SELECT 1' + String.fromCharCode(0),
   ];
   for (const q of malicious) {
     assert.equal(validateReadOnlySql(q).allowed, false, `Should reject: ${q}`);
+  }
+
+  const safeLiteralQueries = [
+    "SELECT 'DELETE; DROP -- is literal'",
+    "SELECT 'value''; DELETE FROM users'",
+    'SELECT $$; DROP TABLE users$$',
+    'SELECT 1; -- trailing comment\n',
+    'SELECT 1 /* outer /* nested ; DROP */ comment */',
+  ];
+  for (const q of safeLiteralQueries) {
+    assert.equal(validateReadOnlySql(q).allowed, true, `Should allow: ${q}`);
   }
 
   const ds = generateSyntheticDataset('energy_mv', 42);
