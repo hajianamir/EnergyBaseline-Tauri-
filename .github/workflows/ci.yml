@@ -120,7 +120,19 @@ jobs:
 
       - name: Run locked Rust unit tests
         working-directory: src-tauri
-        run: cargo test --lib --locked
+        shell: pwsh
+        run: |
+          $log = Join-Path $env:RUNNER_TEMP "cargo-tests.log"
+          cargo test --lib --locked *> $log
+          $testExitCode = $LASTEXITCODE
+          if ($testExitCode -ne 0) {
+            $diagnostics = Get-Content $log -Tail 60
+            $detail = ($diagnostics -join "`n").Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+            Write-Output "::error title=Cargo test details::$detail"
+          } else {
+            Get-Content $log
+          }
+          exit $testExitCode
 
       - name: Verify locked native Cargo build
         working-directory: src-tauri
@@ -139,7 +151,19 @@ jobs:
           exit $buildExitCode
 
       - name: Verify Tauri CLI build path
-        run: npm run tauri:build -- --no-bundle
+        shell: pwsh
+        run: |
+          $log = Join-Path $env:RUNNER_TEMP "tauri-cli-build.log"
+          npm run tauri:build -- --no-bundle *> $log
+          $buildExitCode = $LASTEXITCODE
+          if ($buildExitCode -ne 0) {
+            $diagnostics = Get-Content $log -Tail 60
+            $detail = ($diagnostics -join "`n").Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+            Write-Output "::error title=Tauri CLI build details::$detail"
+          } else {
+            Get-Content $log
+          }
+          exit $buildExitCode
 
   package-windows:
     name: Package Windows installer (M-1)
@@ -183,7 +207,19 @@ jobs:
         run: python -m unittest -v tests/python/test_sidecar.py
 
       - name: Build Windows NSIS installer with bundled onedir resources
-        run: npm run tauri:build
+        shell: pwsh
+        run: |
+          $log = Join-Path $env:RUNNER_TEMP "windows-nsis-build.log"
+          npm run tauri:build *> $log
+          $buildExitCode = $LASTEXITCODE
+          if ($buildExitCode -ne 0) {
+            $diagnostics = Get-Content $log -Tail 70
+            $detail = ($diagnostics -join "`n").Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+            Write-Output "::error title=Windows NSIS build details::$detail"
+          } else {
+            Get-Content $log
+          }
+          exit $buildExitCode
 
       - name: Verify and upload Windows installer
         shell: pwsh
