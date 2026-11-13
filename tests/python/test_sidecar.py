@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path, PureWindowsPath
 from unittest.mock import patch
 
@@ -144,7 +145,7 @@ class TestSessionStore(unittest.TestCase):
 
             audit = store.verify_audit_log()
             self.assertEqual(audit["events"], 5)  # Two schema migrations, save, and two loads.
-            with sqlite3.connect(str(database)) as conn:
+            with closing(sqlite3.connect(str(database))) as conn, conn:
                 chain_rows = conn.execute(
                     "SELECT previous_hash, event_hash FROM audit_log ORDER BY sequence"
                 ).fetchall()
@@ -173,7 +174,7 @@ class TestSessionStore(unittest.TestCase):
             database = Path(tmp) / "data" / "app.db"
             database.parent.mkdir(parents=True)
             payload_json = json.dumps({"workspace": "legacy", "selected": ["kwh"]}, separators=(",", ":"))
-            with sqlite3.connect(str(database)) as conn:
+            with closing(sqlite3.connect(str(database))) as conn, conn:
                 conn.execute(
                     "CREATE TABLE sessions (session_id TEXT PRIMARY KEY, revision INTEGER NOT NULL, "
                     "payload_json TEXT NOT NULL, updated_at TEXT NOT NULL)"
@@ -196,7 +197,7 @@ class TestSessionStore(unittest.TestCase):
             self.assertEqual(restored["revision"], 3)
             backups = list((database.parent / "backups").glob("pre-migration-v1-to-v2-*.db"))
             self.assertEqual(len(backups), 1)
-            with sqlite3.connect(str(backups[0])) as backup:
+            with closing(sqlite3.connect(str(backups[0]))) as backup, backup:
                 self.assertEqual(backup.execute("PRAGMA user_version").fetchone()[0], 1)
                 self.assertEqual(
                     backup.execute("SELECT revision FROM sessions WHERE session_id='legacy-session'").fetchone()[0],
@@ -208,7 +209,7 @@ class TestSessionStore(unittest.TestCase):
     def test_failed_legacy_migration_restores_backup_without_dropping_data(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             database = Path(tmp) / "app.db"
-            with sqlite3.connect(str(database)) as conn:
+            with closing(sqlite3.connect(str(database))) as conn, conn:
                 conn.execute(
                     "CREATE TABLE sessions (session_id TEXT PRIMARY KEY, revision INTEGER NOT NULL, "
                     "payload_json TEXT NOT NULL, updated_at TEXT NOT NULL)"
@@ -228,7 +229,7 @@ class TestSessionStore(unittest.TestCase):
             with self.assertRaises(SessionStoreError) as failure:
                 store.initialize()
             self.assertEqual(failure.exception.app_code, "INTEGRITY")
-            with sqlite3.connect(str(database)) as conn:
+            with closing(sqlite3.connect(str(database))) as conn, conn:
                 self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 1)
                 self.assertNotIn(
                     "payload_sha256",
@@ -246,7 +247,7 @@ class TestSessionStore(unittest.TestCase):
             store = SessionStore(database)
             store.initialize()
             store.save("session-01", {"ok": True})
-            with sqlite3.connect(str(database)) as conn:
+            with closing(sqlite3.connect(str(database))) as conn, conn:
                 with self.assertRaises(sqlite3.IntegrityError):
                     conn.execute("UPDATE audit_log SET event_json='{}' WHERE sequence=1")
                 with self.assertRaises(sqlite3.IntegrityError):
@@ -272,7 +273,7 @@ class TestSessionStore(unittest.TestCase):
             store.save("session-01", {"original": True})
             altered_payload = '{"tampered":true}'
             altered_digest = hashlib.sha256(altered_payload.encode("utf-8")).hexdigest()
-            with sqlite3.connect(str(database)) as conn:
+            with closing(sqlite3.connect(str(database))) as conn, conn:
                 conn.execute(
                     "UPDATE sessions SET payload_json=?, payload_sha256=? WHERE session_id=?",
                     (altered_payload, altered_digest, "session-01"),
