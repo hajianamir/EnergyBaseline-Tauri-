@@ -20,7 +20,30 @@ from energybaseline.sql.guard import validate_readonly_sql
 PROTOCOL_VERSION = "1.0"
 SIDECAR_VERSION = "5.2.0"
 MAX_FRAME_BYTES = 1024 * 1024  # 1 MiB (IPC-1)
+MAX_SBOM_BYTES = 900 * 1024  # Reserve room for JSON-RPC envelope overhead.
 LOGGER = logging.getLogger("energybaseline.ipc")
+
+
+def _load_sbom_document() -> Dict[str, Any]:
+    if getattr(sys, "frozen", False):
+        bundle_root = Path(getattr(sys, "_MEIPASS", Path(sys.executable).resolve().parent))
+        sbom_path = bundle_root / "energybaseline" / "data" / "sbom.cdx.json"
+    else:
+        repository_root = Path(__file__).resolve().parents[3]
+        sbom_path = repository_root / "dist" / "sbom.cdx.json"
+
+    raw_sbom = sbom_path.read_bytes()
+    if len(raw_sbom) > MAX_SBOM_BYTES:
+        raise ValueError("Generated SBOM exceeds the sidecar response size limit.")
+    document = json.loads(raw_sbom.decode("utf-8"))
+    if (
+        not isinstance(document, dict)
+        or document.get("bomFormat") != "CycloneDX"
+        or document.get("specVersion") != "1.5"
+        or not isinstance(document.get("components"), list)
+    ):
+        raise ValueError("Generated SBOM is not a CycloneDX 1.5 document.")
+    return document
 
 # Keep this in sync with the Rust compile-time method allowlist (SCR-7 / ARC-6).
 ALLOWLISTED_METHODS = {
@@ -297,6 +320,16 @@ class SidecarIpcServer:
                     },
                 }
             )
+            return
+
+        if method == "system.sbom":
+            try:
+                document = _load_sbom_document()
+            except (OSError, UnicodeError, ValueError):
+                LOGGER.exception("CycloneDX SBOM could not be loaded")
+                self._error(req_id, -32003, "INTERNAL", "SBOM is unavailable or invalid; rebuild the application and see the sidecar log.")
+                return
+            self.send_frame({"jsonrpc": "2.0", "id": req_id, "result": document})
             return
 
         if method == "sql.run_query":

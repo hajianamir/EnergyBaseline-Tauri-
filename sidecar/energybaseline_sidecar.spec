@@ -1,13 +1,18 @@
 # -*- mode: python ; coding: utf-8 -*-
 """PyInstaller --onedir spec for EnergyBaseline Python sidecar (Windows)."""
 
+from pathlib import Path
+
 block_cipher = None
+sbom_path = Path(SPECPATH).resolve().parent / 'dist' / 'sbom.cdx.json'
+if not sbom_path.is_file():
+    raise FileNotFoundError(f'CycloneDX SBOM is missing; run npm run build first: {sbom_path}')
 
 a = Analysis(
     ['energybaseline/main.py'],
     pathex=['.'],
     binaries=[],
-    datas=[],
+    datas=[(str(sbom_path), 'energybaseline/data')],
     hiddenimports=['energybaseline.config.settings', 'energybaseline.sql.guard', 'energybaseline.ipc.protocol'],
     hookspath=[],
     hooksconfig={},

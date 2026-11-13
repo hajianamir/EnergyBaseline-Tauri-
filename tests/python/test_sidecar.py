@@ -275,6 +275,28 @@ class TestSidecarIpc(unittest.TestCase):
             self.assertIn("exceeds", frames[1]["error"]["message"])
             self.assertEqual(frames[2]["error"]["code"], -32700)
 
+    def test_system_sbom_serves_build_generated_cyclonedx_15_document(self) -> None:
+        sbom_path = REPO_ROOT / "dist" / "sbom.cdx.json"
+        self.assertTrue(sbom_path.is_file(), "npm run build should generate dist/sbom.cdx.json")
+        document = json.loads(sbom_path.read_text(encoding="utf-8"))
+        self.assertEqual(document["bomFormat"], "CycloneDX")
+        self.assertEqual(document["specVersion"], "1.5")
+        self.assertGreater(len(document["components"]), 14)
+        refs = [component["bom-ref"] for component in document["components"]]
+        self.assertEqual(len(refs), len(set(refs)), "each SBOM component must have a unique bom-ref")
+        named_purls = {(component["name"], component["purl"]) for component in document["components"]}
+        self.assertTrue(any(name == "react" and purl.startswith("pkg:npm/") for name, purl in named_purls))
+        self.assertTrue(any(name == "numpy" and purl.startswith("pkg:pypi/") for name, purl in named_purls))
+        self.assertTrue(any(name == "serde" and purl.startswith("pkg:cargo/") for name, purl in named_purls))
+
+        output = io.StringIO()
+        server = SidecarIpcServer(proto_out=output)
+        server.handshaken = True
+        server.dispatch_rpc({"jsonrpc": "2.0", "id": "sbom-1", "method": "system.sbom", "params": {}})
+        frame = json.loads(output.getvalue())
+        self.assertEqual(frame["id"], "sbom-1")
+        self.assertEqual(frame["result"], document)
+
     def test_frozen_onedir_sidecar_handshake(self) -> None:
         configured_exe = os.environ.get("ENERGYBASELINE_FROZEN_SIDECAR")
         frozen_exe = (
@@ -299,12 +321,15 @@ class TestSidecarIpc(unittest.TestCase):
                 "app_home": tmp,
             })
             status = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "system.status", "params": {}})
-            stdout_data, _ = proc.communicate(input=f"{hello}\n{status}\n", timeout=20)
+            sbom = json.dumps({"jsonrpc": "2.0", "id": 2, "method": "system.sbom", "params": {}})
+            stdout_data, _ = proc.communicate(input=f"{hello}\n{status}\n{sbom}\n", timeout=20)
             self.assertEqual(proc.returncode, 0)
             frames = [json.loads(line) for line in stdout_data.splitlines() if line.strip()]
             self.assertEqual(frames[0]["type"], "sidecar.ready")
             self.assertEqual(frames[1]["method"], "sidecar.progress")
             self.assertIn("result", frames[2])
+            self.assertEqual(frames[3]["result"]["bomFormat"], "CycloneDX")
+            self.assertEqual(frames[3]["result"]["specVersion"], "1.5")
 
 
 class TestSecurityConfig(unittest.TestCase):
