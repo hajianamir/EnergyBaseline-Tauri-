@@ -307,6 +307,25 @@ class TestSidecarIpc(unittest.TestCase):
             self.assertIn("result", frames[2])
 
 
+class TestSecurityConfig(unittest.TestCase):
+    def test_csp_scopes_inline_styles_to_documented_attribute_exception(self) -> None:
+        config = json.loads((REPO_ROOT / "src-tauri" / "tauri.conf.json").read_text(encoding="utf-8"))
+        csp = config["app"]["security"]["csp"]
+        directives = {
+            parts[0]: parts[1:]
+            for directive in csp.split(";")
+            if (parts := directive.strip().split())
+        }
+        self.assertEqual(directives["style-src"], ["'self'"])
+        self.assertEqual(directives["style-src-elem"], ["'self'"])
+        self.assertEqual(directives["style-src-attr"], ["'unsafe-inline'"])
+
+        security_doc = (REPO_ROOT / "SECURITY.md").read_text(encoding="utf-8")
+        self.assertIn("style-src-attr 'unsafe-inline'", security_doc)
+        self.assertIn("Mitigation plan", security_doc)
+        self.assertIn("ECharts", security_doc)
+
+
 class TestSqlGuard(unittest.TestCase):
     def test_64_kib_utf8_size_parity_boundary(self) -> None:
         limit = _MAX_SQL_BYTES
