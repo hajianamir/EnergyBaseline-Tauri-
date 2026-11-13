@@ -28,7 +28,8 @@ jobs:
           while IFS= read -r chunk || [[ -n "$chunk" ]]; do
             printf '::notice title=CARGOLOCK_PART_%03d::%s\n' "$part" "$chunk"
             part=$((part + 1))
-          done < <(printf '%s' "$encoded" | fold -w 3000)
+          # Stay below GitHub Actions' per-step annotation cap with larger chunks.
+          done < <(printf '%s' "$encoded" | fold -w 12000)
 
       - name: Upload Cargo lockfile for Phase 0 bootstrap
         uses: actions/upload-artifact@v4
@@ -121,7 +122,25 @@ jobs:
           }
           exit $testExitCode
 
-      - name: Run locked Rust unit tests
+      - name: Run locked Rust integration tests (Linux)
+        if: runner.os == 'Linux'
+        working-directory: src-tauri
+        shell: pwsh
+        run: |
+          $log = Join-Path $env:RUNNER_TEMP "cargo-tests.log"
+          cargo test --lib --locked --features integration *> $log
+          $testExitCode = $LASTEXITCODE
+          if ($testExitCode -ne 0) {
+            $diagnostics = Get-Content $log -Tail 60
+            $detail = ($diagnostics -join "`n").Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+            Write-Output "::error title=Cargo test details::$detail"
+          } else {
+            Get-Content $log
+          }
+          exit $testExitCode
+
+      - name: Run locked Rust unit tests (Windows)
+        if: runner.os == 'Windows'
         working-directory: src-tauri
         shell: pwsh
         run: |

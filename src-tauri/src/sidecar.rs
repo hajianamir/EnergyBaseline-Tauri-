@@ -935,15 +935,22 @@ fn terminate_process_tree(process_tree: Option<ProcessTreeGuard>, pid: Option<u3
 
 #[cfg(test)]
 mod tests {
-    use super::{id_key, is_valid_id, SidecarHandle, MAX_FRAME_BYTES};
+    use super::{id_key, is_valid_id, MAX_FRAME_BYTES};
     use serde_json::json;
+    #[cfg(feature = "integration")]
+    use super::SidecarHandle;
+    #[cfg(feature = "integration")]
     use std::ffi::OsString;
+    #[cfg(feature = "integration")]
     use std::path::{Path, PathBuf};
+    #[cfg(feature = "integration")]
     use std::sync::Arc;
+    #[cfg(feature = "integration")]
     use std::time::{Duration, Instant};
+    #[cfg(feature = "integration")]
     use tauri::test::{mock_builder, mock_context, noop_assets, MockRuntime};
-    use tauri::Manager;
 
+    #[cfg(feature = "integration")]
     fn mock_app() -> tauri::App<MockRuntime> {
         mock_builder()
             .plugin(tauri_plugin_shell::init())
@@ -951,6 +958,7 @@ mod tests {
             .expect("mock Tauri app should build")
     }
 
+    #[cfg(feature = "integration")]
     fn test_app_home(test_name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
             "EnergyBaseline-M1-{test_name}-{}",
@@ -960,6 +968,7 @@ mod tests {
         path
     }
 
+    #[cfg(feature = "integration")]
     fn test_sidecar(
         app: &tauri::App<MockRuntime>,
         app_home: PathBuf,
@@ -975,6 +984,7 @@ mod tests {
         sidecar
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn rust_bridge_round_trips_real_python_sidecar_and_preserves_rpc_error_code() {
         let app = mock_app();
@@ -1012,6 +1022,7 @@ mod tests {
         assert!(error.contains("not.allowlisted"), "unexpected error: {error}");
     }
 
+    #[cfg(feature = "integration")]
     #[test]
     fn rpc_cancel_resolves_a_pending_rust_call_as_cancelled() {
         let app = mock_app();
