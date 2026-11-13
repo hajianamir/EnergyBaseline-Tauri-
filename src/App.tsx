@@ -49,6 +49,8 @@ import { ReportView } from './views/ReportView';
 import { SystemStatusView } from './views/SystemStatusView';
 import { CommandPalette, PaletteAction } from './components/CommandPalette';
 import { AutoInspectorDrawer } from './components/AutoInspectorDrawer';
+import { SidecarRuntimeBanner } from './components/SidecarRuntimeBanner';
+import { useSidecarRuntime } from './lib/sidecarRuntime';
 import {
   Activity,
   BarChart3,
@@ -140,6 +142,7 @@ function initializeWorkspaceFromDataset(ds: DatasetState) {
 }
 
 export default function App() {
+  const sidecarRuntime = useSidecarRuntime();
   const [seed] = useState<number>(42);
   const [initialBoot] = useState(() => {
     const ds = generateSyntheticDataset('energy_mv', 42);
@@ -869,6 +872,63 @@ export default function App() {
         </div>
       </header>
 
+      <SidecarRuntimeBanner
+        status={sidecarRuntime.status}
+        progress={sidecarRuntime.progress}
+        checking={sidecarRuntime.checking}
+        onRetry={() => void sidecarRuntime.checkStatus()}
+        onCancel={() => void sidecarRuntime.cancelCheck()}
+      />
+
+      {sidecarRuntime.status.state !== 'ready' && sidecarRuntime.status.state !== 'web-preview' && (
+        <div
+          className="fixed inset-0 z-[100] flex items-center justify-center bg-slate-950/70 p-4"
+          role={sidecarRuntime.status.state === 'failed' ? 'alertdialog' : 'status'}
+          aria-modal={sidecarRuntime.status.state === 'failed' ? true : undefined}
+          aria-labelledby="sidecar-runtime-title"
+          aria-live={sidecarRuntime.status.state === 'failed' ? 'assertive' : 'polite'}
+        >
+          <section className={`w-full max-w-lg space-y-4 rounded-xl border bg-white p-6 text-slate-900 shadow-2xl dark:bg-slate-900 dark:text-slate-100 ${sidecarRuntime.status.state === 'failed' ? 'border-rose-300 dark:border-rose-900' : 'border-slate-300 dark:border-slate-700'}`}>
+            <div>
+              <h1 id="sidecar-runtime-title" className="text-lg font-bold">
+                {sidecarRuntime.status.state === 'failed' ? 'EnergyBaseline engine could not start' : 'Starting EnergyBaseline engine…'}
+              </h1>
+              <p className="mt-2 text-sm text-slate-600 dark:text-slate-300">
+                {sidecarRuntime.status.state === 'failed'
+                  ? 'The desktop sidecar did not become ready. Retry before starting a desktop analysis run.'
+                  : 'Waiting for the desktop sidecar handshake. The workspace will unlock when the engine is ready.'}
+              </p>
+            </div>
+            {sidecarRuntime.status.message && (
+              <pre className="max-h-36 overflow-auto whitespace-pre-wrap break-words rounded bg-rose-50 p-3 text-xs text-rose-900 dark:bg-rose-950/50 dark:text-rose-200">
+                {sidecarRuntime.status.message}
+              </pre>
+            )}
+            <p className="break-all text-xs font-mono text-slate-500 dark:text-slate-400">
+              Log: {sidecarRuntime.status.logPath ?? 'See the application sidecar log.'}
+            </p>
+            {sidecarRuntime.status.state === 'failed' ? (
+              <button
+                type="button"
+                onClick={() => void sidecarRuntime.checkStatus()}
+                disabled={sidecarRuntime.checking}
+                className="rounded bg-sky-700 px-4 py-2 text-sm font-semibold text-white hover:bg-sky-800 disabled:opacity-50"
+              >
+                {sidecarRuntime.checking ? 'Retrying…' : 'Retry sidecar'}
+              </button>
+            ) : sidecarRuntime.checking ? (
+              <button
+                type="button"
+                onClick={() => void sidecarRuntime.cancelCheck()}
+                className="rounded border border-slate-300 px-4 py-2 text-sm font-semibold hover:bg-slate-100 dark:border-slate-700 dark:hover:bg-slate-800"
+              >
+                Cancel startup check
+              </button>
+            ) : null}
+          </section>
+        </div>
+      )}
+
       {/* Main Workspace Split: Left Stepper + Active View + Right Inspector */}
       <div className="flex-1 flex min-h-0 overflow-hidden relative">
         {/* Desktop Collapsible Sidebar & Mobile Drawer */}
@@ -1102,6 +1162,8 @@ export default function App() {
                 onToggleDarkMode={() => setDarkMode((d) => !d)}
                 onToggleHighContrast={() => setHighContrast((h) => !h)}
                 onChangeFontScale={setFontScale}
+                runtimeStatus={sidecarRuntime.status}
+                onRetrySidecar={() => void sidecarRuntime.checkStatus()}
                 onRestoreEbproj={handleRestoreEbproj}
               />
             )}

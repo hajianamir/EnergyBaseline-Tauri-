@@ -2,6 +2,12 @@ node_modules/
 build/
 dist/
 coverage/
+src-tauri/target/
+src-tauri/Cargo.lock
+sidecar/build/
+sidecar/dist/
+__pycache__/
+*.py[cod]
 .DS_Store
 *.log
 .env*

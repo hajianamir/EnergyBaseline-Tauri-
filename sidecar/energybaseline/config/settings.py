@@ -69,6 +69,13 @@ def _resolve_sqlite_relative(url: str, app_home: Path) -> Path:
     return p
 
 
+def _sqlite_url(path: Path) -> str:
+    if str(path) == ":memory:":
+        return "sqlite:///:memory:"
+    # as_posix keeps SQLAlchemy URLs valid on Windows (C:/..., not C:\\...).
+    return f"sqlite:///{path.as_posix()}"
+
+
 def _probe_non_sqlite(url: str, timeout_sec: float = 3.0) -> tuple[bool, str]:
     # Non-SQLite URL probe (DB-6); without external driver or unreachable host -> degrade cleanly
     try:
@@ -142,11 +149,22 @@ def resolve_database(explicit_app_home: Optional[str] = None) -> DbResolution:
         warning_msg = None
         fallback = False
 
-    # Tier 2: SQLite under APP_HOME
+    # Tier 2: SQLite under APP_HOME (or an explicitly configured in-memory URL).
     sqlite_path = _resolve_sqlite_relative(candidate_url, app_home)
     ok, err = _test_sqlite_writable(sqlite_path)
+    if ok and str(sqlite_path) == ":memory:":
+        memory_warning = "Configured in-memory SQLite is volatile; data will be lost when the app closes."
+        logger.warning("db.url_resolved url=sqlite:///:memory: fallback=true tier=memory")
+        return DbResolution(
+            url="sqlite:///:memory:",
+            url_masked="sqlite:///:memory:",
+            fallback=True,
+            fallback_tier="memory_sqlite",
+            warning=memory_warning,
+            sqlite_path=None,
+        )
     if ok:
-        resolved_url = f"sqlite:///{sqlite_path}" if str(sqlite_path) != ":memory:" else "sqlite:///:memory:"
+        resolved_url = _sqlite_url(sqlite_path)
         masked = mask_url_credentials(resolved_url)
         logger.info("db.url_resolved url=%s fallback=%s", masked, str(fallback).lower())
         return DbResolution(
@@ -162,14 +180,17 @@ def resolve_database(explicit_app_home: Optional[str] = None) -> DbResolution:
     temp_path = Path(tempfile.gettempdir()) / "EnergyBaseline" / "data" / "app.db"
     ok_temp, err_temp = _test_sqlite_writable(temp_path)
     if ok_temp:
-        resolved_url = f"sqlite:///{temp_path}"
+        resolved_url = _sqlite_url(temp_path)
         logger.warning("db.url_resolved url=%s fallback=true tier=temp", resolved_url)
         return DbResolution(
             url=resolved_url,
             url_masked=resolved_url,
             fallback=True,
             fallback_tier="temp_sqlite",
-            warning=f"APP_HOME unwritable ({err}); using temporary storage ({temp_path}) — data may be lost.",
+            warning=" ".join(filter(None, [
+                warning_msg,
+                f"APP_HOME unwritable ({err}); using temporary storage ({temp_path}) — data may be lost.",
+            ])),
             sqlite_path=temp_path,
         )
 
@@ -180,7 +201,10 @@ def resolve_database(explicit_app_home: Optional[str] = None) -> DbResolution:
         url_masked="sqlite:///:memory:",
         fallback=True,
         fallback_tier="memory_sqlite",
-        warning=f"Disk storage unavailable ({err_temp}); running on volatile in-memory SQLite.",
+        warning=" ".join(filter(None, [
+            warning_msg,
+            f"Disk storage unavailable ({err_temp}); running on volatile in-memory SQLite.",
+        ])),
         sqlite_path=None,
     )
 

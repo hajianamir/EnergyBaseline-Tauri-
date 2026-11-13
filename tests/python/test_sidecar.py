@@ -4,13 +4,15 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
+from unittest.mock import patch
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SIDECAR_DIR = REPO_ROOT / "sidecar"
 sys.path.insert(0, str(SIDECAR_DIR))
 
 from energybaseline.config.settings import (  # noqa: E402
+    _sqlite_url,
     mask_url_credentials,
     online_sqlite_backup,
     resolve_database,
@@ -42,6 +44,33 @@ class TestDbResolver(unittest.TestCase):
             res = resolve_database(tmp)
             self.assertEqual(res.fallback_tier, "primary")
             self.assertTrue(res.url.startswith("sqlite:///"))
+
+    def test_read_only_app_home_falls_back_to_temp_with_warning(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "energybaseline.config.settings._test_sqlite_writable",
+            side_effect=[(False, "read-only APP_HOME"), (True, "ok")],
+        ):
+            res = resolve_database(tmp)
+            self.assertEqual(res.fallback_tier, "temp_sqlite")
+            self.assertTrue(res.fallback)
+            self.assertIn("data may be lost", (res.warning or ""))
+            self.assertIn((Path(tempfile.gettempdir()) / "EnergyBaseline").as_posix(), res.url)
+
+    def test_in_memory_sqlite_is_always_reported_as_volatile(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ["EB_DATABASE_URL"] = "sqlite:///:memory:"
+            res = resolve_database(tmp)
+            self.assertEqual(res.fallback_tier, "memory_sqlite")
+            self.assertTrue(res.fallback)
+            self.assertIsNone(res.sqlite_path)
+            self.assertIn("volatile", (res.warning or "").lower())
+
+    def test_windows_sqlite_url_uses_forward_slashes(self) -> None:
+        path = PureWindowsPath("C:/Users/tester/EnergyBaseline/data/app.db")
+        self.assertEqual(
+            _sqlite_url(path),
+            "sqlite:///C:/Users/tester/EnergyBaseline/data/app.db",
+        )
 
     def test_unreachable_postgres_falls_back_to_sqlite(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -96,13 +125,19 @@ class TestSidecarIpc(unittest.TestCase):
             })
             rpc_status = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "system.status", "params": {}})
             rpc_bad = json.dumps({"jsonrpc": "2.0", "id": 2, "method": "not.allowlisted", "params": {}})
-            stdout_data, stderr_data = proc.communicate(input=f"{hello}\n{rpc_status}\n{rpc_bad}\n", timeout=10)
+            rpc_cancel = json.dumps({"jsonrpc": "2.0", "id": "cancel-call", "method": "rpc_cancel", "params": {"id": 3}})
+            stdout_data, stderr_data = proc.communicate(
+                input=f"{hello}\n{rpc_status}\n{rpc_bad}\n{rpc_cancel}\n", timeout=10
+            )
             self.assertEqual(proc.returncode, 0)
             self.assertIn("sidecar.booting", stderr_data)
             lines = [json.loads(line) for line in stdout_data.strip().splitlines() if line.strip()]
             self.assertEqual(lines[0]["type"], "sidecar.ready")
-            self.assertFalse(lines[1]["result"]["matplotlib_loaded"])
-            self.assertEqual(lines[2]["error"]["code"], -32601)
+            self.assertEqual(lines[1]["method"], "sidecar.progress")
+            self.assertEqual(lines[1]["params"]["percent"], 100)
+            self.assertFalse(lines[2]["result"]["matplotlib_loaded"])
+            self.assertEqual(lines[3]["error"]["code"], -32601)
+            self.assertEqual(lines[4]["result"], {"cancelled": 3})
 
     def test_protocol_version_mismatch_aborts(self) -> None:
         proc = subprocess.Popen(
@@ -118,6 +153,65 @@ class TestSidecarIpc(unittest.TestCase):
         frame = json.loads(stdout_data.strip().splitlines()[0])
         self.assertEqual(frame["type"], "sidecar.fatal")
         self.assertEqual(frame["app_code"], "PROTOCOL_VERSION")
+
+    def test_oversized_and_malformed_frames_return_errors_without_crashing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = subprocess.Popen(
+                [sys.executable, str(SIDECAR_DIR / "energybaseline" / "main.py")],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            assert proc.stdin and proc.stdout and proc.stderr
+            oversized = '{"jsonrpc":"2.0","id":1,"method":"system.status","params":{"pad":"' + (
+                "x" * (1024 * 1024)
+            ) + '"}}'
+            malformed = '{"jsonrpc":'
+            hello = json.dumps({
+                "protocol_version": "1.0",
+                "app_version": "5.2.0",
+                "parent_pid": os.getpid(),
+                "app_home": tmp,
+            })
+            stdout_data, _ = proc.communicate(input=f"{hello}\n{oversized}\n{malformed}\n", timeout=10)
+            self.assertEqual(proc.returncode, 0)
+            frames = [json.loads(line) for line in stdout_data.splitlines() if line.strip()]
+            self.assertEqual(frames[0]["type"], "sidecar.ready")
+            self.assertEqual(frames[1]["error"]["app_code"], "VALIDATION")
+            self.assertIn("exceeds", frames[1]["error"]["message"])
+            self.assertEqual(frames[2]["error"]["code"], -32700)
+
+    def test_frozen_onedir_sidecar_handshake(self) -> None:
+        configured_exe = os.environ.get("ENERGYBASELINE_FROZEN_SIDECAR")
+        frozen_exe = (
+            Path(configured_exe)
+            if configured_exe
+            else SIDECAR_DIR / "dist" / "energybaseline_sidecar" / "energybaseline_sidecar.exe"
+        )
+        if not frozen_exe.exists():
+            self.skipTest("PyInstaller onedir sidecar is only present in the Windows packaging job")
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = subprocess.Popen(
+                [str(frozen_exe), "--stdio"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            hello = json.dumps({
+                "protocol_version": "1.0",
+                "app_version": "5.2.0",
+                "parent_pid": os.getpid(),
+                "app_home": tmp,
+            })
+            status = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "system.status", "params": {}})
+            stdout_data, _ = proc.communicate(input=f"{hello}\n{status}\n", timeout=20)
+            self.assertEqual(proc.returncode, 0)
+            frames = [json.loads(line) for line in stdout_data.splitlines() if line.strip()]
+            self.assertEqual(frames[0]["type"], "sidecar.ready")
+            self.assertEqual(frames[1]["method"], "sidecar.progress")
+            self.assertIn("result", frames[2])
 
 
 class TestSqlGuard(unittest.TestCase):

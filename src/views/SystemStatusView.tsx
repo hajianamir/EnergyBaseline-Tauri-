@@ -8,7 +8,8 @@ import {
   VsgEntry,
 } from '../engine/types';
 import { exportEbprojZipBlob, importEbprojZipFile } from '../engine/report';
-import { CheckCircle2, Download, HardDrive, ShieldCheck, Upload } from 'lucide-react';
+import { Download, HardDrive, RefreshCw, ShieldCheck, Upload } from 'lucide-react';
+import type { SidecarUiStatus } from '../lib/sidecarRuntime';
 
 interface SystemStatusViewProps {
   dataset: DatasetState;
@@ -24,6 +25,8 @@ interface SystemStatusViewProps {
   onToggleDarkMode: () => void;
   onToggleHighContrast: () => void;
   onChangeFontScale: (scale: number) => void;
+  runtimeStatus: SidecarUiStatus;
+  onRetrySidecar: () => void;
   onRestoreEbproj: (restored: Awaited<ReturnType<typeof importEbprojZipFile>>) => void;
 }
 
@@ -41,10 +44,13 @@ export const SystemStatusView: React.FC<SystemStatusViewProps> = ({
   onToggleDarkMode,
   onToggleHighContrast,
   onChangeFontScale,
+  runtimeStatus,
+  onRetrySidecar,
   onRestoreEbproj,
 }) => {
   const zipInputRef = useRef<HTMLInputElement>(null);
   const [statusMsg, setStatusMsg] = useState<string | null>(null);
+  const dbStatus = runtimeStatus.db;
 
   const handleExportEbproj = async () => {
     const blob = await exportEbprojZipBlob({
@@ -121,22 +127,36 @@ export const SystemStatusView: React.FC<SystemStatusViewProps> = ({
         <section className="border border-slate-200 dark:border-slate-800 rounded-lg bg-white dark:bg-slate-900 p-4 space-y-3 text-xs">
           <h2 className="text-sm font-semibold font-display inline-flex items-center gap-1.5">
             <HardDrive className="w-4 h-4 text-sky-600" aria-hidden="true" />
-            Where Is My Data Stored? & SQLite Zero-Fail Resolver (DB-1..11)
+            Sidecar &amp; Database Health
           </h2>
           <div className="space-y-1.5 font-mono text-slate-700 dark:text-slate-300">
-            <div>APP_HOME (Windows): %LOCALAPPDATA%\EnergyBaseline</div>
-            <div>DB URL: sqlite:///./data/app.db (WAL + foreign_keys=ON)</div>
-            <div>Portable Override: portable.flag beside EnergyBaseline.exe</div>
-            <div>IPC Transport: JSON-RPC 2.0 NDJSON over stdin/stdout (0 HTTP ports)</div>
-            <div>Shutdown Signal: Stdin EOF + Windows Job Object (KILL_ON_JOB_CLOSE)</div>
+            <div>Runtime state: {runtimeStatus.state}</div>
+            <div>APP_HOME (Windows): %LOCALAPPDATA%\EnergyBaseline (or portable.flag directory)</div>
+            <div>Resolved DB URL: {dbStatus?.url_masked ?? 'Not reported by the desktop sidecar'}</div>
+            <div>Fallback tier: {dbStatus?.fallback_tier ?? 'Not available'}</div>
+            <div>IPC: JSON-RPC 2.0 NDJSON over stdin/stdout · no HTTP listener</div>
+            <div>Shutdown: stdin EOF; guarded process-tree termination on timeout or shell crash</div>
+            <div>Sidecar log: {runtimeStatus.logPath ?? 'Not available'}</div>
           </div>
-          <div className="pt-2 border-t border-slate-100 dark:border-slate-800 flex flex-wrap gap-4 font-mono">
-            <span className="text-emerald-700 dark:text-emerald-400 inline-flex items-center gap-1">
-              <CheckCircle2 className="w-3.5 h-3.5" aria-hidden="true" /> db.ok = true
-            </span>
-            <span>fallback = false</span>
-            <span>writable = true</span>
+          <div className="pt-2 border-t border-slate-100 dark:border-slate-800 flex flex-wrap items-center gap-4 font-mono">
+            <span>db.ok = {dbStatus?.ok === undefined ? 'not reported' : String(dbStatus.ok)}</span>
+            <span>fallback = {dbStatus?.fallback === undefined ? 'not reported' : String(dbStatus.fallback)}</span>
+            <span>writable = {dbStatus?.writable === undefined ? 'not reported' : String(dbStatus.writable)}</span>
+            {runtimeStatus.state === 'failed' && (
+              <button
+                type="button"
+                onClick={onRetrySidecar}
+                className="inline-flex items-center gap-1 text-sky-700 dark:text-sky-300 hover:underline"
+              >
+                <RefreshCw className="h-3 w-3" aria-hidden="true" /> Retry sidecar
+              </button>
+            )}
           </div>
+          {dbStatus?.warning && (
+            <p className="rounded border border-amber-300 bg-amber-50 p-2 text-amber-900 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-200">
+              {dbStatus.warning}
+            </p>
+          )}
         </section>
 
         {/* Accessibility & Theme Controls (UX-2 / UX-4) */}

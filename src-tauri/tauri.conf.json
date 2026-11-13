@@ -26,11 +26,19 @@
       "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src ipc: http://ipc.localhost"
     }
   },
+  "plugins": {
+    "updater": {
+      "pubkey": "",
+      "endpoints": []
+    }
+  },
   "bundle": {
     "active": true,
     "targets": ["nsis"],
     "icon": ["icons/icon.png", "icons/icon.ico"],
-    "resources": ["../sidecar/dist/energybaseline_sidecar/**/*"],
+    "resources": {
+      "../sidecar/dist/energybaseline_sidecar/": "energybaseline_sidecar/"
+    },
     "fileAssociations": [
       {
         "ext": ["ebproj"],
