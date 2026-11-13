@@ -32,10 +32,96 @@ import {
   shouldFitStackedEnsemble,
 } from './modeling';
 import { buildTemporalWarmupContext, predictFromLockedBaseline } from './monitoring';
-import type { DatasetRow, DatasetState } from './types';
-import { buildDeterministicReportModel, renderHtmlReport, verifyReportNarrativeConsistency } from './report';
+import type { DatasetRow, DatasetState, LockedBaseline } from './types';
+import JSZip from 'jszip';
+import { buildDeterministicReportModel, exportEbprojZipBlob, importEbprojZipFile, renderHtmlReport, verifyReportNarrativeConsistency } from './report';
 import type { ReportModel, ReportSection } from './report';
+import { EBPROJ_LIMITS } from './projectArchive';
 import { resolveStandardForDomain } from './domains';
+
+function makeEbprojFixture() {
+  const dataset = generateSyntheticDataset('energy_mv', 42);
+  const tcp = createDefaultTcpConfig(dataset);
+  const calibrationSummary = {
+    method: 'split_conformal',
+    nominalCoverage: 0.95,
+    empiricalCoverage: 0.96,
+    meanWidth: 120,
+    winklerScore: 150,
+    kupiecPofP: 0.4,
+    christoffersenCcP: 0.3,
+    regimeCoverage: [],
+  };
+  const features = ['outdoor_temp_c'];
+  const candidate = {
+    id: 'archive-candidate-1',
+    target: 'kwh_total',
+    name: 'Archive test MLR',
+    family: 'mlr',
+    isParametric: true,
+    isNeuralNet: false,
+    featuresUsed: features,
+    oofCvRmse: 3.5,
+    oofNmbe: 0.2,
+    conformalSummary: calibrationSummary,
+    predictFnParams: {
+      family: 'mlr',
+      features,
+      coeffs: [{ term: 'Intercept', value: 100 }, { term: 'outdoor_temp_c', value: 2 }],
+      bestTh: 18,
+      bestTc: 18,
+      colMedians: { outdoor_temp_c: 18 },
+      meanTarget: 1000,
+      oofRmse: 50,
+      conformalHalfWidth: 98,
+      modelPayload: null,
+    },
+  };
+  const lockedBaseline = {
+    version: 1,
+    target: 'kwh_total',
+    modelId: candidate.id,
+    modelName: candidate.name,
+    family: candidate.family,
+    lockedAt: '2026-11-13T00:00:00.000Z',
+    note: 'Archive test fixture',
+    artifactSha256: 'a'.repeat(32),
+    features,
+    thresholdProfile: 'ashrae14',
+    vsgSnapshotHash: 'b'.repeat(32),
+    tcpSnapshotHash: 'c'.repeat(32),
+    trainingWindow: {
+      start: dataset.temporal.baselineStart,
+      end: dataset.temporal.baselineEnd,
+      nRows: 265,
+    },
+    seed: 42,
+    calibrationSummary,
+    modelCard: {
+      intendedUse: 'Fixture only',
+      trainingWindow: '2025-01-01 to 2025-09-22',
+      features,
+      assumptions: ['Fixture assumption'],
+      knownLimitations: ['Fixture limitation'],
+      calibrationSummary: 'Fixture calibration summary',
+      standardsNote: 'Fixture standards note',
+    },
+    candidate,
+  } as unknown as LockedBaseline;
+  return {
+    dataset,
+    vsgByTarget: {},
+    tcp,
+    lockedBaselines: { kwh_total: lockedBaseline },
+    autoLogs: [],
+    auditLog: [],
+    seed: 42,
+  };
+}
+
+function asEbprojFile(blob: Blob): File {
+  return new File([blob], 'regression-fixture.ebproj', { type: 'application/zip' });
+}
 
 test('Synthetic ground-truth generator is deterministic for a fixed seed', () => {
   const ds1 = generateSyntheticDataset('energy_mv', 42);
@@ -299,7 +385,133 @@ test('DAT-3 refuses coarser-to-finer disaggregation with DATA_REFUSED', () => {
   assert.equal(aggRes.rows.length, 12);
 });
 
-test('F-09: HTML report export escapes company, dataset, and section text as inert text', () => {
+test('F-11: .ebproj schema v2 round-trips validated rows and locked baseline; legacy v5.2 reader remains supported', async () => {
+  const payload = makeEbprojFixture();
+  const blob = await exportEbprojZipBlob(payload);
+  const zip = await JSZip.loadAsync(blob);
+  const manifest = JSON.parse(await zip.file('manifest.json')!.async('string')) as Record<string, unknown>;
+  assert.equal(manifest.schema_version, 2);
+  const entries = manifest.entries as Record<string, { size_bytes: number; sha256: string }>;
+  assert.equal(entries['data/dataset_rows.json'].size_bytes, new TextEncoder().encode(await zip.file('data/dataset_rows.json')!.async('string')).byteLength);
+  assert.match(entries['data/dataset_rows.json'].sha256, /^[0-9a-f]{64}$/);
+
+  const restored = await importEbprojZipFile(asEbprojFile(blob));
+  assert.deepEqual(restored.dataset.rows, payload.dataset.rows);
+  assert.equal(restored.dataset.sha256, payload.dataset.sha256);
+  assert.equal(restored.lockedBaselines.kwh_total.version, 1);
+  assert.equal(restored.lockedBaselines.kwh_total.candidate.predictFnParams.family, 'mlr');
+  assert.match(restored.dataset.sourceNote, /regression-fixture\.ebproj/);
+
+  const legacyZip = await JSZip.loadAsync(blob);
+  const legacyManifest = JSON.parse(await legacyZip.file('manifest.json')!.async('string')) as Record<string, unknown>;
+  legacyManifest.schema_version = '5.2.0';
+  delete legacyManifest.app_version;
+  delete legacyManifest.entries;
+  legacyZip.file('manifest.json', JSON.stringify(legacyManifest));
+  const legacyBlob = await legacyZip.generateAsync({ type: 'blob' });
+  const legacyRestored = await importEbprojZipFile(asEbprojFile(legacyBlob));
+  assert.equal(legacyRestored.dataset.rows.length, payload.dataset.rows.length);
+  assert.equal(legacyRestored.lockedBaselines.kwh_total.version, 1);
+});
+
+test('F-11: .ebproj import rejects bad schemas, entries, shapes, hashes, and oversized files', async () => {
+  const payload = makeEbprojFixture();
+  const blob = await exportEbprojZipBlob(payload);
+
+  const badSchemaZip = await JSZip.loadAsync(blob);
+  const badSchemaManifest = JSON.parse(await badSchemaZip.file('manifest.json')!.async('string')) as Record<string, unknown>;
+  badSchemaManifest.schema_version = 999;
+  badSchemaZip.file('manifest.json', JSON.stringify(badSchemaManifest));
+  await assert.rejects(
+    importEbprojZipFile(asEbprojFile(await badSchemaZip.generateAsync({ type: 'blob' }))),
+    /unsupported schema_version/
+  );
+
+  const extraEntryZip = await JSZip.loadAsync(blob);
+  extraEntryZip.file('unexpected.txt', 'not part of an .ebproj project');
+  await assert.rejects(
+    importEbprojZipFile(asEbprojFile(await extraEntryZip.generateAsync({ type: 'blob' }))),
+    /entry count|Unexpected ZIP entry/
+  );
+
+  const badShapeZip = await JSZip.loadAsync(blob);
+  const badShapeManifest = JSON.parse(await badShapeZip.file('manifest.json')!.async('string')) as Record<string, unknown>;
+  badShapeManifest.columns = [];
+  badShapeZip.file('manifest.json', JSON.stringify(badShapeManifest));
+  await assert.rejects(
+    importEbprojZipFile(asEbprojFile(await badShapeZip.generateAsync({ type: 'blob' }))),
+    /manifest\.columns must not be empty/
+  );
+
+  const badRowsZip = await JSZip.loadAsync(blob);
+  const badRowsText = await badRowsZip.file('data/dataset_rows.json')!.async('string');
+  const badRows = JSON.parse(badRowsText) as Record<string, unknown>[];
+  badRows[0].timestamp = 42;
+  const invalidRowsText = JSON.stringify(badRows);
+  const invalidRowsHash = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(invalidRowsText));
+  const invalidRowsManifest = JSON.parse(await badRowsZip.file('manifest.json')!.async('string')) as Record<string, unknown>;
+  const invalidRowsEntries = invalidRowsManifest.entries as Record<string, { size_bytes: number; sha256: string }>;
+  invalidRowsEntries['data/dataset_rows.json'] = {
+    size_bytes: new TextEncoder().encode(invalidRowsText).byteLength,
+    sha256: Array.from(new Uint8Array(invalidRowsHash), (byte) => byte.toString(16).padStart(2, '0')).join(''),
+  };
+  badRowsZip.file('manifest.json', JSON.stringify(invalidRowsManifest));
+  badRowsZip.file('data/dataset_rows.json', invalidRowsText);
+  await assert.rejects(
+    importEbprojZipFile(asEbprojFile(await badRowsZip.generateAsync({ type: 'blob' }))),
+    /\.timestamp must be a non-empty string/
+  );
+
+  const tamperedRowsZip = await JSZip.loadAsync(blob);
+  const originalRowsText = await tamperedRowsZip.file('data/dataset_rows.json')!.async('string');
+  const tamperedRows = JSON.parse(originalRowsText) as Record<string, unknown>[];
+  tamperedRows[0].is_weekend = tamperedRows[0].is_weekend === 1 ? 0 : 1;
+  const tamperedRowsText = JSON.stringify(tamperedRows);
+  assert.equal(tamperedRowsText.length, originalRowsText.length, 'tampering fixture preserves the declared payload length');
+  tamperedRowsZip.file('data/dataset_rows.json', tamperedRowsText);
+  await assert.rejects(
+    importEbprojZipFile(asEbprojFile(await tamperedRowsZip.generateAsync({ type: 'blob' }))),
+    /dataset rows SHA-256 checksum mismatch/
+  );
+
+  const oversized = {
+    size: EBPROJ_LIMITS.maxFileBytes + 1,
+    arrayBuffer: async () => { throw new Error('The importer should reject by size before reading bytes.'); },
+  } as unknown as File;
+  await assert.rejects(importEbprojZipFile(oversized), /compressed file size limit/);
+});
+
+test('F-11: .ebproj ZIP-bomb metadata is rejected before entry decompression', async () => {
+  const blob = await exportEbprojZipBlob(makeEbprojFixture());
+  const bytes = new Uint8Array(await blob.arrayBuffer());
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const decoder = new TextDecoder();
+  let cursor = 0;
+  let patched = false;
+  while (cursor + 46 <= bytes.length) {
+    if (view.getUint32(cursor, true) !== 0x02014b50) {
+      cursor++;
+      continue;
+    }
+    const nameLength = view.getUint16(cursor + 28, true);
+    const extraLength = view.getUint16(cursor + 30, true);
+    const commentLength = view.getUint16(cursor + 32, true);
+    const name = decoder.decode(bytes.subarray(cursor + 46, cursor + 46 + nameLength));
+    if (name === 'data/dataset_rows.json') {
+      view.setUint32(cursor + 24, EBPROJ_LIMITS.maxEntryBytes + 1, true);
+      patched = true;
+      break;
+    }
+    cursor += 46 + nameLength + extraLength + commentLength;
+  }
+  assert.equal(patched, true, 'test archive should contain the dataset rows central-directory record');
+  await assert.rejects(
+    importEbprojZipFile(asEbprojFile(new Blob([bytes], { type: 'application/zip' }))),
+    /uncompressed entry size limit/
+  );
+});
+
+test('F-09: HTML report export escapes company, dataset, and section text as inert text nodes', () => {
   const payload = `<img src=x onerror="alert('xss')"> & report`;
   const report: ReportModel = {
     generatedAt: '2026-11-13T00:00:00.000Z',

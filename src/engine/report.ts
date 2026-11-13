@@ -1,4 +1,3 @@
-import JSZip from 'jszip';
 import { DOMAIN_PROFILES } from './domains';
 import {
   AuditEvent,
@@ -426,75 +425,4 @@ export function computeRunDiff(
   return diffs;
 }
 
-export async function exportEbprojZipBlob(payload: {
-  dataset: DatasetState;
-  vsgByTarget: Record<string, Record<string, VsgEntry>>;
-  tcp: TcpConfig;
-  lockedBaselines: Record<string, LockedBaseline>;
-  autoLogs: AutoDecisionEntry[];
-  auditLog: AuditEvent[];
-  seed: number;
-}): Promise<Blob> {
-  const zip = new JSZip();
-  const manifest = {
-    schema_version: '5.2.0',
-    exported_at: new Date().toISOString(),
-    seed: payload.seed,
-    dataset_ref: {
-      id: payload.dataset.id,
-      name: payload.dataset.name,
-      domain: payload.dataset.domain,
-      sha256: payload.dataset.sha256,
-      rows: payload.dataset.rows.length,
-    },
-    temporal: payload.dataset.temporal,
-    columns: payload.dataset.columns,
-    vsg_by_target: payload.vsgByTarget,
-    tcp_config: payload.tcp,
-    locked_baselines: payload.lockedBaselines,
-    auto_log: payload.autoLogs,
-    audit_log: payload.auditLog,
-    credentials_included: false,
-  };
-  zip.file('manifest.json', JSON.stringify(manifest, null, 2));
-  zip.file('data/dataset_rows.json', JSON.stringify(payload.dataset.rows));
-  return zip.generateAsync({ type: 'blob' });
-}
-
-export async function importEbprojZipFile(file: File): Promise<{
-  dataset: DatasetState;
-  vsgByTarget: Record<string, Record<string, VsgEntry>>;
-  tcp: TcpConfig;
-  lockedBaselines: Record<string, LockedBaseline>;
-  autoLogs: AutoDecisionEntry[];
-  auditLog: AuditEvent[];
-  seed: number;
-}> {
-  const zip = await JSZip.loadAsync(file);
-  const manifestText = await zip.file('manifest.json')?.async('string');
-  if (!manifestText) throw new Error('Invalid .ebproj archive: missing manifest.json');
-  const manifest = JSON.parse(manifestText);
-  const rowsText = await zip.file('data/dataset_rows.json')?.async('string');
-  const rows = rowsText ? JSON.parse(rowsText) : [];
-  const dataset: DatasetState = {
-    id: manifest.dataset_ref.id,
-    name: manifest.dataset_ref.name,
-    domain: manifest.dataset_ref.domain,
-    rows,
-    rawRowCount: rows.length,
-    sha256: manifest.dataset_ref.sha256,
-    columns: manifest.columns,
-    temporal: manifest.temporal,
-    nonRoutineEvents: [],
-    sourceNote: `Restored from .ebproj (${file.name})`,
-  };
-  return {
-    dataset,
-    vsgByTarget: manifest.vsg_by_target ?? {},
-    tcp: manifest.tcp_config,
-    lockedBaselines: manifest.locked_baselines ?? {},
-    autoLogs: manifest.auto_log ?? [],
-    auditLog: manifest.audit_log ?? [],
-    seed: manifest.seed ?? 42,
-  };
-}
+export { exportEbprojZipBlob, importEbprojZipFile } from './projectArchive';
