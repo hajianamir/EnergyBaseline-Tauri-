@@ -1,0 +1,86 @@
+name: Cross-platform validation
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  cargo-lock:
+    name: Resolve Cargo lockfile
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Generate Cargo lockfile for bootstrap validation
+        run: cargo generate-lockfile --manifest-path src-tauri/Cargo.toml
+
+      - name: Upload Cargo lockfile for Phase 0 bootstrap
+        uses: actions/upload-artifact@v4
+        with:
+          name: cargo-lockfile-bootstrap
+          path: src-tauri/Cargo.lock
+          if-no-files-found: error
+
+  validate:
+    name: Validate (${{ matrix.os }})
+    needs: cargo-lock
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download generated Cargo lockfile
+        uses: actions/download-artifact@v4
+        with:
+          name: cargo-lockfile-bootstrap
+          path: src-tauri
+
+      - name: Setup Node.js 22.22.3
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.22.3'
+          cache: 'npm'
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Setup Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Tauri system dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential curl wget file libssl-dev libxdo-dev \
+            libayatana-appindicator3-dev librsvg2-dev libwebkit2gtk-4.1-dev
+
+      - name: Install frontend dependencies from lockfile
+        run: npm ci
+
+      - name: Lint, engine tests, and production build
+        run: |
+          npm run lint
+          npm run test:engine
+          npm run build
+
+      - name: Run Python sidecar tests
+        run: python -m unittest -v tests/python/test_sidecar.py
+
+      - name: Verify locked native Cargo build
+        working-directory: src-tauri
+        run: cargo build --release --locked
+
+      - name: Verify Tauri CLI build path
+        run: npm run tauri:build -- --no-bundle

@@ -18,10 +18,10 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Node.js 22
+      - name: Setup Node.js 22.22.3
         uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: '22.22.3'
           cache: 'npm'
 
       - name: Setup Python 3.11
@@ -47,7 +47,7 @@ jobs:
         run: |
           npm ci
           npm run lint
-          npx --yes tsx --test src/engine/engine.test.ts
+          npm run test:engine
           npm run build
 
       - name: Install sidecar dependencies & run Python tests
@@ -67,9 +67,9 @@ jobs:
             New-Item -ItemType Directory -Force -Path "src-tauri/webview2" | Out-Null
             Invoke-WebRequest -Uri "https://go.microsoft.com/fwlink/p/?LinkId=2124703" -OutFile "src-tauri/webview2/MicrosoftEdgeWebView2RuntimeInstallerX64.exe"
             $cfg = '{"bundle":{"windows":{"webviewInstallMode":{"type":"offlineInstaller","path":"webview2/MicrosoftEdgeWebView2RuntimeInstallerX64.exe"}}}}'
-            npx tauri build --bundles nsis --config $cfg
+            npm run tauri:build -- --config $cfg
           } else {
-            npx tauri build --bundles nsis
+            npm run tauri:build
           }
 
       - name: Upload Windows NSIS Installer Artifact

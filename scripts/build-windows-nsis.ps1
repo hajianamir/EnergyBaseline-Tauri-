@@ -37,8 +37,6 @@ Push-Location (Join-Path $RepoRoot "sidecar")
 & $PyInstallerExe --clean --noconfirm energybaseline_sidecar.spec
 Pop-Location
 
-$TauriArgs = @("tauri", "build", "--bundles", "nsis")
-
 if ($OfflineWebView2) {
   Write-Host "==> [4b] Fetching WebView2 Evergreen Standalone x64 installer for air-gapped setup..."
   $WvDir = Join-Path $RepoRoot "src-tauri\webview2"
@@ -46,9 +44,10 @@ if ($OfflineWebView2) {
   $WvPath = Join-Path $WvDir "MicrosoftEdgeWebView2RuntimeInstallerX64.exe"
   Invoke-WebRequest -Uri "https://go.microsoft.com/fwlink/p/?LinkId=2124703" -OutFile $WvPath
   $OverrideCfg = '{"bundle":{"windows":{"webviewInstallMode":{"type":"offlineInstaller","path":"webview2/MicrosoftEdgeWebView2RuntimeInstallerX64.exe"}}}}'
-  $TauriArgs += @("--config", $OverrideCfg)
+  Write-Host "==> [5/5] Building Tauri 2 NSIS Installer..."
+  npm run tauri:build -- --config $OverrideCfg
+} else {
+  Write-Host "==> [5/5] Building Tauri 2 NSIS Installer..."
+  npm run tauri:build
 }
-
-Write-Host "==> [5/5] Building Tauri 2 NSIS Installer..."
-npx @TauriArgs
 Write-Host "Done. NSIS installer output is under src-tauri/target/release/bundle/nsis/."

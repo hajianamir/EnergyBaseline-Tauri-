@@ -5,6 +5,10 @@ description = "EnergyBaseline Tauri 2 Desktop Shell"
 authors = ["EnergyBaseline Engineering"]
 edition = "2021"
 
+[lib]
+name = "energybaseline_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
