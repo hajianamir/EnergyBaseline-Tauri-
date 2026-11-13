@@ -193,6 +193,27 @@ test('Phase 2 / F-03: fold imputation and feature selection use training rows on
   assert.deepEqual(prepared.features, ['driver']);
 });
 
+test('Phase 2 / F-03: empty training features fail fast and the modeling pipeline surfaces the error', () => {
+  const dataset = generateSyntheticDataset('energy_mv', 42);
+  const baselineRows = getBaselineRows(dataset);
+  for (const row of baselineRows) row.outdoor_temp_c = null;
+
+  const vsg = buildDefaultVsgForTarget(dataset, 'kwh_total').entries;
+  for (const [name, entry] of Object.entries(vsg)) {
+    entry.state = name === 'outdoor_temp_c' ? 'candidate' : 'exclude';
+  }
+
+  const errorPattern = /No usable training features for target 'kwh_total' \(candidate-pool size: 1\)\./;
+  assert.throws(
+    () => prepareTrainingFold(baselineRows, 'kwh_total', ['outdoor_temp_c']),
+    errorPattern
+  );
+  assert.throws(
+    () => runTargetModelingPipeline(dataset, 'kwh_total', vsg, createDefaultTcpConfig(dataset), 42),
+    errorPattern
+  );
+});
+
 test('Phase 2 / F-03: CV folds are expanding forward-chaining with no future training rows', () => {
   const folds = buildForwardChainingFolds(100, 4, 7);
   assert.equal(folds.length, 4);

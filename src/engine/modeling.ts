@@ -1060,6 +1060,9 @@ export function prepareTrainingFold(
     }
     features.push(feature);
   }
+  if (features.length === 0) {
+    throw new Error(`No usable training features for target '${targetName}' (candidate-pool size: ${candidatePool.length}).`);
+  }
   return { trainingRows, features, medians, prunedCollinear };
 }
 
@@ -1827,6 +1830,7 @@ export function runTargetModelingPipeline(
 
     // Restore training-only preprocessing fit on the complete development partition
     // before fitting the deployable model or touching the final holdout.
+    // Restore the captured array identity so specs that alias it keep `spec.features === fullPreprocessing.features`.
     selectedFeatures = fullPreprocessing.features;
     colMedians = fullPreprocessing.medians;
     tempFeat = selectedFeatures.find((f) => /temp/i.test(f)) ?? selectedFeatures[0];

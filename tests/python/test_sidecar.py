@@ -32,6 +32,7 @@ from energybaseline.persistence import (  # noqa: E402
 )
 from energybaseline.ipc.protocol import (  # noqa: E402
     ALLOWLISTED_METHODS,
+    MAX_CANCELLED_IDS,
     CONTROL_ALLOWLISTED_METHODS,
     SidecarIpcServer,
 )
@@ -325,6 +326,37 @@ class TestSidecarIpc(unittest.TestCase):
                 "jsonrpc": "2.0",
                 "id": "cancel-call",
                 "result": {"cancelled": "pending-request"},
+            },
+        )
+
+    def test_cancellation_bookkeeping_is_bounded_without_changing_wire_response(self) -> None:
+        proto_out = io.StringIO()
+        server = SidecarIpcServer(proto_out=proto_out)
+        server.handshaken = True
+        request_count = MAX_CANCELLED_IDS + 25
+
+        # These targets are deliberately never dispatched as system.status requests.
+        for index in range(request_count):
+            server.dispatch_rpc(
+                {
+                    "jsonrpc": "2.0",
+                    "id": f"cancel-call-{index}",
+                    "method": "rpc_cancel",
+                    "params": {"id": f"background-request-{index}"},
+                }
+            )
+
+        self.assertLessEqual(len(server.cancelled_ids), MAX_CANCELLED_IDS)
+        self.assertEqual(len(server.cancelled_ids), MAX_CANCELLED_IDS)
+        self.assertNotIn("background-request-0", server.cancelled_ids)
+        last_target_id = f"background-request-{request_count - 1}"
+        self.assertIn(last_target_id, server.cancelled_ids)
+        self.assertEqual(
+            json.loads(proto_out.getvalue().splitlines()[-1]),
+            {
+                "jsonrpc": "2.0",
+                "id": f"cancel-call-{request_count - 1}",
+                "result": {"cancelled": last_target_id},
             },
         )
 

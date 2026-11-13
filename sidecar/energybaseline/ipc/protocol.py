@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import sys
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Dict, Optional, TextIO
 
@@ -21,6 +22,7 @@ from energybaseline.sql.guard import validate_readonly_sql
 PROTOCOL_VERSION = "1.0"
 SIDECAR_VERSION = "5.2.0"
 MAX_FRAME_BYTES = 1024 * 1024  # 1 MiB (IPC-1)
+MAX_CANCELLED_IDS = 256
 MAX_SBOM_BYTES = 900 * 1024  # Reserve room for JSON-RPC envelope overhead.
 LOGGER = logging.getLogger("energybaseline.ipc")
 
@@ -100,7 +102,8 @@ class SidecarIpcServer:
             or os.environ.get("ENERGYBASELINE_LOG_PATH")
             or Path(self.app_home or Path.home()) / "logs" / "sidecar.log"
         )
-        self.cancelled_ids: set[Any] = set()
+        # The cap bounds bookkeeping only; rpc_cancel retains the same wire response.
+        self.cancelled_ids: OrderedDict[Any, None] = OrderedDict()
         # Do not touch the filesystem until the shell has supplied the canonical
         # APP_HOME in its hello frame.
         self.db_resolution = None
@@ -292,7 +295,10 @@ class SidecarIpcServer:
             if not _is_valid_id(target_id):
                 self._error(req_id, -32602, "VALIDATION", "Cancellation id must be a string, number, or null.")
                 return
-            self.cancelled_ids.add(target_id)
+            self.cancelled_ids.pop(target_id, None)
+            self.cancelled_ids[target_id] = None
+            if len(self.cancelled_ids) > MAX_CANCELLED_IDS:
+                self.cancelled_ids.popitem(last=False)
             self.send_frame(
                 {
                     "jsonrpc": "2.0",
@@ -345,7 +351,7 @@ class SidecarIpcServer:
 
         if method == "system.status":
             if req_id in self.cancelled_ids:
-                self.cancelled_ids.discard(req_id)
+                self.cancelled_ids.pop(req_id, None)
                 self._error(req_id, -32800, "CANCELLED", "The request was cancelled.")
                 return
             self._send_progress(req_id, stage="status", percent=100)
