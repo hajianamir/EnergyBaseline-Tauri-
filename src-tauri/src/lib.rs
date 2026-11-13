@@ -125,7 +125,7 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(|window, event| {
-            if let tauri::WindowEvent::CloseRequested { api } = event {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 // Closing the CommandChild writer sends stdin EOF. Let the Python sidecar
                 // close cleanly, then terminate its whole process tree if it exceeds 10 s.
                 api.prevent_close();

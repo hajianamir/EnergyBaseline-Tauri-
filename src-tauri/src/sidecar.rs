@@ -201,7 +201,7 @@ impl SidecarHandle {
             command = command.env("PYTHONUNBUFFERED", "1");
         }
 
-        let (receiver, mut child) = match command.spawn() {
+        let (receiver, child) = match command.spawn() {
             Ok(spawned) => spawned,
             Err(error) => {
                 let message = format!(
