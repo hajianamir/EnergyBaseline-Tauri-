@@ -4,7 +4,7 @@
 
 ## Build under test
 
-Use the `EnergyBaseline-Windows-NSIS-M1` artifact (artifact ID `14055932314`) from [CI run 43459781814](https://github.com/hajianamir/EnergyBaseline-Tauri-/actions/runs/43459781814). That run passed locked Windows/Ubuntu validation and the automated Windows freeze, NSIS install, resource-staging, and sidecar IPC/EOF smoke checks. Those checks do **not** launch and forcibly terminate the actual Tauri desktop process.
+Use the `EnergyBaseline-Windows-NSIS-M1` artifact (artifact ID `14057359462`) from [CI run 43463729769](https://github.com/hajianamir/EnergyBaseline-Tauri-/actions/runs/43463729769). That run passed locked Windows/Ubuntu validation and the automated Windows freeze, NSIS install, resource-staging, and sidecar IPC/EOF smoke checks. Those checks do **not** launch and forcibly terminate the actual Tauri desktop process.
 
 ## Preconditions
 
