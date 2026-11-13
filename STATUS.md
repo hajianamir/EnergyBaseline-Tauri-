@@ -6,7 +6,7 @@ Updated: 2026-11-13 (UTC)
 
 | Phase | Scope | State | Commit | Tests | Notes |
 |---|---|---|---|---|---|
-| 0 | Repository hygiene, package-manager/lockfile consistency, and build bootstrap | In progress — local checks pass; Windows and Linux CI gates are pending | Pending | `npm ci`, `npm audit`, `npm run lint`, engine tests, Vite build, Python sidecar tests: Pass locally. Native Rust/Tauri build: Unverified locally. | Do not start Phase 1 until both Windows and Linux CI pass on the checked-in lockfiles. |
+| 0 | Repository hygiene, package-manager/lockfile consistency, and build bootstrap | In progress — first CI run failed in the Windows lint/test/build step and Linux native Cargo build; diagnostics and rerun required | `35cdc9b` (bootstrap), `6f07f0f` (metadata claims) | Local npm install, audit, lint, engine tests, Vite build, and Python tests: Pass. Linux CI frontend and Python steps: Pass. Windows combined frontend check: Failed; failing subcommand unknown. Linux native Cargo build: Failed (run `43413725141`). | Checks are being split and native compiler diagnostics exposed for diagnosis. Do not start Phase 1 until both Windows and Linux CI pass on checked-in lockfiles. |
 | 1 | Tauri and sidecar runtime | Blocked by Phase 0 gate | — | — | — |
 | 2 | Analytical validity | Not started | — | — | — |
 | 3 | Truthful statistics | Not started | — | — | — |
