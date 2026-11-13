@@ -20,25 +20,15 @@ jobs:
         run: cargo generate-lockfile --manifest-path src-tauri/Cargo.toml
 
       - name: Expose Cargo lockfile for local bootstrap
-        shell: pwsh
+        shell: bash
         run: |
-          Add-Type -AssemblyName System.IO.Compression
-          $lockPath = Join-Path $PWD "src-tauri/Cargo.lock"
-          $bytes = [System.IO.File]::ReadAllBytes($lockPath)
-          $stream = [System.IO.MemoryStream]::new()
-          $gzip = [System.IO.Compression.GzipStream]::new($stream, [System.IO.Compression.CompressionLevel]::Optimal, $true)
-          $gzip.Write($bytes, 0, $bytes.Length)
-          $gzip.Dispose()
-          $encoded = [Convert]::ToBase64String($stream.ToArray())
-          $chunkSize = 4000
-          $part = 1
-          for ($offset = 0; $offset -lt $encoded.Length; $offset += $chunkSize) {
-            $length = [Math]::Min($chunkSize, $encoded.Length - $offset)
-            $chunk = $encoded.Substring($offset, $length)
-            $title = "CARGOLOCK_PART_{0:D3}" -f $part
-            Write-Output "::notice title=$title::$chunk"
-            $part++
-          }
+          set -euo pipefail
+          encoded="$(gzip -c src-tauri/Cargo.lock | base64 -w0)"
+          part=1
+          while IFS= read -r chunk; do
+            printf '::notice title=CARGOLOCK_PART_%03d::%s\n' "$part" "$chunk"
+            part=$((part + 1))
+          done < <(printf '%s' "$encoded" | fold -w 4000)
 
       - name: Upload Cargo lockfile for Phase 0 bootstrap
         uses: actions/upload-artifact@v4
@@ -50,6 +40,8 @@ jobs:
   validate:
     name: Validate (${{ matrix.os }})
     needs: cargo-lock
+    env:
+      TAURI_CONFIG: '{"bundle":{"resources":[]}}'
     strategy:
       fail-fast: false
       matrix:
@@ -100,6 +92,8 @@ jobs:
             $diagnostics = Get-Content $log -Tail 30
             $detail = ($diagnostics -join "`n").Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
             Write-Output "::error title=TypeScript lint details::$detail"
+          } else {
+            Get-Content $log
           }
           exit $lintExitCode
 
@@ -110,7 +104,19 @@ jobs:
         run: npm run build
 
       - name: Run Python sidecar tests
-        run: python -m unittest -v tests/python/test_sidecar.py
+        shell: pwsh
+        run: |
+          $log = Join-Path $env:RUNNER_TEMP "python-tests.log"
+          python -m unittest -v tests/python/test_sidecar.py *> $log
+          $testExitCode = $LASTEXITCODE
+          if ($testExitCode -ne 0) {
+            $diagnostics = Get-Content $log -Tail 45
+            $detail = ($diagnostics -join "`n").Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+            Write-Output "::error title=Python test details::$detail"
+          } else {
+            Get-Content $log
+          }
+          exit $testExitCode
 
       - name: Verify locked native Cargo build
         working-directory: src-tauri
@@ -123,6 +129,8 @@ jobs:
             $diagnostics = Get-Content $log -Tail 45
             $detail = ($diagnostics -join "`n").Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
             Write-Output "::error title=Cargo build details::$detail"
+          } else {
+            Get-Content $log
           }
           exit $buildExitCode
 
