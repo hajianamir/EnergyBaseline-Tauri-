@@ -6,7 +6,7 @@ Updated: 2026-11-13 (UTC)
 
 | Phase | Scope | State | Commit | Tests | Notes |
 |---|---|---|---|---|---|
-| 0 | Repository hygiene, package-manager/lockfile consistency, and build bootstrap | In progress — CI run `43414712733` failed at Windows TypeScript lint and Linux native Cargo build; diagnostic annotations added for the next run | `35cdc9b` (bootstrap), `6f07f0f` (metadata claims), `238eb2d` (CI diagnostics) | Local install/audit/lint/engine/build/Python checks: Pass. Linux CI install, lint, engine, frontend build, and Python tests: Pass; native Cargo build: Failed. Windows CI install: Pass; TypeScript lint: Failed. | Root causes not yet established. Do not start Phase 1 until both Windows and Linux CI pass on checked-in lockfiles. |
+| 0 | Repository hygiene, package-manager/lockfile consistency, and build bootstrap | In progress — Windows failure traced to a missing TypeScript 7 win32-x64 optional package in the npm lock; lock regenerated from a clean state. Linux Tauri build-script failure still needs its diagnostic. | `35cdc9b` (bootstrap), `6f07f0f` (metadata claims), `238eb2d` and `e7477c4` (CI diagnostics) | Local clean `npm ci`, audit, lint, engine tests, Vite build, and Python tests: Pass. Linux CI frontend and Python steps: Pass; native Cargo build: Failed. Windows CI `npm ci`: Pass; TypeScript lint failed before lock regeneration. | Regenerated npm lock now includes all 20 TypeScript platform packages. Cargo lock generation is currently CI-bootstrapped, not yet checked in. Do not start Phase 1 until both OS gates pass with checked-in locks. |
 | 1 | Tauri and sidecar runtime | Blocked by Phase 0 gate | — | — | — |
 | 2 | Analytical validity | Not started | — | — | — |
 | 3 | Truthful statistics | Not started | — | — | — |
