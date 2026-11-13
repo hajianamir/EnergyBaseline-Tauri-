@@ -28,7 +28,7 @@ jobs:
           while IFS= read -r chunk; do
             printf '::notice title=CARGOLOCK_PART_%03d::%s\n' "$part" "$chunk"
             part=$((part + 1))
-          done < <(printf '%s' "$encoded" | fold -w 4000)
+          done < <(printf '%s' "$encoded" | fold -w 3000)
 
       - name: Upload Cargo lockfile for Phase 0 bootstrap
         uses: actions/upload-artifact@v4
