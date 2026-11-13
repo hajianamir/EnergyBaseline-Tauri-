@@ -56,3 +56,13 @@ The F-01–F-13 identifiers and their detailed acceptance criteria remain those 
 | STAT-03 | Not started | — | — | Replace proxy or hard-coded values presented as computed statistical metrics. |
 | STAT-04 | Not started | — | — | Replace FNV-based values labeled SHA-256 with the claimed cryptographic digest. |
 | STAT-05 | Not started | — | — | Preserve seeds; document method changes and bump `engine_version` when numeric outputs change. |
+
+## Deferred review observations (non-blocking)
+
+These notes do not change phase states, acceptance evidence, or sequencing. They are follow-ups only; no Wave 2 work has started.
+
+- **Cancellation bookkeeping:** `cancelled_ids` can retain targets that never reach the `system.status` cleanup path. Review response-path cleanup or a bounded policy in a later runtime slice.
+- **Audit scaling and retention:** `_verify_audit_chain` re-parses the full log for each save/load, and the append-only log has no rotation. Before higher-volume use, define a verifiable checkpoint/anchor and archive/retention policy that preserves tamper evidence.
+- **Empty training feature set:** If all candidates lack finite training values, `prepareTrainingFold` can return an empty feature list and downstream modeling may silently fit an intercept-only result. Add an explicit fail-fast error and regression test in a future analytical slice.
+- **Phase 1 cancellation observation:** During the existing physical acceptance pass, verify cancellation stops sidecar-side work (not only the Rust-side wait) and check whether the UI needs an explicit cancellation confirmation. Do not alter the current checklist/evidence requirements here.
+- **Fold/model-card invariant:** Add a comment near `runTargetModelingPipeline` explaining why `spec.features` remains consistent when fold preprocessing arrays are restored after cross-validation; protect that invariant during future refactors.
